@@ -1,4 +1,4 @@
-# B 站投稿信息（宣传片 v1）
+﻿# B 站投稿信息（宣传片 v1）
 
 ## 视频文件
 `E:\OCR\promo\out\promo_bilibili.mp4`（1920×1080 / 30fps / 48.8 秒 / 5.4 MB / H.264 + AAC）
@@ -26,7 +26,7 @@
 技术栈：Python + FastAPI + Word COM 排版 + OpenCV（ArUco/QR/OMR）+ PaddleOCR-VL
 全部本地运行，答案和照片不出你自己的电脑。
 
-开源地址：（填写 GitHub 仓库地址）
+开源地址：https://github.com/Crh0826/math-paper-app
 测试：859 条自动化测试全绿；判卷 100 次合成样本标定/QR/选择题判分 100%
 
 #数学 #开源 #Python #教育 #自动判卷
