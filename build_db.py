@@ -23,7 +23,10 @@ from docx_rich import M_NS, extract_tokens, plain_text, stats
 from families import family_key, parse_label
 from taxonomy import classify
 
-ROOT = r"E:\OCR"
+import paths as app_paths
+
+#: 题库目录（原始 docx）：环境变量 > config.paths.qbank > 老路径 E:\OCR（存在才用）> <程序>/qbank
+ROOT = app_paths.resolve_qbank(legacy=app_paths.LEGACY_QBANK)
 HERE = os.path.dirname(os.path.abspath(__file__))
 JSONL = os.path.join(ROOT, "dedup", "data", "questions.jsonl")
 DEFAULT_DB = os.path.join(HERE, "data", "app.db")
@@ -45,6 +48,13 @@ def _fmt(tok_stats: dict, raw_xml_flags: dict) -> str:
     if tok_stats["table"]:
         parts.append("table")
     return "+".join(parts) or "plain"
+
+
+_Q_COLS = ("no,qtype,option_count,sub_count,is_empty,media_count,text_len,text_plain,"
+           "tokens_json,fmt,src_title,src_para,family_key,kp_id,chapter,kp,kp_source,"
+           "answer_raw,check_status,subject_pk")
+_INSERT_Q = ("INSERT OR REPLACE INTO questions(%s) VALUES (%s)"
+             % (_Q_COLS, ",".join("?" * 20)))
 
 
 def build(limit: int = 0, db_path: str = DEFAULT_DB, fresh: bool = False,
@@ -121,6 +131,7 @@ def build(limit: int = 0, db_path: str = DEFAULT_DB, fresh: bool = False,
             src_title, r.get("src_para"), fam,
             kp["kp_id"], kp["chapter"], kp["kp"], kp["source"],
             (r.get("answer") or "").strip(), (r.get("check_status") or ""),
+            dbmod.DEFAULT_SUBJECT,
         ))
         c["questions"] += 1
         c[f"kp_source:{kp['source']}"] += 1
@@ -132,14 +143,14 @@ def build(limit: int = 0, db_path: str = DEFAULT_DB, fresh: bool = False,
 
         if len(batch) >= 500:
             cur.executemany(
-                "INSERT OR REPLACE INTO questions VALUES " + "(" + ",".join("?" * 19) + ")", batch)
+                _INSERT_Q, batch)
             batch = []
         if progress_every and i % progress_every == 0:
             print(f"  ... {i}/{len(rows)}  ({time.time()-t0:.1f}s, tokens {t_tok:.1f}s)", flush=True)
 
     if batch:
         cur.executemany(
-            "INSERT OR REPLACE INTO questions VALUES " + "(" + ",".join("?" * 19) + ")", batch)
+            _INSERT_Q, batch)
 
     # 题族表（只有 ≥2 题的族才有训练价值，但全存便于查看）
     for k, n in fam_members.items():
@@ -150,8 +161,10 @@ def build(limit: int = 0, db_path: str = DEFAULT_DB, fresh: bool = False,
     # 知识点表
     from taxonomy import all_kps
     for kp in all_kps():
-        cur.execute("INSERT OR REPLACE INTO kps(kp_id, chapter, kp, n_questions) VALUES(?,?,?,?)",
-                    (kp["kp_id"], kp["chapter"], kp["kp"], kp_members.get(kp["kp_id"], 0)))
+        cur.execute("INSERT OR REPLACE INTO kps(kp_id, chapter, kp, n_questions, subject_pk)"
+                    " VALUES(?,?,?,?,?)",
+                    (kp["kp_id"], kp["chapter"], kp["kp"], kp_members.get(kp["kp_id"], 0),
+                     dbmod.DEFAULT_SUBJECT))
 
     dbmod.set_meta(conn, "built_at", time.strftime("%Y-%m-%d %H:%M:%S"))
     dbmod.set_meta(conn, "source_jsonl", JSONL)

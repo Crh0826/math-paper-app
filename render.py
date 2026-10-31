@@ -14,6 +14,11 @@
 * **Word 不在就降级，不让 COM 报错穿透**：先探测 WINWORD.EXE（PATH → App Paths 注册表
   → 常见安装目录），没有就抛 ``WordUnavailable("not_installed")``；DispatchEx 失败、
   COM 断连同样收敛成 ``WordUnavailable``（带机器可读的 ``reason``，供 errors.py 写文案）。
+* **LibreOffice 回退（跨平台）**：Word 不可用时用 ``soffice --headless --convert-to pdf``
+  导 PDF（``LIBREOFFICE_PATH`` / PATH / 常见安装目录），两者都没有才
+  ``WordUnavailable("no_backend")``；每个后端转换后都做 A4 尺寸校验。探测接口
+  ``probe_backend()`` / ``active_backend()`` 供 server 的 /health 与设置页直接调用。
+  LibreOffice 的字体/公式与 Word 可能有细微差异，health 里会带 ``last_backend()``。
 * **看门狗**：COM 调用放在工作线程里，主线程 join ``WORD_TIMEOUT_S``（90s）；超时后按
   转换前快照 diff 出本次新起的 WINWORD.EXE 并 ``taskkill /F``，抛
   ``WordUnavailable("timeout")``。同一进程内 Word 转换串行（``_WORD_LOCK``），
@@ -107,10 +112,11 @@ class RenderError(RuntimeError):
 
 
 class WordUnavailable(RenderError):
-    """本机没有可用的 Word / Word 卡死 —— 上层据此降级（errors.py 的 WordUnavailable）。
+    """本机没有可用的 PDF 后端 / 后端卡死 —— 上层据此降级（errors.py 的 WordUnavailable）。
 
     ``reason`` 是机器可读的短码，当前取值：
     ``not_installed`` / ``pywin32_missing`` / ``dispatch_failed`` / ``com_failed`` / ``timeout``
+    / ``busy``（跨进程锁没拿到）/ ``no_backend``（Word 与 LibreOffice 都没有）。
     """
 
     def __init__(self, reason: str, detail: str = ""):
@@ -217,6 +223,114 @@ def word_path(refresh: bool = False) -> str | None:
 def word_available(refresh: bool = False) -> bool:
     """本机能不能用 Word 导 PDF（pywin32 可 import + 找得到 WINWORD.EXE）。"""
     return bool(win32 is not None and word_path(refresh=refresh))
+
+
+# ---------------------------------------------------------------- PDF 后端：Word / LibreOffice
+#: 用户反馈第 2 条：强依赖 Word 会把 macOS/Linux 全挡外面，所以加 LibreOffice 回退。
+#: 优先级：Word COM → LibreOffice(`soffice`) → 都没有才 `WordUnavailable("no_backend")`。
+#: 注意：`word_available()` 仍然**只表示 Word**（既有调用方的语义不变）。
+SOFFICE_ENV_VAR = "LIBREOFFICE_PATH"
+_soffice_cache = "unset"
+_last_backend = [None]             # 最近一次成功转换用的后端（None = 还没转过）
+
+
+def _soffice_candidates() -> list:
+    """可能的 soffice 路径：环境变量 → PATH → 常见安装目录（Win/mac/Linux）。"""
+    found = []
+    env = os.environ.get(SOFFICE_ENV_VAR)
+    if env:
+        found.append(env.strip().strip('"'))
+    for name in ("soffice", "soffice.exe"):
+        which = shutil.which(name)
+        if which:
+            found.append(which)
+    if sys.platform == "win32":
+        for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"),
+                     os.environ.get("ProgramW6432")):
+            if base:
+                found.append(os.path.join(base, "LibreOffice", "program", "soffice.exe"))
+    elif sys.platform == "darwin":
+        found.append("/Applications/LibreOffice.app/Contents/MacOS/soffice")
+    else:
+        found.extend(["/usr/bin/soffice", "/usr/local/bin/soffice",
+                      "/usr/lib/libreoffice/program/soffice",
+                      "/lib/libreoffice/program/soffice", "/snap/bin/libreoffice"])
+    return found
+
+
+def _find_soffice(candidates=None) -> str | None:
+    """只做路径探测，绝不启动 LibreOffice。"""
+    for path in (candidates if candidates is not None else _soffice_candidates()):
+        if not path:
+            continue
+        try:
+            if os.path.isfile(path):
+                return os.path.abspath(path)
+        except OSError:
+            continue
+    return None
+
+
+def soffice_path(refresh: bool = False) -> str | None:
+    """LibreOffice 的 soffice 路径（缓存）；找不到返回 None。"""
+    global _soffice_cache
+    if refresh or _soffice_cache == "unset":
+        _soffice_cache = _find_soffice()
+    return _soffice_cache
+
+
+def soffice_available(refresh: bool = False) -> bool:
+    return bool(soffice_path(refresh=refresh))
+
+
+def probe_backend(refresh: bool = False) -> dict:
+    """探测 PDF 后端：``{"word": bool, "libreoffice": bool, "chosen": str|None, "detail": str}``。
+
+    server.py 的 /health 与设置页可以直接用（ui-engineer 接线）；``detail`` 是给人看的一行说明。
+    """
+    word_ok = word_available(refresh=refresh)
+    lo_ok = soffice_available(refresh=refresh)
+    chosen = "word" if word_ok else ("libreoffice" if lo_ok else None)
+    if chosen == "word":
+        detail = "Word COM（%s）" % (word_path() or "WINWORD.EXE")
+    elif chosen == "libreoffice":
+        detail = "LibreOffice（%s）" % (soffice_path() or "soffice")
+    else:
+        detail = ("没有可用的 PDF 后端：没找到 Microsoft Word，也没找到 LibreOffice")
+    return {
+        "word": word_ok,
+        "libreoffice": lo_ok,
+        "chosen": chosen,
+        "word_path": word_path(refresh=refresh),
+        "soffice_path": soffice_path(refresh=refresh),
+        "detail": detail,
+        "last_used": _last_backend[0],
+    }
+
+
+def active_backend() -> str | None:
+    """当前会用来导 PDF 的后端：``"word"`` / ``"libreoffice"`` / ``None``。"""
+    return probe_backend()["chosen"]
+
+
+def last_backend() -> str | None:
+    """最近一次**成功**转换实际用的后端（排查"这台机器到底走的哪条路"最有用）。"""
+    return _last_backend[0]
+
+
+def _require_backend() -> tuple:
+    """选后端：Word 优先，其次 LibreOffice；都没有抛 ``WordUnavailable("no_backend")``。"""
+    word = _find_word_exe() if win32 is not None else None
+    if word:
+        return "word", word
+    soffice = _find_soffice()
+    if soffice:
+        return "libreoffice", soffice
+    raise WordUnavailable(
+        "no_backend",
+        "既没找到 Microsoft Word（WINWORD.EXE），也没找到 LibreOffice（soffice）。"
+        "装任意一个即可：Windows 装 Word 2016+ 或 LibreOffice；"
+        "macOS/Linux 装 LibreOffice（soffice 在 PATH 里，或用 LIBREOFFICE_PATH 指过去）")
 
 
 def _require_word() -> str:
@@ -920,13 +1034,100 @@ def _run_with_watchdog(docx_path: str, pdf_path: str) -> int:
     return int(box.get("pages") or 0)
 
 
-def docx_to_pdf(docx_path: str, pdf_path: str) -> tuple:
-    """docx → PDF（Word COM 导出），返回 ``(pages, seconds)``。
+def _soffice_invocation(path: str, args: list) -> list:
+    """拼 soffice 命令行；Windows 上 .cmd/.bat 包装器（scoop shim 等）要走 cmd /c。"""
+    if os.name == "nt" and path.lower().endswith((".cmd", ".bat")):
+        return ["cmd", "/c", path] + list(args)
+    return [path] + list(args)
 
-    * 源 docx 只读打开（先复制到 temp 的 ASCII 文件名下），绝不改原文件；
-    * 没有 Word / Word 卡死 → ``WordUnavailable``（带 reason，供上层降级）；
+
+def _tail(text: str, lines: int = 20) -> str:
+    """取输出最后 N 行（LibreOffice 的报错通常在末尾）。"""
+    rows = [row for row in str(text or "").replace("\r", "").split("\n") if row.strip()]
+    return "\n".join(rows[-max(1, int(lines)):]) or "（无输出）"
+
+
+def _convert_with_libreoffice(docx_path: str, pdf_path: str, soffice: str,
+                              timeout: float = None) -> int:
+    """LibreOffice headless 导 PDF，返回页数。
+
+    ``soffice --headless --norestore --convert-to pdf --outdir <dir> <docx>``；每次用独立
+    用户 profile（``-env:UserInstallation``），避免和用户开着的 LibreOffice 抢锁。
+    失败时把 stderr/stdout 末尾 20 行放进错误详情（排查最有用）。
+    """
+    timeout = WORD_TIMEOUT_S if timeout is None else float(timeout)
+    out_dir = os.path.dirname(pdf_path)
+    os.makedirs(out_dir, exist_ok=True)
+    profile = tempfile.mkdtemp(prefix=TEMP_PREFIX + "lo-")
+    profile_url = "file:///" + os.path.abspath(profile).replace("\\", "/").lstrip("/")
+    args = ["--headless", "--norestore", "--nolockcheck", "--nodefault",
+            "--convert-to", "pdf", "--outdir", out_dir,
+            "-env:UserInstallation=" + profile_url, docx_path]
+    cmd = _soffice_invocation(soffice, args)
+    try:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=timeout,
+                                  creationflags=_no_window() if sys.platform == "win32" else 0)
+        except subprocess.TimeoutExpired:
+            raise WordUnavailable("timeout",
+                                  "LibreOffice 超过 %.0f 秒没转换完，已放弃" % timeout)
+        except OSError as exc:
+            raise RenderError("启动 LibreOffice 失败：%s" % _short(exc)) from exc
+        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        produced = os.path.join(out_dir, os.path.splitext(os.path.basename(docx_path))[0] + ".pdf")
+        if proc.returncode != 0 or not os.path.isfile(produced):
+            raise RenderError("LibreOffice 转换失败（退出码 %s）：%s"
+                              % (proc.returncode, _tail(output, 20)))
+        if os.path.abspath(produced) != os.path.abspath(pdf_path):
+            try:
+                os.replace(produced, pdf_path)
+            except OSError as exc:
+                raise RenderError("LibreOffice 产物落位失败：%s（%s）"
+                                  % (pdf_path, _short(exc))) from exc
+        pages = _pdf_page_count(pdf_path)
+        if pages <= 0:
+            raise RenderError("LibreOffice 产出 0 页 PDF：%s（%s）" % (pdf_path, _tail(output, 20)))
+        return pages
+    finally:
+        _rmtree(profile)
+
+
+def _verify_pdf_a4(pdf_path: str) -> None:
+    """A4 页面尺寸校验：复用 paper.check_pdf_a4（t48 的 FidelityError(code="pdf_not_a4")）。
+
+    答题卡坐标是按 A4 pt 写死的，非 A4 的 PDF 会让后续整页像素对不上；这里在转换出口就卡住。
+    """
+    try:
+        import paper  # noqa: PLC0415 - 避免 render ↔ paper 循环导入
+    except Exception:                  # noqa: BLE001 - 独立使用 render 时退化自查
+        bad = []
+        doc = pymupdf.open(pdf_path)
+        try:
+            for i, page in enumerate(doc, 1):
+                if (abs(float(page.rect.width) - 595.28) > 0.5
+                        or abs(float(page.rect.height) - 841.89) > 0.5):
+                    bad.append((i, round(float(page.rect.width), 2),
+                                round(float(page.rect.height), 2)))
+        finally:
+            doc.close()
+        if bad:
+            raise RenderError("PDF 不是 A4（%s）：%r" % (pdf_path, bad[:3]))
+        return
+    if hasattr(paper, "check_pdf_a4"):
+        paper.check_pdf_a4(pdf_path)   # FidelityError(code="pdf_not_a4")
+
+
+def docx_to_pdf(docx_path: str, pdf_path: str) -> tuple:
+    """docx → PDF，返回 ``(pages, seconds)``。
+
+    后端优先级：**Word COM → LibreOffice → 都没有抛 ``WordUnavailable("no_backend")``**。
+    转换前先复制到 temp 的 ASCII 文件名（不动源文件），转换后跨盘落位 + A4 尺寸校验。
+
+    * 源 docx 只读打开，绝不改原文件；
+    * 没有 Word / Word 卡死 / 没有 LibreOffice → ``WordUnavailable``（带 reason，供上层降级）；
     * 目标 PDF 被别的程序锁住 → 转换前就抛 ``RenderError``（含"关掉打开它的程序"提示）；
-    * 其它失败（文件不存在、Word 报错、跨卷/占用）→ ``RenderError``。
+    * 其它失败（文件不存在、后端报错、跨卷/占用、非 A4）→ ``RenderError``。
     """
     t0 = time.perf_counter()
     docx_path = os.path.abspath(str(docx_path))
@@ -937,7 +1138,7 @@ def docx_to_pdf(docx_path: str, pdf_path: str) -> tuple:
         raise RenderError("只接受 .docx：%s" % docx_path)
     if os.path.isdir(pdf_path):
         raise RenderError("pdf_path 指向目录，不是文件：%s" % pdf_path)
-    _require_word()
+    backend, backend_path = _require_backend()
     _preflight_target(pdf_path)
 
     parent = os.path.dirname(pdf_path)
@@ -952,24 +1153,33 @@ def docx_to_pdf(docx_path: str, pdf_path: str) -> tuple:
     tmp_dir = tempfile.mkdtemp(prefix=TEMP_PREFIX)
     _write_meta(tmp_dir)
     try:
-        src = os.path.join(tmp_dir, "in.docx")   # ASCII 名字：Word 最稳的输入
+        src = os.path.join(tmp_dir, "in.docx")   # ASCII 名字：后端最稳的输入
         try:
             shutil.copy2(docx_path, src)
         except OSError as exc:                   # 源 docx 被 Word 锁着 / 权限不足
             raise RenderError("读不了源 docx（可能被 Word 打开占用或没有读权限）：%s（%s）"
                               % (docx_path, _short(exc))) from exc
         out = os.path.join(tmp_dir, "out.pdf")
-        word_pages = _run_with_watchdog(src, out)
+        if backend == "word":
+            backend_pages = _run_with_watchdog(src, out)
+            backend_label = "Word"
+        else:
+            with _cross_process_lock():          # 和 Word 路径一样串行，别同时开一堆 soffice
+                backend_pages = _convert_with_libreoffice(src, out, backend_path)
+            backend_label = "LibreOffice"
         if not os.path.isfile(out) or os.path.getsize(out) < MIN_PDF_BYTES:
-            raise RenderError("Word 没产出可用 PDF：%s（%s 字节）"
-                              % (pdf_path, os.path.getsize(out) if os.path.isfile(out) else 0))
+            raise RenderError("%s 没产出可用 PDF：%s（%s 字节）"
+                              % (backend_label, pdf_path,
+                                 os.path.getsize(out) if os.path.isfile(out) else 0))
         _move_into_place(out, pdf_path)
     finally:
         _rmtree(tmp_dir)
 
-    pages = _pdf_page_count(pdf_path) or int(word_pages or 0)
+    pages = _pdf_page_count(pdf_path) or int(backend_pages or 0)
     if pages <= 0:
         raise RenderError("PDF 页数为 0，渲染失败：%s" % pdf_path)
+    _verify_pdf_a4(pdf_path)          # 非 A4 → FidelityError(code="pdf_not_a4")，答题卡坐标才不会错位
+    _last_backend[0] = backend
     return int(pages), round(time.perf_counter() - t0, 3)
 
 
@@ -1069,3 +1279,36 @@ def pdf_to_png(pdf_path: str, out_dir: str, dpi: int = 300, prefix: str = "page"
         return out
     finally:
         doc.close()
+
+
+def _main(argv=None) -> int:
+    """``python -m render --check``：只探测 PDF 后端，先看这台机器走哪条路。
+
+    非 Windows 用户装完 LibreOffice 先跑它确认 soffice 能被找到；``--json`` 给脚本/CI 用。
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m render", description="PDF 后端探测（Microsoft Word / LibreOffice）")
+    parser.add_argument("--check", action="store_true", help="只探测并打印（默认行为）")
+    parser.add_argument("--json", action="store_true", help="输出 JSON（给脚本用）")
+    args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
+    probe = probe_backend(refresh=True)
+    if args.json:
+        print(json.dumps(probe, ensure_ascii=False, indent=2))
+    else:
+        chosen = probe.get("chosen")
+        print("PDF 后端：%s" % {"word": "word",
+                               "libreoffice": "libreoffice"}.get(chosen or "", "都没有"))
+        print("  Word        %s" % (probe.get("word_path") or "未找到"))
+        print("  LibreOffice %s" % (probe.get("soffice_path") or "未找到"))
+        if chosen:
+            print("  → 会用它导 PDF：%s" % probe.get("detail"))
+        else:
+            print("  → PDF 会失败。装 Word 2016+ 或 LibreOffice 任一个；")
+            print("    macOS/Linux 装 LibreOffice；soffice 不在 PATH 时用 LIBREOFFICE_PATH 指过去。")
+    return 0 if probe.get("chosen") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

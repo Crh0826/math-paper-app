@@ -63,6 +63,15 @@ CONTENT_W_PT = PAGE_W_PT - 2 * MARGIN_PT
 
 #: 版面模式：compact = 省纸模式（默认，用户 2026-10-31 提的「留白太大」）；
 #: normal = 原来那套宽松版面（2cm 边距 / 1.15 行距 / 题间 6pt 空段）。
+#: A4 规范尺寸（PDF 点）：595.28 × 841.89。允许 ±0.5pt 的舍入误差。
+A4_W_PT = 595.28
+A4_H_PT = 841.89
+A4_TOL_PT = 0.5
+PT_PER_MM = 72.0 / 25.4
+#: 校准页里那个「量一下」的方框边长（mm → pt ≈ 283.46）
+CALIBRATION_MM = 100.0
+CALIBRATION_RULER_MM = 10.0
+
 LAYOUT_COMPACT = "compact"
 LAYOUT_NORMAL = "normal"
 LAYOUTS = (LAYOUT_COMPACT, LAYOUT_NORMAL)
@@ -1026,6 +1035,163 @@ def check_docx(docx_path: str, manifest: dict, expected: dict = None) -> dict:
     }
 
 
+# ---------------------------------------------------------------- 打印校准 / 尺寸自检
+def pdf_page_sizes(pdf_path: str) -> list:
+    """PDF 每页尺寸（pt）：[(w, h), ...]。读不了直接抛 PaperError。"""
+    import pymupdf
+
+    if not os.path.exists(pdf_path):
+        raise PaperError("PDF 不存在：%s" % pdf_path)
+    doc = pymupdf.open(pdf_path)
+    try:
+        return [(round(p.rect.width, 2), round(p.rect.height, 2)) for p in doc]
+    finally:
+        doc.close()
+
+
+def check_pdf_a4(pdf_path: str, tol: float = A4_TOL_PT) -> list:
+    """每页都必须是 A4（595.28 × 841.89pt，±tol）→ 否则 FidelityError(code="pdf_not_a4")。
+
+    为什么卡这么死：答题卡的二维码/Aruco 四角坐标全是按 A4 的 pt 坐标写死的，
+    页面尺寸一被改（Letter / 被缩放的 PDF），判卷就对着错位的坐标找标记，必错。
+    """
+    sizes = pdf_page_sizes(pdf_path)
+    bad = [(i, w, h) for i, (w, h) in enumerate(sizes, 1)
+           if abs(w - A4_W_PT) > tol or abs(h - A4_H_PT) > tol]
+    if bad:
+        detail = "; ".join("第 %d 页 %.2f×%.2fpt" % b for b in bad)
+        raise FidelityError(
+            "PDF 页面不是 A4（pdf_not_a4）：期望 %.2f×%.2fpt ±%.1fpt，实际 %s —— "
+            "打印会整体错位，判卷坐标会失效" % (A4_W_PT, A4_H_PT, tol, detail),
+            code="pdf_not_a4")
+    return sizes
+
+
+def _draw_mixed(page, x: float, y: float, text: str, size: float = 10,
+                color=(0.1, 0.1, 0.1)) -> float:
+    """一行里中英混排：ASCII 串用 helv（数字不会散开），其余用 china-s。返回结束 x。"""
+    import pymupdf
+
+    for piece in re.findall(r"[\x20-\x7e]+|[^\x20-\x7e]+", text):
+        font = "helv" if piece.isascii() else "china-s"
+        page.insert_text((x, y), piece, fontname=font, fontsize=size, color=color)
+        x += pymupdf.get_text_length(piece, fontname=font, fontsize=size)
+    return x
+
+
+def build_calibration_pdf(path: str, *, title: str = "", pid: str = "") -> str:
+    """生成一页 A4 校准页：100mm 方框 + 10mm 刻度尺 + A4 外框 + 四角标记。
+
+    用户反馈第 5 条：打印要求 100% 比例太脆 —— 打印这页量一下方框就知道有没有被缩放。
+    本页不判卷，只用于校准。
+    """
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4_W_PT, height=A4_H_PT)
+    mm = PT_PER_MM
+    W, H = A4_W_PT, A4_H_PT
+    grey = (0.55, 0.55, 0.55)
+    ink = (0.85, 0.1, 0.1)
+
+    # A4 外框（10mm 内缩）：差 1mm 以上就说明被缩放了
+    margin = 10 * mm
+    page.draw_rect(pymupdf.Rect(margin, margin, W - margin, H - margin),
+                   color=grey, width=0.6)
+    _draw_mixed(page, margin + 4, margin + 12, "A4 外框：210 × 297 mm", 8, grey)
+
+    # 四角标记（十字）
+    arm = 8 * mm
+    for cx, cy in ((margin, margin), (W - margin, margin),
+                   (margin, H - margin), (W - margin, H - margin)):
+        page.draw_line((cx - arm, cy), (cx + arm, cy), color=grey, width=0.8)
+        page.draw_line((cx, cy - arm), (cx, cy + arm), color=grey, width=0.8)
+
+    # 标题与说明
+    _draw_mixed(page, margin + 4, margin + 40, "打印校准页（本页不判卷，只为校准）", 16)
+    if title or pid:
+        _draw_mixed(page, margin + 4, margin + 58,
+                    ("%s  卷号 %s" % (title, pid)).strip(), 9, grey)
+
+    # 100mm 方框（实线方框；边框本身粗 1.5pt，量外沿）
+    side = CALIBRATION_MM * mm
+    x0 = (W - side) / 2
+    y0 = 120
+    page.draw_rect(pymupdf.Rect(x0, y0, x0 + side, y0 + side),
+                   color=ink, width=1.5)
+
+    # 上边 10mm 刻度尺
+    tick_y = y0 - 2 * mm
+    page.draw_line((x0, tick_y), (x0 + side, tick_y), color=(0.2, 0.2, 0.2), width=0.7)
+    n = int(CALIBRATION_MM // CALIBRATION_RULER_MM)
+    for i in range(n + 1):
+        tx = x0 + i * CALIBRATION_RULER_MM * mm
+        long_tick = (i % 5 == 0)
+        page.draw_line((tx, tick_y - (3 * mm if long_tick else 1.6 * mm)),
+                       (tx, tick_y), color=(0.2, 0.2, 0.2), width=0.7)
+        if long_tick:
+            _draw_mixed(page, tx - 6, tick_y - 4 * mm, str(i * int(CALIBRATION_RULER_MM)),
+                        7, (0.2, 0.2, 0.2))
+    _draw_mixed(page, x0 + side + 6, tick_y - 2 * mm, "mm 刻度（每格 10mm）", 7,
+                (0.2, 0.2, 0.2))
+
+    # 左边 10mm 刻度尺
+    tick_x = x0 - 2 * mm
+    page.draw_line((tick_x, y0), (tick_x, y0 + side), color=(0.2, 0.2, 0.2), width=0.7)
+    for i in range(n + 1):
+        ty = y0 + i * CALIBRATION_RULER_MM * mm
+        long_tick = (i % 5 == 0)
+        page.draw_line((tick_x - (3 * mm if long_tick else 1.6 * mm), ty),
+                       (tick_x, ty), color=(0.2, 0.2, 0.2), width=0.7)
+
+    # 方框内文字（纯 ASCII → 全部走 helv，宽度自己算，居中）
+    box_text = "100 mm × 100 mm"
+    tw = pymupdf.get_text_length(box_text, fontname="helv", fontsize=16)
+    page.insert_text((x0 + (side - tw) / 2, y0 + side / 2),
+                     box_text, fontname="helv", fontsize=16, color=ink)
+
+    # 使用说明
+    lines = [
+        "打印后量一下：这个红色方框的四边必须都是 100 mm（用尺子量外沿）。",
+        "不是 100 mm → 说明打印时被缩放了。请在打印设置里选「实际大小 / 100%」，",
+        "不要选「适合页面 / 缩放以适合」。",
+        "",
+        "A4 外框量出来差 1 mm 以上，也说明被缩放。",
+        "刻度尺每格 10 mm，共 100 mm，可直接对照。",
+        "",
+        "本页不判卷，只为校准；在组卷页取消勾选「附校准页」即可不打印这一页。",
+    ]
+    ty = y0 + side + 30
+    for line in lines:
+        if line:
+            _draw_mixed(page, margin + 4, ty, line, 10)
+        ty += 18
+
+    doc.save(path, garbage=3, deflate=True)
+    doc.close()
+    return path
+
+
+def prepend_pdf(front_pdf: str, target_pdf: str) -> str:
+    """把 front_pdf 的页面插到 target_pdf 最前面（先写 .tmp 再原子替换）。"""
+    import pymupdf
+
+    merged = pymupdf.open()
+    tmp = target_pdf + ".tmp"
+    try:
+        for src_path in (front_pdf, target_pdf):
+            src = pymupdf.open(src_path)
+            try:
+                merged.insert_pdf(src)
+            finally:
+                src.close()
+        merged.save(tmp, garbage=3, deflate=True)
+    finally:
+        merged.close()
+    os.replace(tmp, target_pdf)
+    return target_pdf
+
+
 # ---------------------------------------------------------------- 导 PDF / PNG
 _render_mod = "unset"
 
@@ -1277,12 +1443,17 @@ def _png_size(png_path: str):
 
 # ---------------------------------------------------------------- 主入口
 def render_paper(manifest: dict, out_dir: str, *, name: str = "paper", dpi: int = DPI,
-                 deep_check: bool = False, layout: str = None) -> dict:
+                 deep_check: bool = False, layout: str = None,
+                 calibration: bool = None) -> dict:
     """排版 → PDF → PNG，并跑保真 + 分页体检。返回 {"docx","pdf","pages","png","health"}。
 
     ``deep_check=True``（出卷/CLI 默认走这条）会把 docx 交给 Word 真的打开一次：
     XML 合法、关系齐全都不代表 Word 认这份文件，打不开就 ``FidelityError(code="word_cannot_open")``。
     预览路径可以关掉，省掉一次 Word 往返。
+
+    ``calibration``（默认取 manifest.params.calibration，缺省 True）：在卷面 PDF 前插一页
+    100mm 校准页（打印时量一下就知道有没有被缩放）。卷面页数仍按内容页算（manifest.paper.pages），
+    答题卡页码接着内容页数走，不受校准页影响。
     """
     os.makedirs(out_dir, exist_ok=True)
     t0 = time.time()
@@ -1334,12 +1505,30 @@ def render_paper(manifest: dict, out_dir: str, *, name: str = "paper", dpi: int 
             health["word_open"] = "ok"
 
     pdf_path = chosen["pdf"]
-    pngs = chosen["png"]
+    content_pages = chosen["pages"]
     convert_s = chosen["convert_s"]
-    ink = chosen["ink"]
+    check_pdf_a4(pdf_path)                     # 内容 PDF 必须是 A4（打印/判卷坐标都靠它）
+
+    want_calibration = (manifest.get("params") or {}).get("calibration") \
+        if calibration is None else calibration
+    want_calibration = True if want_calibration is None else bool(want_calibration)
+    if want_calibration:
+        calib_pdf = os.path.join(out_dir, "_calibration.pdf")
+        build_calibration_pdf(calib_pdf, title=str(manifest.get("title") or ""),
+                              pid=str(manifest.get("pid") or ""))
+        prepend_pdf(calib_pdf, pdf_path)
+        pngs = pdf_to_png(pdf_path, out_dir, dpi=dpi, prefix=name, warnings=health["warnings"])
+        ink = [ink_ratio(p) for p in pngs]
+        check_pdf_a4(pdf_path)                 # 合并后再验一次（防合并把尺寸搞坏）
+    else:
+        pngs = chosen["png"]
+        ink = chosen["ink"]
     size = _png_size(pngs[0])
     health.update({
         "pages": len(pngs),
+        "paper_pages": content_pages,
+        "calibration": want_calibration,
+        "page_size_pt": [round(A4_W_PT, 2), round(A4_H_PT, 2)],
         "pdf": os.path.abspath(pdf_path),
         "pdf_bytes": os.path.getsize(pdf_path),
         "png": list(pngs),
@@ -1351,23 +1540,29 @@ def render_paper(manifest: dict, out_dir: str, *, name: str = "paper", dpi: int 
         "convert_s": round(convert_s, 2),
         "elapsed_s": round(time.time() - t0, 2),
     })
-    _gate_pages(health)
+    _gate_pages(health, content_pages=content_pages)
     # 卷面页数写回 manifest：card.py 用它算答题卡起始页码（各自编号，不合并页脚）
-    manifest["paper"] = {"pages": len(pngs), "dpi": dpi, "w_px": size[0], "h_px": size[1]}
-    health["paper_pages"] = len(pngs)
+    manifest["paper"] = {"pages": content_pages, "dpi": dpi, "w_px": size[0], "h_px": size[1],
+                         "calibration": want_calibration}
     return {"docx": built["docx"], "pdf": pdf_path, "pages": len(pngs),
             "png": list(pngs), "health": health}
 
 
-def _gate_pages(health: dict) -> None:
-    """分页体检：页数>0、A4@300dpi、没有空白页。"""
-    pages = health["pages"]
+def _gate_pages(health: dict, content_pages: int = None) -> None:
+    """分页体检：页数>0、A4@300dpi、没有空白页。
+
+    **校准页是工具页，不参与填充率闸门**（它本来就只画一个 100mm 方框 + 说明，墨迹 ~2% 是正常的；
+    判定「末页是否几乎空白」时也要把这一页摘出去，否则会把校准页当成末页误判）。
+    """
+    ink = list(health.get("ink_ratio") or [])
+    if health.get("calibration") and len(ink) > 1:
+        ink = ink[1:]                      # 去掉第 1 页校准页，只看内容页
+    pages = content_pages or len(ink)
     if pages <= 0:
         raise FidelityError("页数为 0：PDF 渲染失败")
     if health.get("dpi") == DPI and tuple(health.get("page_size_px") or ()) != PAGE_PX:
         raise FidelityError("页面不是 A4@300dpi：实测 %r，期望 %r"
                             % (health.get("page_size_px"), PAGE_PX))
-    ink = health["ink_ratio"]
     for i, ratio in enumerate(ink, 1):
         if ratio >= _BLANK_INK:
             continue
@@ -1398,6 +1593,8 @@ def _main(argv=None):
     ap.add_argument("--flat", action="store_true",
                     help="产物直接放在 --out 下（交付卷用：out/delivery/paper24.pdf）")
     ap.add_argument("--summary", default="", help="把每套卷的 pid/题号/页数/health 写成 JSON")
+    ap.add_argument("--no-calibration", action="store_true",
+                    help="不附 100mm 校准页（默认附：打印前量一下就知道有没有被缩放）")
     ap.add_argument("--layout", default=DEFAULT_LAYOUT, choices=list(LAYOUTS),
                     help="版式：compact 省纸（默认）/ normal 宽松")
     ap.add_argument("--no-deep-check", action="store_true",
@@ -1451,6 +1648,7 @@ def _main(argv=None):
                 # 卷面只印题、作答在答题卡上 → 不留白（CONTRACT §2）
                 "space": {"选择": 0, "填空": 0, "解答": 0},
                 "layout": args.layout,
+                "calibration": not args.no_calibration,
             }
             build_kw = {} if base_pid is None else {"pid": _bump_pid(base_pid, idx)}
             if used_nos:
@@ -1466,7 +1664,8 @@ def _main(argv=None):
                                        else "paper%d" % total)
                 name = "paper"
             res = render_paper(manifest, out_dir, name=name, layout=args.layout,
-                               deep_check=not args.no_deep_check)
+                               deep_check=not args.no_deep_check,
+                               calibration=not args.no_calibration)
             h = res["health"]
             item = {
                 "n_requested": total, "n_items": h["n_items"],
@@ -1492,6 +1691,9 @@ def _main(argv=None):
                 "paper_pages": h.get("paper_pages", 0),
                 "fig_ref_missing": h.get("fig_ref_missing", 0),
                 "space_paras_total": h.get("space_paras_total", 0),
+                "calibration": h.get("calibration", False),
+                "paper_pages": h.get("paper_pages", 0),
+                "page_size_pt": h.get("page_size_pt"),
                 "stem_prefix_stripped": h.get("stem_prefix_stripped", 0),
                 "ink_ratio": [round(x, 4) for x in h["ink_ratio"]],
                 "warnings": h["warnings"],

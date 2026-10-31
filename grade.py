@@ -51,9 +51,12 @@ VERDICTS = ("correct", "wrong", "unsure", "pending", "ungraded")
 
 
 # ---------------------------------------------------------------- 小工具
-def _err(code: str, detail: str = "", pid: str = None) -> dict:
-    return {"sid": None, "pid": pid, "warp_ok": False, "qr_ok": False,
-            "score": 0, "full": 0, "items": [], "error": code, "detail": str(detail)}
+def _err(code: str, detail: str = "", pid: str = None, diag: dict = None) -> dict:
+    out = {"sid": None, "pid": pid, "warp_ok": False, "qr_ok": False,
+           "score": 0, "full": 0, "items": [], "error": code, "detail": str(detail)}
+    if diag is not None:
+        out["diag"] = diag
+    return out
 
 
 def _json_loads(s):
@@ -628,10 +631,10 @@ def scan_id_blocks(gray) -> dict:
 
 def scan_ids(image_path):
     """拍照 → 标定 → 扫标识块（给 UI/测试用的轻量入口）。"""
-    norm, photo_meta, code, why = _warp_photo(image_path)
+    norm, photo_meta, code, why, diag = _warp_photo(image_path)
     if norm is None:
         return {"error": code or "warp_failed", "detail": why, "blocks": [],
-                "unreadable": [], "legacy": 0}
+                "unreadable": [], "legacy": 0, "diag": diag}
     out = scan_id_blocks(norm)
     out["photo"] = photo_meta
     return out
@@ -684,9 +687,9 @@ def grade_by_ids(conn, image_path, out_dir: str = None) -> dict:
 
 
 def _grade_by_ids(conn, image_path, out_root):
-    norm, photo_meta, code, why = _warp_photo(image_path)
+    norm, photo_meta, code, why, diag = _warp_photo(image_path)
     if norm is None:
-        return _err(code or "warp_failed", why, None)
+        return _err(code or "warp_failed", why, None, diag=diag)
     qr_payload = card.read_qr(norm, {"x": card.QR_POS[0], "y": card.QR_POS[1],
                                      "size": card.QR_SIZE})
     qr_ok = qr_payload is not None
@@ -844,29 +847,188 @@ def _units_for_page(norm, page_items, by_idx, crop_dir):
     return units, pending_units
 
 
+# ---------------------------------------------------------------- 拍照诊断（t50）
+CORNER_NAMES = ("TL", "TR", "BR", "BL")
+TILT_LIMIT_DEG = 15.0
+MIN_PAPER_RATIO = 0.25
+GLARE_MEAN = 240.0
+
+SUGGEST_TEXT = {
+    "missing_corner": "有角没拍到：让答题卡四角的黑块都落在取景框内，别用手指挡住",
+    "tilt": "拍歪了：正对答题卡，让四个黑块连成的框尽量是矩形",
+    "too_small": "太远了：靠近一点，让答题卡差不多填满取景框",
+    "glare": "角上反光：换个角度或避开顶光，别让黑块发白",
+}
+
+
+def _quad_angles(pts):
+    """四点（TL,TR,BR,BL 顺序）→ 四个内角（度）。"""
+    out = []
+    n = len(pts)
+    for i in range(n):
+        a = np.array(pts[i - 1], dtype=float)
+        b = np.array(pts[i], dtype=float)
+        c = np.array(pts[(i + 1) % n], dtype=float)
+        v1, v2 = a - b, c - b
+        denom = float(np.linalg.norm(v1) * np.linalg.norm(v2)) + 1e-9
+        cos = max(-1.0, min(1.0, float(np.dot(v1, v2)) / denom))
+        out.append(float(np.degrees(np.arccos(cos))))
+    return out
+
+
+def _poly_area(pts) -> float:
+    x = [p[0] for p in pts]
+    y = [p[1] for p in pts]
+    return abs(sum(x[i] * y[(i + 1) % len(pts)] - x[(i + 1) % len(pts)] * y[i]
+                   for i in range(len(pts)))) / 2.0
+
+
+def _diag_from_centers(full_img, centers: dict) -> dict:
+    """四角中心（原图坐标）→ 结构化诊断。"""
+    h, w = full_img.shape[:2]
+    corners, glare = {}, {}
+    for name, mid in zip(CORNER_NAMES, (0, 1, 2, 3)):
+        pt = centers.get(mid)
+        if pt:
+            corners[name] = [round(float(pt[0]), 1), round(float(pt[1]), 1)]
+            x, y = int(pt[0]), int(pt[1])
+            patch = full_img[max(0, y - 40):y + 40, max(0, x - 40):x + 40]
+            glare[name] = bool(patch.size and float(patch.mean()) > GLARE_MEAN)
+        else:
+            # 没检到的角不判反光（空白纸面本来就亮，不能当反光），但键要在
+            corners[name] = None
+            glare[name] = False
+    found = [n for n in CORNER_NAMES if corners[n]]
+    missing = [n for n in CORNER_NAMES if not corners[n]]
+    max_dev, ratio, rotation = None, None, None
+    if len(found) == 4:
+        pts = [corners[n] for n in CORNER_NAMES]
+        max_dev = max(abs(a - 90.0) for a in _quad_angles(pts))
+        ratio = _poly_area(pts) / float(w * h)
+        # 页面在画面里整体转了多少度（上边相对水平线，折算到 -45..45）
+        import math as _math
+        ang = _math.degrees(_math.atan2(pts[1][1] - pts[0][1], pts[1][0] - pts[0][0]))
+        ang = (ang + 90.0) % 180.0 - 90.0
+        rotation = abs(ang) if abs(ang) <= 45 else 180.0 - abs(ang)
+    if missing:
+        suggest = "missing_corner"
+    elif max((max_dev or 0.0), (rotation or 0.0)) > TILT_LIMIT_DEG:
+        suggest = "tilt"      # 透视歪（内角偏）或整体转歪都算
+    elif ratio is not None and ratio < MIN_PAPER_RATIO:
+        suggest = "too_small"
+    elif any(glare.values()):
+        suggest = "glare"
+    else:
+        suggest = None
+    return {
+        "found": len(found), "expected": 4, "missing": missing, "corners": corners,
+        "angles_deg": round(max_dev, 1) if max_dev is not None else None,
+        "rotation_deg": round(rotation, 1) if rotation is not None else None,
+        "paper_ratio": round(ratio, 3) if ratio is not None else None,
+        "glare": glare, "suggest": suggest,
+        "suggest_text": SUGGEST_TEXT.get(suggest, ""),
+    }
+
+
+def diagnose(image_path):
+    """只做标定诊断（不判卷）→ {"warp_ok", "diag", "error"}。永不抛异常。"""
+    try:
+        full_img, meta, code, why = _read_photo(image_path)
+        if full_img is None:
+            return {"warp_ok": False, "diag": None,
+                    "error": code or "image_unreadable", "detail": why}
+        work, scale = _work_image(full_img)
+        centers, mirrored = detect_markers_with_mirror(work)
+        if centers and scale and scale != 1.0:
+            centers = {k: (v[0] / scale, v[1] / scale) for k, v in centers.items()}
+        diag = _diag_from_centers(full_img, centers)
+        diag["mirrored"] = mirrored
+        diag["photo"] = meta
+        return {"warp_ok": len(centers) >= 4, "diag": diag, "error": None}
+    except Exception as e:
+        return {"warp_ok": False, "diag": None, "error": "internal_error",
+                "detail": "%s: %s" % (type(e).__name__, e)}
+
+
+def _diag_font(size: int, bold: bool = False):
+    for p in (r"C:\Windows\Fonts\msyhbd.ttc" if bold else r"C:\Windows\Fonts\msyh.ttc",
+              r"C:\Windows\Fonts\simhei.ttf"):
+        if os.path.exists(p):
+            try:
+                from PIL import ImageFont
+                return ImageFont.truetype(p, size, index=0)
+            except Exception:
+                continue
+    from PIL import ImageFont
+    return ImageFont.load_default()
+
+
+def diag_image(image_path, diag: dict, out_path: str):
+    """把诊断画成图：绿圈=检出的角，红箭头=没拍到的角 + 顶部一句话原因。"""
+    from PIL import Image, ImageDraw
+    try:
+        img = Image.open(image_path).convert("RGB")
+    except Exception:
+        return None
+    W, H = img.size
+    d = ImageDraw.Draw(img)
+    small, big = _diag_font(max(22, int(min(W, H) * 0.022))), _diag_font(
+        max(26, int(min(W, H) * 0.03)), bold=True)
+    corners = (diag or {}).get("corners") or {}
+    r = max(18, int(min(W, H) * 0.018))
+    targets = {"TL": (int(W * 0.12), int(H * 0.10)), "TR": (int(W * 0.88), int(H * 0.10)),
+               "BR": (int(W * 0.88), int(H * 0.90)), "BL": (int(W * 0.12), int(H * 0.90))}
+    for name in CORNER_NAMES:
+        pt = corners.get(name)
+        if pt:
+            x, y = float(pt[0]), float(pt[1])
+            d.ellipse([x - r, y - r, x + r, y + r], outline=(0, 170, 60), width=max(4, r // 5))
+            d.text((x + r + 6, y - r), name, font=small, fill=(0, 140, 40))
+        else:
+            tx, ty = targets[name]
+            cx, cy = int(W * 0.5), int(H * 0.5)
+            d.line([(cx, cy), (tx, ty)], fill=(215, 30, 30), width=max(5, r // 4))
+            d.ellipse([tx - r, ty - r, tx + r, ty + r], outline=(215, 30, 30),
+                      width=max(4, r // 5))
+            d.text((tx - r, ty + r + 4), "让 %s 入镜" % name, font=small, fill=(180, 20, 20))
+    text = (diag or {}).get("suggest_text") or "四角没有全部检出，请重拍"
+    band = max(46, int(H * 0.05))
+    d.rectangle([0, 0, W, band], fill=(255, 238, 238))
+    d.text((int(W * 0.012), int(band * 0.2)), text, font=big, fill=(160, 0, 0))
+    try:
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        img.save(out_path)
+        return out_path
+    except Exception:
+        return None
+
+
 def _warp_photo(image_path):
     """读图 → ArUco 标定 → 复原到 2480×3508。→ (norm|None, photo_meta, err_code, err_msg)"""
     full_img, photo_meta, code, why = _read_photo(image_path)
     if full_img is None:
-        return None, photo_meta, code or "warp_failed", why or ("读图失败: %s" % image_path)
+        return None, photo_meta, code or "warp_failed", (
+            why or ("读图失败: %s" % image_path)), None
     work, scale = _work_image(full_img)
     centers, mirrored = detect_markers_with_mirror(work)
     if mirrored:
         photo_meta["mirror_fixed"] = True
-    if len(centers) < 4:
-        return None, photo_meta, "warp_failed", "只检出 %d/4 个 ArUco。%s" % (
-            len(centers), WARP_HINT)
     if scale and scale != 1.0:
         centers = {k: (v[0] / scale, v[1] / scale) for k, v in centers.items()}
+    diag = _diag_from_centers(full_img, centers)
+    diag["mirrored"] = mirrored
+    if len(centers) < 4:
+        txt = "%s（只检出 %d/4 个）" % (diag.get("suggest_text") or WARP_HINT, len(centers))
+        return None, photo_meta, "warp_failed", txt, diag
     M = homography_from_markers(centers)
     if M is None:
-        return None, photo_meta, "warp_failed", "四角单应矩阵求解失败。%s" % WARP_HINT
+        return None, photo_meta, "warp_failed", "四角单应矩阵求解失败。%s" % WARP_HINT, diag
     try:
         norm = cv2.warpPerspective(full_img, M, (PAGE_W, PAGE_H),
                                    flags=cv2.INTER_LINEAR, borderValue=255)
     except Exception as e:
-        return None, photo_meta, "warp_failed", "透视复原失败（%s）。%s" % (e, WARP_HINT)
-    return norm, photo_meta, None, ""
+        return None, photo_meta, "warp_failed", "透视复原失败（%s）。%s" % (e, WARP_HINT), diag
+    return norm, photo_meta, None, "", diag
 
 
 def _looks_legacy(gray, page) -> bool:
@@ -894,9 +1056,9 @@ def _grade_image(conn, pid, image_path, ocr, out_root):
     if not pages:
         return _err("no_card", "该卷没有 card 几何（还没生成答题卡？）", pid)
 
-    norm, photo_meta, code, why = _warp_photo(image_path)
+    norm, photo_meta, code, why, diag = _warp_photo(image_path)
     if norm is None:
-        return _err(code or "warp_failed", why, pid)
+        return _err(code or "warp_failed", why, pid, diag=diag)
 
     # ---- 卷号 QR：防串卷
     qr_payload, qr_page = None, None

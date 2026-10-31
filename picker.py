@@ -364,6 +364,9 @@ def normalize_params(params: dict) -> dict:
                           "空题（is_empty=1）没有题干，无法印卷")
     p["requirements"] = rq
 
+    # 附校准页：用户反馈第 5 条（打印要 100% 比例，太脆）→ 默认附一页 100mm 校准页
+    p["calibration"] = _as_bool(params.get("calibration", True), "calibration")
+
     layout = str(params.get("layout") or DEFAULT_LAYOUT).strip().lower()
     if layout not in LAYOUTS:
         raise SelectError("layout 只能是 %s：%r" % (" / ".join(LAYOUTS), params.get("layout")))

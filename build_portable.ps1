@@ -15,7 +15,7 @@
     可重复执行：每次先清 dist\<名>\ 与 build\<名>\，再重新打包；题库用 robocopy /MIR 增量同步。
 
 .PARAMETER Name      产物名（默认 数学题库工作台）
-.PARAMETER Version   zip 里的版本号（默认 v1.1）
+.PARAMETER Version   zip 名与包内 README/版本行（默认 v1.2）
 .PARAMETER Python    用哪个解释器（默认 python）
 .PARAMETER SkipQbank 跳过复制题库（只验代码打包，速度快）
 .PARAMETER NoZip     不生成 zip
@@ -27,7 +27,7 @@
 #>
 param(
     [string]$Name = "数学题库工作台",
-    [string]$Version = "v1.1",
+    [string]$Version = "v1.2",
     [string]$Python = "python",
     [switch]$SkipQbank,
     [switch]$NoZip,
@@ -59,6 +59,16 @@ foreach ($need in @("server.py", "launcher.py", "templates", "static", "config.j
 }
 Ok "源码与资源齐全（$App）"
 
+Step "0b) 校验答题卡标识是 5×5 新版（防止把 legacy 4×4 卡打进包）"
+$cardPy = Join-Path $App "card.py"
+if (-not (Test-Path $cardPy)) { throw "找不到 card.py：$cardPy（答题卡模块缺失，不能打包）" }
+$cardSrc = Get-Content $cardPy -Raw -Encoding UTF8
+$gridMatch = [regex]::Match($cardSrc, '(?m)^\s*ID_GRID\s*=\s*(\d+)')
+if (-not $gridMatch.Success) { throw "card.py 里找不到 ID_GRID 常量，无法确认是 5×5 新卡；打包中止（用户装了会判 legacy_card）" }
+$idGrid = [int]$gridMatch.Groups[1].Value
+if ($idGrid -ne 5) { throw "答题卡标识是 $idGrid×$idGrid，不是 5×5（t46 新版）；打包中止，免得用户装了被判 legacy_card" }
+if ($cardSrc -notmatch 'ID_GRID \* ID_GRID') { throw "card.py 里没有 5×5=25 位的用法（ID_GRID*ID_GRID），疑似旧版；打包中止" }
+Ok "答题卡标识 = 5×5（ID_GRID=5；25 位 = 20 位题号 + 5 位 CRC）"
 Step "1) 清理旧产物"
 if (-not $NoClean) {
     foreach ($p in @($Target, (Join-Path $Work $Name))) {
@@ -73,11 +83,12 @@ Push-Location $App
 try {
     $pyArgs = @(
         "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir",
-        "--name", $Name, "--distpath", $Dist, "--workpath", $Work,
-        "--add-data", "templates;templates",
-        "--add-data", "static;static",
-        "--add-data", "data\app.db;data",
-        "--add-data", "config.json;.",
+        "--name", $Name, "--distpath", $Dist, "--workpath", $Work, "--specpath", $Work,
+        # 用绝对路径：--specpath 把 spec 放到 build\ 里，相对路径会被按 spec 目录解析
+        "--add-data", "$App\templates;templates",
+        "--add-data", "$App\static;static",
+        "--add-data", "$App\data\app.db;data",
+        # config.json 不从这里进包：真实 config 带 OCR token，见 2b) 脱敏后再拷进 _internal
         # uvicorn 是动态 import，必须显式声明，否则打包后启动报 "No module named uvicorn.loops.auto"
         "--hidden-import", "uvicorn.logging",
         "--hidden-import", "uvicorn.loops.auto",
@@ -88,6 +99,9 @@ try {
         "--hidden-import", "uvicorn.protocols.websockets.websockets_impl",
         "--hidden-import", "uvicorn.lifespan.on",
         "--hidden-import", "uvicorn.lifespan.off",
+        # ocr.pin_stdlib_select() 会重 import select（打包后容易丢），显式声明
+        "--hidden-import", "select",
+        "--hidden-import", "selectors",
         # Word COM（render.py 里是 try/import，静态分析看不到）
         "--hidden-import", "win32com.client",
         "--hidden-import", "pythoncom",
@@ -114,25 +128,74 @@ $Exe = Join-Path $Target "$Name.exe"
 if (-not (Test-Path $Exe)) { throw "没生成 exe：$Exe" }
 Ok ("exe: {0}  ({1:N1} MB)" -f $Exe, ((Get-Item $Exe).Length / 1MB))
 
+Step "2b) 生成打包用配置（脱敏：不带 OCR token）"
+$assets = Join-Path $Work "_assets"
+New-Item -ItemType Directory -Force -Path $assets | Out-Null
+$port = 8710
+try {
+    $realCfg = Get-Content (Join-Path $App "config.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($realCfg.server -and $realCfg.server.port) { $port = [int]$realCfg.server.port }
+} catch { Warn "读现有 config.json 失败，端口用默认 8710" }
+$packCfg = [ordered]@{
+    "_note"  = "便携版默认配置：不含任何密钥，OCR 默认本机 manual（填空/解答留待人工确认）。要用云端识别再填 token，见 README-便携版.txt。"
+    "ocr"     = [ordered]@{
+        "backend"   = "manual"
+        "timeout_s" = 120
+        "poll_s"    = 2
+        "paddle_vl" = [ordered]@{
+            "token"   = ""
+            "model"   = "PaddleOCR-VL-1.6"
+            "job_url" = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+        }
+        "vlm"       = [ordered]@{ "base_url" = ""; "key" = ""; "model" = "" }
+    }
+    "server"  = [ordered]@{ "host" = "127.0.0.1"; "port" = $port; "pin" = "" }
+}
+[System.IO.File]::WriteAllText((Join-Path $assets "config.json"),
+    ($packCfg | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+$example = Join-Path $App "config.example.json"
+if (Test-Path $example) { Copy-Item $example (Join-Path $assets "config.example.json") -Force }
+# 放进 PyInstaller 的 _internal（启动时装进 exe 旁边；launcher.bootstrap_file 只在缺失时复制）
+$internal = Join-Path $Target "_internal"
+if (-not (Test-Path $internal)) { throw "找不到 $internal：PyInstaller 没按 onedir 产出" }
+Copy-Item (Join-Path $assets "config.json") (Join-Path $internal "config.json") -Force
+if (Test-Path (Join-Path $assets "config.example.json")) {
+    Copy-Item (Join-Path $assets "config.example.json") (Join-Path $internal "config.example.json") -Force
+}
+Ok "打包用 config.json 已脱敏（ocr.backend=manual，无 token）并放进 _internal"
+[System.IO.File]::WriteAllText((Join-Path $internal "VERSION.txt"), $Version.TrimStart("vV") + "`n", (New-Object System.Text.UTF8Encoding($false)))
+Ok "包内版本 = $Version（写进 _internal\VERSION.txt，启动横幅/--check 会显示它）"
+
 Step "3) 复制题库 docx → qbank\（只读复制，不动 E:\OCR 原件）"
 if ($SkipQbank) {
     Warn "按 -SkipQbank 跳过题库复制（卷面/PDF 会因为没有 docx 而不可用）"
 } else {
+    # 【关键】qbank 就在 E:\OCR 里面：绝不能递归复制，否则 robocopy 会把 dist 自己拷进 qbank。
+    #（第一次构建踩过：/MIR 递归出 6 万多个 qbank/dist/... 目录。）所以清空 + 只拷顶层（/LEV:1）。
+    if (Test-Path $QbankDst) {
+        $empty = Join-Path $Work "_empty"
+        New-Item -ItemType Directory -Force -Path $empty | Out-Null
+        $rc0 = Start-Process -FilePath "robocopy" -ArgumentList @("`"$empty`"", "`"$QbankDst`"", "/MIR", "/NFL", "/NDL", "/NJH", "/NJS", "/NP") -Wait -PassThru -NoNewWindow
+        if ($rc0.ExitCode -ge 8) { throw "清空旧 qbank 失败（退出码 $($rc0.ExitCode)）" }
+    }
     New-Item -ItemType Directory -Force -Path $QbankDst | Out-Null
-    # robocopy 处理两万个 5KB 小文件比 Copy-Item 快一个数量级；/MIR 让重跑变增量
     $rc = Start-Process -FilePath "robocopy" `
-        -ArgumentList @("`"$QbankSrc`"", "`"$QbankDst`"", "*.docx", "/MIR", "/MT:16", "/NFL", "/NDL", "/NJH", "/NJS", "/NP") `
+        -ArgumentList @("`"$QbankSrc`"", "`"$QbankDst`"", "*.docx", "/LEV:1", "/MT:16", "/NFL", "/NDL", "/NJH", "/NJS", "/NP") `
         -Wait -PassThru -NoNewWindow
     if ($rc.ExitCode -ge 8) { throw "robocopy 复制题库失败（退出码 $($rc.ExitCode)）" }
+    $subs = @(Get-ChildItem $QbankDst -Directory -ErrorAction SilentlyContinue)
+    if ($subs.Count -gt 0) {
+        throw "qbank 里出现了 $($subs.Count) 个子目录（第一个：$($subs[0].Name)）——递归复制了，立刻停"
+    }
     $qCount = (Get-ChildItem $QbankDst -Filter *.docx -File | Measure-Object).Count
     $qMB = (Get-ChildItem $QbankDst -Filter *.docx -File | Measure-Object Length -Sum).Sum / 1MB
-    Ok ("qbank: {0:N0} 份 docx / {1:N1} MB" -f $qCount, $qMB)
+    Ok ("qbank: {0:N0} 份 docx / {1:N1} MB（无子目录，确认只拷了顶层）" -f $qCount, $qMB)
     if ($qCount -lt 20000) { Warn "题库只有 $qCount 份，明显偏少，确认 E:\OCR 原件是否完整" }
 }
 
 Step "4) 写 README-便携版.txt（UTF-8 无 BOM）"
 $Readme = @'
-数学题库工作台 · 便携版 v1.1
+数学题库工作台 · 便携版 __VERSION__
 ============================================================
 
 一、怎么用
@@ -152,10 +215,19 @@ $Readme = @'
   _internal\             程序本体（Python 运行时 + 依赖 + 模板），别动
   qbank\                 题库：22,898 份题目 docx（只读，别改/别删）
   data\app.db            题库索引 + 你的卷子记录（**第一次启动会从包内复制一份到这里**）
-  config.json            配置：端口、访问码、OCR token（**含密钥，别外传/别发群里**）
+  config.json            配置：端口、访问码、OCR 设置（**包里这份是脱敏的，不含任何密钥**）
+  config.example.json    配置模板（字段说明）
   out\                   生成的卷子/答题卡/判分图都在这（第一次运行自动创建，可随时删）
+  README-便携版.txt      就是你正在看的这个
 
-四、手机拍照判卷（局域网）
+四、要不要开云端 OCR
+  便携版默认 ocr.backend = "manual"：填空/解答判卷结果会留在「待人工确认」，不联网、不花钱。
+  想让它自动认字：编辑 config.json，把 ocr.backend 改成 "paddle_vl"，
+  再把你的 paddle_vl.token 填进去（token 只放这个文件，别外传/别发群里）。
+  也可以不写进文件，用环境变量：set OCR_TOKEN=xxxxx 再启动。
+  不想让任何作答图外发，就保持 manual。
+
+五、手机拍照判卷（局域网）
   默认只允许本机访问。要让手机连，命令行运行：
       数学题库工作台.exe --lan
   窗口会打印「手机/同 WiFi 打开」的地址和 4 位访问码；手机扫码/输地址后输入访问码即可。
@@ -163,20 +235,29 @@ $Readme = @'
   * Windows 防火墙弹窗要允许（专用网络）。
   * 关掉 --lan 就恢复只本机。
 
-五、常见问题
+六、常见问题
   * 端口 8710 被占用：程序会自动 +1（看窗口里的实际地址）。
   * 想换端口：--port 8800；想改默认值：编辑 config.json 的 server.port。
   * 打不开/白屏：命令行运行「数学题库工作台.exe --check」，会打印题库/数据库/Word/端口自检。
   * 想从头开始：删掉 data\app.db 与 out\（下次启动会重新从包内复制数据库）。
   * 换电脑后题库更新：把新的 qbank\ 整个覆盖过去即可（data\ 保留你的卷子记录）。
+  * 首次启动会从包内 _internal\ 复制 120MB 数据库到 data\，慢 1~3 秒属正常。
 
-六、隐私
-  全部在本机运行；只有「填空/解答 OCR 识别」会把你裁的作答图发到云端识别服务
-  （config.json 里的 OCR token）。不想联网就把 config.json 的 ocr.backend 改成 "manual"。
+七、隐私
+  全部在本机运行；只有你自己把 ocr.backend 改成云端后端时，才会把裁出的作答图发到识别服务。
+  默认 manual 模式不联网。
 '@
+$Readme = $Readme.Replace('__VERSION__', $Version)
 $ReadmePath = Join-Path $Target "README-便携版.txt"
 [System.IO.File]::WriteAllText($ReadmePath, $Readme, (New-Object System.Text.UTF8Encoding($false)))
 Ok "已写 $ReadmePath"
+
+Step "4b) 自动自检 exe --check（不落盘：不会把 120MB 数据库复制进包里）"
+$checkOut = & $Exe --check 2>&1 | Out-String
+$checkCode = $LASTEXITCODE
+foreach ($line in ($checkOut.Trim() -split "`r?`n")) { Write-Host "    $line" }
+if ($checkCode -ne 0) { throw "exe --check 失败（退出码 $checkCode）：题库/数据库/配置至少缺一项，先别发版" }
+Ok "exe --check 通过（打包产物可直接运行）"
 
 Step "5) 统计体积"
 $files = Get-ChildItem $Target -Recurse -File

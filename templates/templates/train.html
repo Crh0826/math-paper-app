@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h1>错题训练</h1>
+  <p class="lede">
+    把判卷里的错题，按「同题族 → 同知识点 → 同章 → 跨章」抽同类题，生成一份新卷（也带答题卡）。
+    <span class="muted">原错题不会再出现在训练卷里。</span>
+  </p>
+</div>
+
+<div class="card">
+  <h2>从判卷结果生成</h2>
+  {% if summary %}
+  <p>
+    判卷 <span class="mono">{{ summary.sid }}</span>
+    {% if summary.pid %}（卷号 <a class="mono" href="/papers/{{ summary.pid }}">{{ summary.pid }}</a>）{% endif %}
+    找到 <strong>{{ summary.n }}</strong> 道错题／待确认题。
+  </p>
+  {% else %}
+  <p class="muted">还没选判卷结果 —— 也可以直接在下面贴题号。</p>
+  {% endif %}
+  <p class="field-hint">
+    正常流程：<a href="/submissions">判卷页</a> 上传答题卡 → 结果页点「用错题生成训练卷」。
+    想从某次结果生成，也可以把结果页的判卷编号填到下面。
+  </p>
+</div>
+
+<form class="form" method="post" action="/train">
+  <section class="card">
+    <h2>参数</h2>
+    <div class="grid grid-2">
+      <label class="field">
+        <span class="field-label">判卷编号（可选）</span>
+        <input type="text" name="sid" value="{{ sid }}" placeholder="S20261031-153045-ab12cd" autocomplete="off">
+        <span class="field-hint">填了就从这次判卷里自动取错题；不填就只看下面贴的题号。</span>
+      </label>
+      <label class="field">
+        <span class="field-label">每道错题抽几道同类题</span>
+        <input type="number" name="n_per" value="3" min="1" max="10" step="1">
+        <span class="field-hint">默认 3。10 道错题 × 3 = 30 题的卷子，别太厚。</span>
+      </label>
+    </div>
+    <label class="field" style="margin-top:12px">
+      <span class="field-label">错题号（可选，逗号或空格分隔）</span>
+      <textarea name="nos" rows="3" placeholder="00001, 00002, 00097">{{ nos_text }}</textarea>
+      <span class="field-hint">题号印在卷面与答题卡上；填了就以这些题为准，优先级高于判卷编号。</span>
+    </label>
+  </section>
+
+  <div class="form-actions">
+    <span class="muted">生成要排版 + 出答题卡，约十几秒。</span>
+    <button class="btn btn-primary" type="submit">生成训练卷</button>
+  </div>
+</form>
+{% endblock %}

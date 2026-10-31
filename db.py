@@ -13,8 +13,18 @@ CREATE TABLE IF NOT EXISTS meta (
   value TEXT
 );
 
+-- t51 · 多学科：一个库可以装多套教材/学科；老库默认全部归到 math7a（数学·七年级上·沪科版）
+CREATE TABLE IF NOT EXISTS subjects (
+  subject_pk  TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,          -- 学科：数学 / 语文 / 英语…
+  grade       TEXT DEFAULT '',        -- 年级：七年级上
+  version     TEXT DEFAULT '',        -- 教材版本：沪科版 / 人教版
+  created_at  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS questions (
   no            TEXT PRIMARY KEY,
+  subject_pk    TEXT DEFAULT 'math7a',
   qtype         TEXT NOT NULL,
   option_count  INTEGER DEFAULT 0,
   sub_count     INTEGER DEFAULT 0,
@@ -51,6 +61,7 @@ CREATE TABLE IF NOT EXISTS families (
 
 CREATE TABLE IF NOT EXISTS kps (
   kp_id       TEXT PRIMARY KEY,
+  subject_pk  TEXT DEFAULT 'math7a',
   chapter     TEXT,
   kp          TEXT,
   n_questions INTEGER DEFAULT 0
@@ -115,12 +126,51 @@ CREATE INDEX IF NOT EXISTS idx_dg_group ON dup_groups(group_id);
 """
 
 
+DEFAULT_SUBJECT = "math7a"
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """老库升级：补 subject_pk 列 + 默认学科行（幂等）。"""
+    for table in ("questions", "kps"):
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+        if cols and "subject_pk" not in cols:
+            conn.execute("ALTER TABLE %s ADD COLUMN subject_pk TEXT DEFAULT 'math7a'" % table)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_q_subject ON questions(subject_pk)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_kp_subject ON kps(subject_pk)")
+    conn.execute(
+        "INSERT OR IGNORE INTO subjects(subject_pk, name, grade, version, created_at)"
+        " VALUES(?,?,?,?,datetime('now'))",
+        (DEFAULT_SUBJECT, "数学", "七年级上", "沪科版"))
+
+
 def connect(path: str) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate(conn)
+    conn.commit()
     return conn
+
+
+def ensure_subject(conn: sqlite3.Connection, subject_pk: str, name: str,
+                   grade: str = "", version: str = "") -> str:
+    """登记（或更新）一个学科，返回 subject_pk。"""
+    conn.execute(
+        "INSERT INTO subjects(subject_pk, name, grade, version, created_at)"
+        " VALUES(?,?,?,?,datetime('now'))"
+        " ON CONFLICT(subject_pk) DO UPDATE SET name=excluded.name,"
+        " grade=excluded.grade, version=excluded.version",
+        (subject_pk, name, grade, version))
+    return subject_pk
+
+
+def list_subjects(conn: sqlite3.Connection) -> list:
+    try:
+        return conn.execute("SELECT subject_pk, name, grade, version, created_at"
+                            " FROM subjects ORDER BY subject_pk").fetchall()
+    except sqlite3.OperationalError:
+        return []
 
 
 def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:

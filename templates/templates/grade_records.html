@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page_title }} · 数学题库工作台</title>
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  /* 判卷记录：手机优先。宽屏是表格，≤720px 自动变成一张张卡片（标题 + 得分大字 + 徽章 + 按钮） */
+  .banner-ok { background: var(--ok-soft); border-color: #c5e5cf; }
+  .banner-ok .banner-head { color: #14632c; }
+  .footer {
+    max-width: 1080px; margin: 0 auto; padding: 18px 20px 42px;
+    color: var(--muted); font-size: 12.5px;
+    display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+
+  /* 手机：7 个导航项在 390px 放不下（app.css 的 .topbar-inner 不换行）→ 允许换行并缩小间距 */
+  html, body { max-width: 100%; }
+  .page { max-width: 100%; }
+  .topbar-inner { flex-wrap: wrap; }
+  .nav { flex-wrap: wrap; }
+
+  .rec-head { display: block; }
+  .rec-count { display: inline-block; margin-left: 8px; font-size: 13px; color: var(--muted); }
+
+  .filters { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 0 0 14px; }
+  .filters input[type="search"] {
+    flex: 1 1 220px; min-width: 0; padding: 8px 10px; font: inherit; font-size: 14px;
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  .filters select {
+    padding: 8px 10px; font: inherit; font-size: 14px; border: 1px solid var(--line);
+    border-radius: 8px; background: #fff; max-width: 100%; min-width: 0;
+  }
+
+  .records-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .records-table th, .records-table td {
+    text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line-soft);
+    vertical-align: middle;
+  }
+  .records-table th { font-size: 12.5px; color: var(--muted); font-weight: 600; }
+  .records-table tr:last-child td { border-bottom: none; }
+  .rec-title { display: block; font-size: 14px; }
+  .rec-pid, .rec-sid { display: block; font-size: 11.5px; }
+  .rec-num { font-size: 20px; color: var(--accent); }
+  .rec-pct { display: block; font-size: 11.5px; color: var(--muted); }
+  .rec-actions { white-space: nowrap; }
+  .rec-actions .btn { padding: 5px 10px; font-size: 12.5px; }
+  .rec-del { display: inline; margin: 0; }
+  .btn-danger { color: var(--danger); border-color: #f2c2c2; background: var(--danger-soft); }
+  .btn-danger:hover { border-color: #e3a5a5; }
+  .rec-empty { text-align: center; padding: 34px 12px; color: var(--ink-2); }
+
+  @media (max-width: 720px) {
+    .page { padding: 16px 10px 36px; }
+    .records-table { display: block; }
+    .records-table thead { display: none; }
+    .records-table tbody { display: block; }
+    .records-table tr.rec-card {
+      display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline;
+      background: #fff; border: 1px solid var(--line); border-radius: 12px;
+      box-shadow: var(--shadow); padding: 12px 14px; margin-bottom: 12px;
+      box-sizing: border-box; max-width: 100%;
+    }
+    .records-table td { display: block; border: none; padding: 0; width: auto; max-width: 100%; }
+    .rec-main { order: 1; flex: 1 1 100%; }
+    .rec-title { font-size: 15.5px; font-weight: 600; }
+    .rec-score { order: 2; flex: 0 0 auto; }
+    .rec-num { font-size: 30px; line-height: 1.1; }
+    .rec-pending { order: 3; flex: 0 0 auto; }
+    .rec-status { order: 4; flex: 0 0 auto; }
+    .rec-when { order: 5; flex: 1 1 100%; color: var(--muted); font-size: 12.5px; }
+    /* 动作区竖排（block）：手机上最稳，永远不会横向溢出 */
+    .records-table td.rec-actions { order: 6; flex: 1 1 100%; display: block; margin-top: 8px; white-space: normal; }
+    .records-table td.rec-actions .btn {
+      display: block; width: 100%; margin: 0 0 8px; text-align: center;
+      padding: 10px 8px; font-size: 14px;
+    }
+    .rec-del { display: block; }
+    .rec-del .btn { display: block; width: 100%; margin: 0; }
+    .rec-title, .rec-pid, .rec-sid, .lede, .rec-head, .rec-count { min-width: 0; overflow-wrap: anywhere; }
+    .filters input[type="search"], .filters select { flex: 1 1 100%; }
+  }
+
+  @media (max-width: 520px) {
+    body { overflow-x: hidden; }
+    .topbar-inner { gap: 8px; padding: 8px 12px; }
+    .nav { gap: 2px; }
+    .nav-item { padding: 4px 7px; font-size: 13px; }
+    .ghost-link { display: none; }
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">Σ</span>
+      <span class="brand-text">
+        <strong>数学题库工作台</strong>
+        <small>沪科版七年级上 · 判卷记录</small>
+      </span>
+    </a>
+    <nav class="nav" aria-label="主导航">
+      <a class="nav-item" href="/">组卷</a>
+      <a class="nav-item" href="/papers">我的卷子</a>
+      <a class="nav-item" href="/submissions">判卷</a>
+      <a class="nav-item is-active" href="/records" aria-current="page">判卷记录</a>
+      <a class="nav-item" href="/train">训练</a>
+      <a class="nav-item" href="/guide">使用指南</a>
+      <a class="nav-item" href="/health">自检</a>
+    </nav>
+    <a class="ghost-link mono" href="/healthz" target="_blank" rel="noopener">healthz</a>
+  </div>
+</header>
+
+<main class="page">
+  {% from "_banner.html" import banner %}
+  <div class="page-head">
+    <h1>判卷记录</h1>
+    <p class="lede rec-head">
+      <span>判过的卷子都在这里：点「查看结果」看逐题判定，点「导出证据包」拿批注图与 evidence.json。</span>
+      <span class="rec-count">共 {{ total }} 次判卷{% if items | length != total %} · 当前显示 {{ items | length }} 条{% endif %}{% if n_pending %} · 其中待确认 {{ n_pending }} 条{% endif %}</span>
+    </p>
+  </div>
+
+  {% if notice %}{{ banner(notice, notice.tone) }}{% endif %}
+
+  <form class="filters" method="get" action="/records">
+    <input type="search" name="q" value="{{ f_q }}" placeholder="搜卷号 / 标题 / 判卷编号" autocomplete="off">
+    <select name="pid" aria-label="按卷子筛选">
+      <option value="">全部卷子</option>
+      {% for p in papers %}
+      <option value="{{ p.pid }}"{% if p.pid == f_pid %} selected{% endif %}>{{ p.title | truncate(16, True, '…') if p.title else p.pid }}（判 {{ p.n }} 次）</option>
+      {% endfor %}
+    </select>
+    <label class="check-inline">
+      <input type="checkbox" name="only" value="pending"{% if f_only == 'pending' %} checked{% endif %}>
+      只看待确认
+    </label>
+    <button class="btn btn-primary" type="submit">筛选</button>
+    {% if f_pid or f_q or f_only %}<a class="btn" href="/records">清除筛选</a>{% endif %}
+  </form>
+
+  {% if items %}
+  <section class="card" style="padding: 6px 10px;">
+    <div class="records" data-layout="cards-mobile">
+      <table class="records-table">
+        <thead>
+          <tr>
+            <th>时间</th><th>卷子</th><th>得分</th><th>待确认</th><th>状态</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for it in items %}
+          <tr class="rec-card" id="rec-{{ it.sid }}">
+            <td class="rec-when" data-label="时间"><span class="mono">{{ it.when }}</span></td>
+            <td class="rec-main" data-label="卷子">
+              <strong class="rec-title">{{ it.title or '（卷子记录已不在，仍可看结果）' }}</strong>
+              <span class="mono muted rec-pid">卷号 {{ it.pid }}</span>
+              <span class="mono muted rec-sid">{{ it.sid }}</span>
+            </td>
+            <td class="rec-score" data-label="得分">
+              <strong class="rec-num">{{ it.score }} / {{ it.full }}</strong>
+              <span class="rec-pct">{{ it.pct }}%</span>
+            </td>
+            <td class="rec-pending" data-label="待确认">
+              {% if it.pending_items %}<span class="pill pill-warn">待确认 {{ it.pending_items }} 题</span>
+              {% else %}<span class="muted">—</span>{% endif %}
+            </td>
+            <td class="rec-status" data-label="状态">
+              <span class="pill{% if it.tone %} pill-{{ it.tone }}{% endif %}">{{ it.status }}</span>
+            </td>
+            <td class="rec-actions" data-label="">
+              <a class="btn btn-primary" href="/submissions/{{ it.sid }}">查看结果</a>
+              <a class="btn" href="/submissions/{{ it.sid }}/export.zip">导出证据包</a>
+              <form class="rec-del" method="post" action="/records/{{ it.sid }}/delete"
+                    onsubmit="return confirm('删除 {{ it.sid }} 这条判卷记录？\n批注图与裁切图会一起删掉，删了不能恢复。');">
+                <button class="btn btn-danger" type="submit">删除</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% else %}
+  <section class="card">
+    <div class="rec-empty">
+      {% if total %}
+      <p>没有符合条件的判卷记录。</p>
+      <p><a class="btn" href="/records">清除筛选，看全部 {{ total }} 条</a></p>
+      {% else %}
+      <p>还没有判过卷子。</p>
+      <p>判完第一份就会出现在这里：<a class="btn btn-primary" href="/submissions">去判卷</a></p>
+      {% endif %}
+    </div>
+  </section>
+  {% endif %}
+
+  <div class="form-actions">
+    <a class="btn btn-primary" href="/submissions">判新的一份</a>
+    <a class="btn" href="/records.csv" title="全部判卷记录汇总，Excel 直接打开">导出全部 CSV</a>
+    <a class="btn" href="/papers">我的卷子</a>
+    <a class="btn" href="/guide#photo">拍照要求</a>
+  </div>
+  <p class="muted" style="font-size:12.5px;margin:8px 0 0;">
+    学情报告口径：按知识点聚合的正确率（/papers/&lt;卷号&gt;/report.csv）在同一份卷被判过多次时只取
+    <strong>最近一次</strong>提交，避免同一张卷被重复计数。
+  </p>
+</main>
+
+<footer class="footer">
+  <span>题库组卷 · 答题卡生成 · 拍照判卷 · 错题训练</span>
+  <span class="mono">本地运行，数据不出机器</span>
+</footer>
+</body>
+</html>

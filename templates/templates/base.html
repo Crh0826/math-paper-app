@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page_title }} · {{ brand }}</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">Σ</span>
+      <span class="brand-text">
+        <strong>{{ brand }}</strong>
+        <small>{{ brand_sub }}</small>
+      </span>
+    </a>
+    <nav class="nav" aria-label="主导航">
+      {% for item in nav %}
+        {% if item.enabled %}
+        <a class="nav-item{% if item.key == nav_active %} is-active{% endif %}" href="{{ item.href }}"
+           {% if item.key == nav_active %}aria-current="page"{% endif %}>{{ item.label }}</a>
+        {% else %}
+        <span class="nav-item is-soon" aria-disabled="true" title="{{ item.soon_hint }}">{{ item.label }}<i class="badge">未启用</i></span>
+        {% endif %}
+      {% endfor %}
+    </nav>
+    <a class="ghost-link mono" href="/healthz" target="_blank" rel="noopener" title="自检数据（JSON）">healthz</a>
+  </div>
+</header>
+
+<main class="page">
+  {% from "_banner.html" import banner with context %}
+  {% if error %}{{ banner(error, "error") }}{% endif %}
+  {% for w in warnings %}{{ banner(w, "warn") }}{% endfor %}
+  {% block content %}{% endblock %}
+</main>
+
+<footer class="footer">
+  <span>{{ app_title }} · v{{ app_version }}</span>
+  <span class="mono">127.0.0.1:8710 · 本地运行，数据不出机器</span>
+</footer>
+</body>
+</html>

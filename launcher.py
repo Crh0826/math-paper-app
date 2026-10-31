@@ -38,6 +38,23 @@ OUT_REL = "out"
 VERSION = "1.1"
 
 
+def read_version(base: str = None, bundle: str = None) -> str:
+    """版本号：优先读包内 VERSION.txt（构建脚本写进 _internal），没有就用源码默认。"""
+    for root in (base or base_dir(), bundle or bundle_dir()):
+        try:
+            with open(os.path.join(root, "VERSION.txt"), encoding="utf-8-sig") as fh:
+                text = fh.read().strip()
+        except OSError:
+            continue
+        if text:
+            return text.lstrip("vV")
+    return VERSION
+
+
+def _version() -> str:
+    return read_version()
+
+
 # ---------------------------------------------------------------- 目录解析
 def is_frozen() -> bool:
     """是不是 PyInstaller 打出来的 exe。"""
@@ -72,7 +89,8 @@ def resolve_qb_root(base: str = None, candidates=None) -> str | None:
     """题库目录：显式候选 > MATH_QB_ROOT > <base>/qbank > E:\\OCR；都没有返回 None。"""
     base = base or base_dir()
     if candidates is None:
-        candidates = [os.environ.get("MATH_QB_ROOT"),
+        candidates = [os.environ.get("MATH_APP_QBDIR"),
+                      os.environ.get("MATH_QB_ROOT"),
                       os.path.join(base, QB_DIRNAME),
                       FALLBACK_QB_ROOT]
     for path in candidates:
@@ -110,16 +128,32 @@ def bootstrap_file(rel: str, base: str = None, bundle: str = None,
 
 
 def prepare_paths(base: str = None, bundle: str = None, db: str = None,
-                  config: str = None, out: str = None) -> dict:
-    """算好本次运行用到的全部路径（不创建除 data/out 之外的目录）。"""
+                  config: str = None, out: str = None, bootstrap: bool = True) -> dict:
+    """算好本次运行用到的全部路径。
+
+    ``bootstrap=True``（默认）会把 _internal 里的 config.json / data/app.db 复制到 exe 旁边；
+    ``--check`` 走 ``bootstrap=False``：**只体检、不落盘**（否则在 dist 里跑一次 --check
+    就会把 120MB 数据库复制进包里，打 zip 时白白多 120MB）。
+    """
     base = base or base_dir()
     bundle = bundle or bundle_dir()
+    if bootstrap:
+        db_path = os.path.abspath(db) if db else bootstrap_file(DB_REL, base, bundle)
+        cfg_path = os.path.abspath(config) if config else bootstrap_file(CONFIG_REL, base, bundle)
+    else:
+        db_path = os.path.abspath(db) if db else os.path.join(base, DB_REL)
+        cfg_path = os.path.abspath(config) if config else os.path.join(base, CONFIG_REL)
+        # 首次启动前 exe 旁边还没有这两份：回落到包内那份，--check 才看得见真实文件
+        if not os.path.isfile(db_path):
+            db_path = os.path.join(bundle, DB_REL)
+        if not os.path.isfile(cfg_path):
+            cfg_path = os.path.join(bundle, CONFIG_REL)
     info = {
         "base": base,
         "bundle": bundle,
         "qbank": resolve_qb_root(base),
-        "db": os.path.abspath(db) if db else bootstrap_file(DB_REL, base, bundle),
-        "config": os.path.abspath(config) if config else bootstrap_file(CONFIG_REL, base, bundle),
+        "db": db_path,
+        "config": cfg_path,
         "out": os.path.abspath(out) if out else os.path.join(base, OUT_REL),
     }
     return info
@@ -197,6 +231,56 @@ def point_paper_to_qbank(qb_root: str | None) -> bool:
         return False
 
 
+def _install_frozen_stdlib_bridge(names=("select",), force: bool = False) -> bool:
+    """冻结包里把 stdlib 扩展模块「钉」住，防止被 ocr.pin_stdlib_select() 弄丢。
+
+    背景：``ocr.pin_stdlib_select()`` 会临时把「自己所在目录」从 sys.path 移走再 ``import select``
+    （防 app/select.py 遮蔽标准库）。打包后这个目录就是 ``_internal`` —— ``select.pyd`` 也在里面，
+    移走后就 ``ModuleNotFoundError: No module named 'select'``，连带 grade_routes 挂不上、判卷页全 404。
+
+    这里在导入业务模块**之前**先 import 一份真身，并注册一个 meta_path finder：之后无论 sys.path
+    怎么被改，``import select``（包括 reload）都拿回同一个真身。返回是否安装成功。
+    """
+    if not (force or is_frozen()):
+        return False
+    import importlib
+    import importlib.abc
+    import importlib.util
+
+    pinned = {}
+    for name in names:
+        try:
+            pinned[name] = importlib.import_module(name)
+        except Exception:              # noqa: BLE001 - 拿不到就算了，别挡住启动
+            continue
+    if not pinned:
+        return False
+
+    class _Loader(importlib.abc.Loader):
+        def __init__(self, module):
+            self.module = module
+
+        def create_module(self, spec):
+            return self.module
+
+        def exec_module(self, module):     # 已经执行过了，不再跑
+            return None
+
+    class _Finder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            module = pinned.get(fullname)
+            if module is None:
+                return None
+            return importlib.util.spec_from_loader(fullname, _Loader(module))
+
+    for finder in sys.meta_path:
+        if finder.__class__.__name__ == "_Finder" and getattr(finder, "_launcher_bridge", False):
+            return True
+    _Finder._launcher_bridge = True        # 标记，防止重复安装
+    sys.meta_path.insert(0, _Finder())
+    return True
+
+
 def _ensure_out_dir(path: str) -> None:
     try:
         os.makedirs(path, exist_ok=True)
@@ -214,7 +298,7 @@ def _say(text: str = "") -> None:
 
 def banner(info: dict, cfg: dict, port: int) -> None:
     _say("=" * 64)
-    _say("  数学题库工作台 v%s  ·  组卷 / 答题卡 / 拍照判卷 / 错题训练" % VERSION)
+    _say("  数学题库工作台 v%s  ·  组卷 / 答题卡 / 拍照判卷 / 错题训练" % _version())
     _say("  题库：沪科版七年级上 · 约 22,898 题（只读）")
     _say("=" * 64)
     _say("  数据库   %s" % info["db"])
@@ -242,23 +326,31 @@ def banner(info: dict, cfg: dict, port: int) -> None:
 
 
 def word_notice() -> bool:
-    """没 Word 只提示降级，不退出。返回 Word 是否可用。"""
+    """提示 PDF 后端情况（Word / LibreOffice / 都没有），不退出。返回 Word 是否可用。"""
     try:
         import render  # noqa: PLC0415
 
-        ok = bool(render.word_available())
+        probe = render.probe_backend()
     except Exception:              # noqa: BLE001
-        ok = False
-    if not ok:
-        _say("  [!] 没检测到 Microsoft Word：卷面 docx 仍会生成，转 PDF 会失败/降级。")
-        _say("      装 Word 2016+ 后重启本程序即可；组卷选题与判卷功能不受影响。")
-    return ok
+        probe = {"chosen": None, "detail": "探测失败"}
+    if probe.get("chosen") == "word":
+        return True
+    if probe.get("chosen") == "libreoffice":
+        _say("  [i] 没检测到 Microsoft Word，改用 LibreOffice 渲染 PDF（%s）；"
+             % probe.get("detail"))
+        _say("      公式/字体与 Word 可能有细微差异，打印前建议先看一眼 PDF。")
+        _say("      想完全对齐 Word：装 Word 2016+ 后重启本程序。")
+        return False
+    _say("  [!] 没检测到 Microsoft Word，也没检测到 LibreOffice：卷面 docx 仍会生成，转 PDF 会失败。")
+    _say("      装任意一个即可：Word 2016+ / LibreOffice（macOS·Linux 装 LibreOffice 即可）。")
+    _say("      组卷选题与判卷功能不受影响。")
+    return False
 
 
 # ---------------------------------------------------------------- --check
 def describe_environment(info: dict, argv: argparse.Namespace) -> int:
     """只体检不启动：给用户/冒烟脚本一个"到底哪里不对"的答案。"""
-    _say("数学题库工作台 v%s · 环境自检" % VERSION)
+    _say("数学题库工作台 v%s · 环境自检" % _version())
     _say("  打包运行   %s" % ("是（exe）" if is_frozen() else "否（源码）"))
     _say("  程序目录   %s" % info["base"])
     _say("  只读资源   %s" % info["bundle"])
@@ -266,7 +358,21 @@ def describe_environment(info: dict, argv: argparse.Namespace) -> int:
     _say("  数据库     %s%s" % (info["db"], "" if os.path.isfile(info["db"]) else "（缺失）"))
     _say("  配置       %s%s" % (info["config"], "" if os.path.isfile(info["config"]) else "（缺失）"))
     ok_word = word_notice()
-    _say("  Word       %s" % ("可用" if ok_word else "不可用（PDF 会降级）"))
+    try:
+        import render  # noqa: PLC0415
+
+        probe = render.probe_backend()
+        chosen = probe.get("chosen")
+        detail = probe.get("detail") or ""
+    except Exception:              # noqa: BLE001
+        chosen, detail = None, "探测失败"
+    backend_label = {"word": "word", "libreoffice": "libreoffice"}.get(chosen or "", "都没有")
+    _say("  PDF 后端   %s" % backend_label)
+    if chosen:
+        _say("             %s" % detail)
+    else:
+        _say("             PDF 会失败。装 Word 2016+ 或 LibreOffice 任一个即可；")
+        _say("             macOS/Linux 装 LibreOffice；soffice 不在 PATH 时用 LIBREOFFICE_PATH 指过去。")
     host = argv.host or "127.0.0.1"
     try:
         port = free_port(host, argv.port or 8710)
@@ -359,6 +465,10 @@ def main(argv=None) -> int:
     parser.add_argument("--check", action="store_true", help="只自检并打印环境，不启动服务")
     args = parser.parse_args(argv)
 
+    # 打包版必须在导入业务模块之前把 stdlib 的 select 钉住：
+    # ocr.pin_stdlib_select() 会临时把 _internal 移出 sys.path，否则 grade_routes 挂不上（判卷页 404）。
+    _install_frozen_stdlib_bridge()
+
     base = base_dir()
     try:
         os.chdir(base)             # 让相对路径、模板查找都落在程序目录
@@ -366,7 +476,8 @@ def main(argv=None) -> int:
         pass
     if args.qbank:
         os.environ["MATH_QB_ROOT"] = os.path.abspath(args.qbank)
-    info = prepare_paths(base=base, db=args.db, config=args.config, out=args.out)
+    info = prepare_paths(base=base, db=args.db, config=args.config, out=args.out,
+                         bootstrap=not args.check)
     if args.qbank and os.path.isdir(args.qbank):
         info["qbank"] = os.path.abspath(args.qbank)
 

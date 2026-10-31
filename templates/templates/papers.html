@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h1>我的卷子</h1>
+  <p class="lede">
+    共 {{ n_papers }} 份 · 占用 {{ total_mb }} MB
+    <span class="muted">· 产物在 <span class="mono">app\out\&lt;卷号&gt;\</span>，删卷子会把那个目录一起删掉。</span>
+  </p>
+</div>
+
+<p class="field-hint">
+  删除策略：<strong>没判过卷</strong>的卷子连产物目录一起删；<strong>判过卷</strong>的只从列表隐藏，
+  判卷记录与批注图<strong>保留</strong>（占磁盘，可在自检页看「判卷证据」占用）。
+</p>
+
+{% if papers %}
+<table class="papers-table">
+  <thead>
+    <tr>
+      <th>卷号</th>
+      <th>标题</th>
+      <th>创建时间</th>
+      <th>题数</th>
+      <th>页数</th>
+      <th>判卷</th>
+      <th>状态</th>
+      <th>操作</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for p in papers %}
+    <tr>
+      <td class="mono">{{ p.pid }}</td>
+      <td>{{ p.title }}</td>
+      <td class="mono small">{{ p.created_at }}</td>
+      <td>{{ p.n_items }}</td>
+      <td>卷面 {{ p.paper_n }} + 卡 {{ p.card_n }}</td>
+      <td>{% if p.n_submissions %}<span class="mono">判卷 {{ p.n_submissions }} 次</span>{% else %}<span class="muted">未判卷</span>{% endif %}</td>
+      <td>
+        {% if p.has_paper_pdf %}
+        <span class="pill pill-ok">PDF 已生成</span>
+        {% else %}
+        <span class="pill pill-warn">仅答题卡</span>
+        {% endif %}
+        {% if p.has_print_pdf %}<span class="pill pill-ok" title="合并打印件已生成">可合并打印</span>{% endif %}
+      </td>
+      <td class="row-actions">
+        <a class="btn btn-small" href="/papers/{{ p.pid }}">预览</a>
+        {% if p.has_paper_pdf and p.has_card_pdf %}
+        <a class="btn btn-small" href="/papers/{{ p.pid }}/print.pdf">合并下载</a>
+        {% elif p.has_paper_pdf %}
+        <a class="btn btn-small" href="/papers/{{ p.pid }}/pdf">卷面 PDF</a>
+        {% elif p.has_card_pdf %}
+        <a class="btn btn-small" href="/papers/{{ p.pid }}/card.pdf">答题卡</a>
+        {% endif %}
+        <form class="inline-form" method="post" action="/papers/{{ p.pid }}/delete"
+              onsubmit="return confirm('{% if p.n_submissions %}删除卷号 {{ p.pid }}？\n这份卷子有 {{ p.n_submissions }} 次判卷记录：记录与批注图会保留，仅从列表隐藏（仍占用 X MB）。{% else %}删除卷号 {{ p.pid }}？\n会同时删掉 app\\out 下的卷面与答题卡文件，删了不能恢复。{% endif %}');">
+          <button class="btn btn-small btn-danger" type="submit"
+                  title="删除前会弹确认（删行 + 删产物目录）">删除</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p class="field-hint">删除是不可恢复的：卷子记录与 <span class="mono">app\out\&lt;卷号&gt;\</span> 目录一起删。</p>
+{% else %}
+<div class="empty-state">
+  <p>还没有卷子，去组一份吧。</p>
+  <p><a class="btn btn-primary" href="/">去组卷</a></p>
+</div>
+{% endif %}
+{% endblock %}

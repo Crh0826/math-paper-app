@@ -40,12 +40,16 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import errors as errs  # 错误文案字典（纯数据，无副作用）
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+import paths as app_paths
+
+BASE_DIR = app_paths.APP_DIR
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-DEFAULT_DB = os.path.join(BASE_DIR, "data", "app.db")
-DEFAULT_CONFIG = os.path.join(BASE_DIR, "config.json")
-OUT_DIR = os.path.join(BASE_DIR, "out")
+DEFAULT_CONFIG = app_paths.config_path()
+DEFAULT_DB = app_paths.resolve_db(DEFAULT_CONFIG)
+OUT_DIR = app_paths.resolve_out_dir(DEFAULT_CONFIG)
+#: 题库目录（原始 docx）：环境变量 > config.paths.qbank > 老路径 E:\OCR（存在才用）> <程序>/qbank
+QBDIR = app_paths.resolve_qbank(DEFAULT_CONFIG, legacy=app_paths.LEGACY_QBANK)
 
 APP_BRAND = "数学题库工作台"
 #: seed：留空时在这个范围里随机（表单 max=999999 对齐）
@@ -76,6 +80,7 @@ NAV = (
     {"key": "papers", "label": "我的卷子", "href": "/papers", "enabled": True, "soon_hint": ""},
     {"key": "grade", "label": "判卷", "href": "/submissions", "enabled": True, "soon_hint": ""},
     {"key": "train", "label": "训练", "href": "/train", "enabled": True, "soon_hint": ""},
+    {"key": "settings", "label": "设置", "href": "/settings", "enabled": True, "soon_hint": ""},
     {"key": "guide", "label": "使用指南", "href": "/guide", "enabled": True, "soon_hint": ""},
     {"key": "health", "label": "自检", "href": "/health", "enabled": True, "soon_hint": ""},
 )
@@ -399,6 +404,33 @@ def load_ocr_config(config_path: str | None = None) -> dict:
         (ocr.get("vlm") or {}).get("key"),
     ]
     out["token_present"] = any(str(t or "").strip() for t in tokens)
+    # 设置页/自检页要显示「已配置 · 尾号 abcd」：只暴露尾号，绝不回显明文
+    def _tail(value) -> str:
+        text = str(value or "").strip()
+        return text[-4:] if len(text) >= 4 else ("" if not text else "***")
+
+    pv_token = os.environ.get("OCR_TOKEN") or (ocr.get("paddle_vl") or {}).get("token")
+    vlm_key = os.environ.get("OCR_KEY") or (ocr.get("vlm") or {}).get("key")
+    out["paddle_vl"] = {"token_present": bool(str(pv_token or "").strip()),
+                        "token_tail": _tail(pv_token),
+                        "model": (ocr.get("paddle_vl") or {}).get("model"),
+                        "job_url": (ocr.get("paddle_vl") or {}).get("job_url")}
+    out["vlm"] = {"key_present": bool(str(vlm_key or "").strip()),
+                  "key_tail": _tail(vlm_key),
+                  "base_url": (ocr.get("vlm") or {}).get("base_url"),
+                  "model": (ocr.get("vlm") or {}).get("model")}
+    out["backend_label"] = {
+        "paddle_vl": "PaddleOCR-VL 云端",
+        "vlm": "视觉模型（OpenAI 兼容）",
+        "local": "本机离线 OCR",
+        "manual": "全人工确认（不联网）",
+    }.get(str(out["backend"] or ""), str(out["backend"] or "未设置"))
+    try:
+        import ocr as _ocr
+        out["local_ready"] = bool(getattr(_ocr, "_HAS_WINOCR", None)
+                                  or getattr(_ocr, "LOCAL_OK", None))
+    except Exception:  # noqa: BLE001
+        out["local_ready"] = None
     return out
 
 
@@ -508,6 +540,80 @@ def lan_url(port: int | None = None, pin: str = "") -> str | None:
     return base + (("?pin=" + pin) if pin else "")
 
 
+#: 内置测试图上的算式：既给云端"文档里的一行字"的版式，也方便用户核对识别结果
+SELFTEST_EXPR = "40 + 2 = 42"
+SELFTEST_CAPTION = "识别测试 · 请忽略这一行小字"
+
+
+def make_selftest_image(target: str, size=(900, 260)) -> str:
+    """生成「像文档里一行字」的测试图。
+
+    之前用 640×160 的小图，PaddleOCR-VL 会把整张当图片块、解析不出 block，
+    于是「云端明明是通的」也被报成失败。这里改成正常页面尺寸 + 96px 黑体居中，
+    并加一行小字，识别结果可以人工核对。
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    width, height = size
+    img = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(img)
+
+    def _font(px: int):
+        for name in ("msyhbd.ttc", "msyh.ttc", "simhei.ttf", "arialbd.ttf", "arial.ttf"):
+            path = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", name)
+            if os.path.isfile(path):
+                try:
+                    return ImageFont.truetype(path, px)
+                except OSError:
+                    continue
+        return ImageFont.load_default()
+
+    big, small = _font(96), _font(28)
+    box = draw.textbbox((0, 0), SELFTEST_EXPR, font=big)
+    draw.text(((width - (box[2] - box[0])) / 2, (height - (box[3] - box[1])) / 2 - 18),
+              SELFTEST_EXPR, fill=(10, 10, 10), font=big)
+    cap = draw.textbbox((0, 0), SELFTEST_CAPTION, font=small)
+    draw.text(((width - (cap[2] - cap[0])) / 2, height - 52),
+              SELFTEST_CAPTION, fill=(120, 120, 120), font=small)
+    img.save(target)
+    return target
+
+
+def classify_ocr_probe(*, text: str, backend: str, error: str = "",
+                       elapsed: float = 0.0) -> dict:
+    """把一次「测试连接」的结果翻译成人话，**别把「连通但没解析出 block」说成 Key 坏了**。
+
+    分四种：
+      ok                    真的认出了字
+      connected_no_content  云端通了、但这张图没解析出内容（图太简单 / 没有文本行）
+      auth_or_quota         401 / 鉴权失败 / 额度不足 —— 这才该查 Key
+      network               连不上、超时、DNS
+    """
+    text = (text or "").strip()
+    error = (error or "").strip()
+    backend = (backend or "").strip()
+    lowered = error.lower()
+    if text:
+        return {"ok": True, "kind": "ok", "message": "连接正常，认出了：%s" % text[:80]}
+    auth_keys = ("401", "403", "unauthor", "invalid token", "invalid api key", "forbidden",
+                 "quota", "额度", "余额", "鉴权", "认证", "token 无效", "key 无效")
+    net_keys = ("timeout", "timed out", "超时", "connection", "connect", "dns", "resolve",
+                "network", "unreachable", "ssl", "proxy")
+    if any(word in lowered for word in auth_keys):
+        return {"ok": False, "kind": "auth_or_quota",
+                "message": "鉴权/额度有问题：%s —— 这只可能是 Key 或额度的问题，去查一下。" % error[:120]}
+    if any(word in lowered for word in net_keys):
+        return {"ok": False, "kind": "network",
+                "message": "没连上云端：%s —— 先查网络 / 代理 / 防火墙，不是 Key 的问题。" % error[:120]}
+    if "->manual" in backend or "没有可用" in error or "no block" in lowered \
+            or "empty" in lowered or not error:
+        return {"ok": False, "kind": "connected_no_content",
+                "message": "已连通云端，但这张测试图没解析出内容（可能是图像过于简单）；"
+                           "这不代表 Key 有问题 —— 建议用一张真实答题卡裁切图再测。"}
+    return {"ok": False, "kind": "error",
+            "message": "测试没跑完：%s（先看上面的错误，再决定要不要查 Key）" % error[:120]}
+
+
 def lan_startup_text(config_path: str | None = None) -> str:
     """start.bat 用：打印本机 / 局域网两个地址 + 防火墙指引（LAN 模式下）。"""
     cfg = load_server_config(config_path)
@@ -564,6 +670,73 @@ def _check(key: str, label: str, status: str, detail: str,
             "hints": [h for h in (hints or []) if h]}
 
 
+def local_ocr_support() -> dict:
+    """本机离线 OCR（local 后端）到底能不能用：要 Windows + winsdk。
+
+    grading-engineer 实测：本机 Python 3.14 装不上 winsdk（编译失败），
+    `Recognizer(backend="local")` 会静默降级成 local->manual —— 设置页必须如实说，不能装能用。
+    """
+    import platform as _platform
+
+    is_windows = sys.platform.startswith("win") or _platform.system() == "Windows"
+    winsdk_ok, error = False, ""
+    if is_windows:
+        try:
+            import winsdk  # noqa: F401
+            from winsdk.windows.media.ocr import OcrEngine  # noqa: F401
+            winsdk_ok = True
+        except Exception as exc:  # noqa: BLE001 - ImportError / OSError 都算不可用
+            error = "%s: %s" % (type(exc).__name__, exc)
+    else:
+        error = "不是 Windows 系统"
+    available = bool(is_windows and winsdk_ok)
+    if available:
+        detail = "可用：winsdk 已装，走 Windows 内置 OCR（不联网）"
+    elif not is_windows:
+        detail = "本机不支持：local 走 Windows 内置 OCR，当前系统不是 Windows"
+    else:
+        detail = ("本机不支持：缺 winsdk（Windows 内置 OCR 的 Python 绑定）。"
+                  "pip install winsdk 在 Python 3.14 上常编译失败 —— 建议改用 paddle_vl / vlm / manual")
+    return {"available": available, "windows": is_windows, "winsdk": winsdk_ok,
+            "detail": detail, "error": error,
+            "python": _platform.python_version()}
+
+
+def probe_pdf_backend() -> dict:
+    """PDF 后端探测：优先用 render.probe_backend()（Word / LibreOffice / 都没有）。
+
+    render 模块缺失或探测抛错时退回旧的「只探 Word」，保证 /health 不会 500。
+    """
+    try:
+        render = _load_module("render")
+        probe = getattr(render, "probe_backend", None)
+        if callable(probe):
+            data = probe()
+            if isinstance(data, dict) and "chosen" in data:
+                return data
+    except Exception:  # noqa: BLE001
+        pass
+    word = probe_word()
+    ok = bool(word.get("available"))
+    return {"word": ok, "libreoffice": False,
+            "chosen": "word" if ok else None,
+            "detail": (word.get("path") if ok else word.get("reason")) or "",
+            "word_path": word.get("path") if ok else None,
+            "soffice_path": None, "last_used": None,
+            "fallback": True}
+
+
+def pdf_backend_note(probe: dict) -> str:
+    """给页面用的一句话：LibreOffice 时说明「版面可能与 Word 有差异」。"""
+    chosen = (probe or {}).get("chosen")
+    if chosen == "libreoffice":
+        return ("当前用 LibreOffice 渲染 PDF，公式/字体/页脚可能与 Word 略有细微差异，"
+                "打印前建议先看 PDF。")
+    if chosen == "word":
+        return ""
+    return "没有可用的 PDF 后端：装 Word 2016+ 或 LibreOffice 才能出卷面 PDF。"
+
+
 def collect_health(db_path: str, config_path: str | None = None,
                    out_root: str | None = None, grade_ok: bool | None = None) -> dict:
     out_path = os.path.abspath(out_root or OUT_DIR)
@@ -609,9 +782,27 @@ def collect_health(db_path: str, config_path: str | None = None,
         "runtime", "组卷/判卷记录", "ok",
         f"卷 {db['counts'].get('papers') or 0} 份 · 提交 {db['counts'].get('submissions') or 0} 次"))
 
-    if word["available"]:
-        checks.append(_check("word", "Microsoft Word（docx 排版/转 PDF）", "ok", word["path"]))
+    pdf_backend = probe_pdf_backend()
+    _chosen = pdf_backend.get("chosen")
+    _pdf_detail = str(pdf_backend.get("detail") or "")
+    if _chosen == "word":
+        checks.append(_check("pdf", "PDF 后端（docx→PDF）", "ok", _pdf_detail or "Word"))
+    elif _chosen == "libreoffice":
+        checks.append(_check(
+            "pdf", "PDF 后端（docx→PDF）", "warn",
+            "LibreOffice 渲染（版面可能与 Word 略有差异）· " + (_pdf_detail or "soffice"),
+            ["没有 Word 时会用 LibreOffice；公式/字体/页脚可能与 Word 略有差异，打印前先看 PDF",
+             "想完全一致：装 Microsoft Word 2016+，程序会自动优先用 Word",
+             "soffice 路径特殊时可用环境变量 LIBREOFFICE_PATH 指定"]))
     else:
+        checks.append(_check(
+            "pdf", "PDF 后端（docx→PDF）", "fail",
+            _pdf_detail or "Word 与 LibreOffice 都没检测到",
+            ["装 Microsoft Word 2016+（推荐，版面最稳）",
+             "或装 LibreOffice（macOS/Linux 只装这个就行）",
+             "soffice 不在 PATH 时用 LIBREOFFICE_PATH 指定路径",
+             "只想要答题卡、不需要卷面 PDF：可以先这样用（答题卡仍可打印）"]))
+    if not word["available"]:
         checks.append(_check("word", "Microsoft Word（docx 排版/转 PDF）", "warn",
                              word["reason"], word.get("hints")))
 
@@ -650,6 +841,19 @@ def collect_health(db_path: str, config_path: str | None = None,
             if hint not in hints:
                 hints.append(hint)
 
+    # OCR 行补「后端 · token 尾号」，设置页/自检页都靠它核对（不回显明文）
+    for _row in checks:
+        if _row.get("key") != "ocr":
+            continue
+        _detail = _row.get("detail") or ""
+        _label = ocr.get("backend_label") or ocr.get("backend") or "未设置"
+        _tail = ""
+        if ocr.get("backend") == "paddle_vl" and (ocr.get("paddle_vl") or {}).get("token_present"):
+            _tail = " · token 已配置（尾号 %s）" % (ocr["paddle_vl"].get("token_tail") or "****")
+        elif ocr.get("backend") == "vlm" and (ocr.get("vlm") or {}).get("key_present"):
+            _tail = " · key 已配置（尾号 %s）" % (ocr["vlm"].get("key_tail") or "****")
+        _row["detail"] = "后端：%s%s。%s" % (_label, _tail, _detail)
+
     return {
         "ok": not fails,
         "status": status,
@@ -666,6 +870,7 @@ def collect_health(db_path: str, config_path: str | None = None,
         "server": server_cfg,
         "db": db,
         "word": word,
+        "pdf_backend": pdf_backend,
         "ocr": ocr,
         "data_dir": data_dir,
         "out_dir": out_dir,
@@ -1328,6 +1533,25 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
                       links=links or [{"href": "/", "label": "回组卷首页"},
                                       {"href": "/guide", "label": "使用指南"}])
 
+    def _ocr_notice_ctx() -> dict:
+        """首页/设置页用：还没配识别服务时提醒一句（填空/解答会全进人工确认）。"""
+        try:
+            info = load_ocr_config(cfp)
+        except Exception:  # noqa: BLE001
+            return {"show": False, "text": "", "backend": ""}
+        backend = str(info.get("backend") or "manual")
+        has_token = bool((info.get("paddle_vl") or {}).get("token_present")
+                         or (info.get("vlm") or {}).get("key_present"))
+        if backend == "manual":
+            return {"show": True, "backend": backend, "level": "warn",
+                    "text": "尚未配置识别服务（当前是「全人工确认」）：填空/解答会全部进待人工确认队列，"
+                            "选择题仍自动判。"}
+        if backend in ("paddle_vl", "vlm") and not has_token:
+            return {"show": True, "backend": backend, "level": "warn",
+                    "text": "识别后端是 %s，但还没填 Key/Token：填空/解答会降级为人工确认。"
+                            % info.get("backend_label", backend)}
+        return {"show": False, "backend": backend, "level": "", "text": ""}
+
     def _lan_ctx() -> dict:
         """模板用的局域网信息：开没开、手机地址、二维码开关。"""
         return {"on": bool(app.state.lan), "pin_required": bool(app.state.lan_pin),
@@ -1349,6 +1573,9 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
         if error:
             ctx["error"] = error
         ctx["lan"] = _lan_ctx()
+        ctx["ocr_notice"] = _ocr_notice_ctx()
+        ctx["pdf_backend"] = probe_pdf_backend()
+        ctx["pdf_note"] = pdf_backend_note(ctx["pdf_backend"])
         return render("index.html", status_code=status_code, page_title="组卷",
                       nav_active="compose", **ctx)
 
@@ -1525,6 +1752,12 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
             conn = _connect_rw(dbp)
             params = _load_module("train").plan(conn, payload["wrong_nos"],
                                                 n_per=payload["n_per"])
+            # train.plan 默认按错题集合派生 seed（同一批错题永远同一份训练卷）；
+            # 用户没指定 seed 时改成随机 —— 和组卷页「留空=每次换一套」同一套语义。
+            if payload.get("seed") is None:
+                params["seed"] = secrets.randbelow(SEED_MAX)
+            else:
+                params["seed"] = int(payload["seed"])
             # train.plan 只看题族/知识点，不知道题库体检（缺图、不可印、答案不符）；
             # picker.build 会用 quality_flags 硬挡，所以这里先按同一口径滤一遍，
             # 剔掉被挡的替代题（宁可卷子少两道，也不印缺图的废题）。
@@ -1558,6 +1791,11 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
         nos_text = str(form.get("nos") or "").strip()
         n_per = max(1, min(10, _to_int(form.get("n_per"), 3)))
         wrong_nos = _parse_nos(nos_text)
+        seed_text = str(form.get("seed") or "").strip()
+        try:
+            seed_value = int(seed_text) if seed_text else None
+        except ValueError:
+            seed_value = None
         if not wrong_nos and sid:
             try:
                 conn = _open_ro(dbp)
@@ -1580,7 +1818,8 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
                           nos_text=nos_text, summary=None)
         try:
             pid = await run_in_threadpool(_train_compose,
-                                          {"wrong_nos": wrong_nos, "n_per": n_per})
+                                          {"wrong_nos": wrong_nos, "n_per": n_per,
+                                           "seed": seed_value})
         except DbMissing as exc:
             return render("error.html", status_code=503, page_title="错题训练",
                           error=_db_error(exc, dbp))
@@ -1834,6 +2073,200 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
         img.save(buf, format="PNG")
         return Response(buf.getvalue(), media_type="image/png",
                         headers={"Cache-Control": "no-store"})
+
+    # ---------------------------------------------------------------- 设置（OCR / AI Key）
+    OCR_BACKENDS = (
+        ("paddle_vl", "PaddleOCR-VL 云端", "把作答格拼图发给 PaddleOCR-VL，识别质量最好"),
+        ("vlm", "视觉模型（OpenAI 兼容）", "自己填 base_url + key + 模型名，走兼容 OpenAI 的视觉接口"),
+        ("local", "本机离线（Windows OCR）", "不联网，识别质量一般，胜在隐私与零配置"),
+        ("manual", "全人工确认（不联网）", "不识别，填空/解答全部进待确认队列，选择仍走 OMR"),
+    )
+
+    def _read_cfg_json() -> dict:
+        try:
+            with open(cfp, encoding="utf-8") as fh:
+                data = json.load(fh) or {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_cfg_json(cfg: dict) -> str:
+        """写 config.json：先留 .bak；其它键原样保留（只改调用方动过的那段）。"""
+        backup = ""
+        if os.path.isfile(cfp):
+            backup = cfp + ".bak"
+            try:
+                shutil.copyfile(cfp, backup)
+            except OSError:
+                backup = ""
+        with open(cfp, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        return backup
+
+    def _settings_ctx(status_code: int = 200, notice=None, test_result=None):
+        info = load_ocr_config(cfp)
+        cfg = _read_cfg_json()
+        ocr_cfg = cfg.get("ocr") if isinstance(cfg.get("ocr"), dict) else {}
+        local = local_ocr_support()
+        backends = []
+        for key, label, hint in OCR_BACKENDS:
+            item = {"key": key, "label": label, "hint": hint, "available": True, "note": ""}
+            if key == "local" and not local["available"]:
+                item["available"] = False
+                item["note"] = "本机不支持（缺 winsdk）"
+            backends.append(item)
+        return dict(
+            status_code=status_code, notice=notice, test_result=test_result,
+            info=info, ocr_cfg=ocr_cfg, config_path=cfp,
+            local_ocr=local,
+            backends=backends,
+            current=info.get("backend") or "manual",
+            pdf_backend=probe_pdf_backend(),
+            pdf_note=pdf_backend_note(probe_pdf_backend()),
+            ocr_notice=_ocr_notice_ctx(),
+            paths=app_paths.describe(cfp),
+            env_override=bool(os.environ.get("OCR_BACKEND") or os.environ.get("OCR_TOKEN")
+                              or os.environ.get("OCR_KEY")),
+        )
+
+    @app.get("/settings", response_class=HTMLResponse)
+    def settings_page(saved: str = "", cleared: str = ""):  # noqa: ANN202
+        notice = None
+        if saved:
+            notice = {"kind": "ok", "text": "已保存（config.json 更新，旧版本备份为 config.json.bak）"}
+        elif cleared:
+            notice = {"kind": "ok", "text": "已清除该后端的 Key/Token"}
+        ctx = _settings_ctx(notice=notice)
+        ctx.pop("status_code", None)
+        return render("settings.html", page_title="设置", nav_active="settings", **ctx)
+
+    @app.post("/settings")
+    async def settings_save(request: Request):  # noqa: ANN202
+        form = await request.form()
+        backend = str(form.get("backend") or "").strip()
+        valid = {key for key, _label, _hint in OCR_BACKENDS}
+        if backend not in valid:
+            ctx = _settings_ctx(status_code=400, notice={
+                "kind": "bad",
+                "text": "后端名字不对：%r 不在 %s 里，没保存。" % (backend, " / ".join(sorted(valid))),
+            })
+            ctx.pop("status_code", None)
+            return render("settings.html", status_code=400, page_title="设置",
+                          nav_active="settings", **ctx)
+
+        cfg = _read_cfg_json()
+        ocr_cfg = cfg.get("ocr") if isinstance(cfg.get("ocr"), dict) else {}
+        ocr_cfg["backend"] = backend
+        clear = str(form.get("clear") or "").strip()
+
+        def _text(key: str) -> str:
+            return str(form.get(key) or "").strip()
+
+        if backend == "paddle_vl":
+            pv = ocr_cfg.get("paddle_vl") if isinstance(ocr_cfg.get("paddle_vl"), dict) else {}
+            if clear == "paddle_vl":
+                pv["token"] = ""
+            elif _text("token"):
+                pv["token"] = _text("token")
+            for key in ("model", "job_url"):
+                if _text(key):
+                    pv[key] = _text(key)
+            ocr_cfg["paddle_vl"] = pv
+        elif backend == "vlm":
+            vlm = ocr_cfg.get("vlm") if isinstance(ocr_cfg.get("vlm"), dict) else {}
+            if clear == "vlm":
+                vlm["key"] = ""
+            elif _text("key"):
+                vlm["key"] = _text("key")
+            for key in ("base_url", "model"):
+                if _text(key):
+                    vlm[key] = _text(key)
+            ocr_cfg["vlm"] = vlm
+        cfg["ocr"] = ocr_cfg
+        _write_cfg_json(cfg)
+        if clear:
+            return RedirectResponse("/settings?cleared=1", status_code=303)
+        return RedirectResponse("/settings?saved=1", status_code=303)
+
+    @app.post("/settings/test", response_class=HTMLResponse)
+    async def settings_test(request: Request):  # noqa: ANN202
+        form = await request.form()
+        backend = str(form.get("backend") or "").strip()
+        valid = {key for key, _label, _hint in OCR_BACKENDS}
+        if backend not in valid:
+            return render("settings.html", status_code=400, page_title="设置",
+                          nav_active="settings",
+                          **_settings_ctx(notice={"kind": "bad", "text": "后端名字不对，没法测。"}))
+        info = load_ocr_config(cfp)
+        need = {"paddle_vl": (info.get("paddle_vl") or {}).get("token_present"),
+                "vlm": (info.get("vlm") or {}).get("key_present")}.get(backend, True)
+        if not need:
+            ctx = _settings_ctx(test_result={
+                "ok": False, "backend": backend, "elapsed_s": 0.0, "text": "",
+                "error": "还没填 %s，先把 Key/Token 填进上面的框再测"
+                         % ("token" if backend == "paddle_vl" else "key"),
+            }, notice={"kind": "bad", "text": "缺 Key/Token，没发请求（不会 500）"})
+            ctx.pop("status_code", None)
+            return render("settings.html", page_title="设置", nav_active="settings", **ctx)
+        if backend == "local" and not local_ocr_support()["available"]:
+            support = local_ocr_support()
+            ctx = _settings_ctx(test_result={
+                "ok": False, "kind": "unsupported", "elapsed_s": 0.0, "text": "",
+                "backend": "local", "error": support["error"],
+                "message": support["detail"] + "。这不是 Key 的问题，换 paddle_vl / vlm，"
+                                               "或先用 manual 全人工确认。",
+            })
+            ctx.pop("status_code", None)
+            return render("settings.html", page_title="设置", nav_active="settings", **ctx)
+        if backend == "manual":
+            ctx = _settings_ctx(test_result={
+                "ok": True, "backend": "manual", "elapsed_s": 0.0, "text": "",
+                "error": "", "note": "manual 不联网：填空/解答留人工确认，选择题走 OMR 照常判",
+            })
+            ctx.pop("status_code", None)
+            return render("settings.html", page_title="设置", nav_active="settings", **ctx)
+
+        # 真跑一次识别：内置小图（12×2 的算式），30s 超时
+        result = await run_in_threadpool(_ocr_selftest, backend)
+        ctx = _settings_ctx(test_result=result)
+        ctx.pop("status_code", None)
+        return render("settings.html", page_title="设置", nav_active="settings", **ctx)
+
+    def _ocr_selftest(backend: str) -> dict:
+        started = time.time()
+        tmp_png = os.path.join(out_root, "_settings_selftest.png")
+        try:
+            os.makedirs(os.path.dirname(tmp_png), exist_ok=True)
+            make_selftest_image(tmp_png)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "backend": backend, "elapsed_s": 0.0, "text": "",
+                    "kind": "error", "message": "生成测试图失败：%s: %s"
+                                              % (type(exc).__name__, exc)}
+        try:
+            import ocr as _ocr
+            rec = _ocr.Recognizer(config_path=cfp, backend=backend, use_env=False, timeout_s=30)
+            res = rec.read(tmp_png, "test") or {}
+            elapsed = round(time.time() - started, 2)
+            text = str(res.get("text") or "").strip()
+            error = str(getattr(rec, "last_error", "") or res.get("error") or "")
+            got = str(res.get("backend") or backend)
+            verdict = classify_ocr_probe(text=text, backend=got, error=error,
+                                         elapsed=elapsed)
+            verdict.update({"backend": got, "elapsed_s": elapsed, "text": text[:160],
+                            "confidence": res.get("confidence"), "error": error})
+            return verdict
+        except Exception as exc:  # noqa: BLE001 - 测试连接不许 500
+            return {"ok": False, "backend": backend,
+                    "elapsed_s": round(time.time() - started, 2), "text": "",
+                    "kind": "error", "error": "%s: %s" % (type(exc).__name__, exc),
+                    "message": "测试没跑完：%s: %s（不是 Key 的问题，先看网络/依赖）"
+                               % (type(exc).__name__, exc)}
+        finally:
+            try:
+                os.remove(tmp_png)
+            except OSError:
+                pass
 
     # ---------------------------------------------------------------- 使用指南（纯静态，不碰库）
     @app.get("/guide", response_class=HTMLResponse)

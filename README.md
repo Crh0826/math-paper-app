@@ -1,32 +1,9 @@
 # 数学题库工作台
 
-**七年级数学「组卷 → 打印 → 拍照判卷 → 错题训练」一体化工具**，全部跑在本地，题库与照片不出你自己的电脑。
-
-沪科版七年级上 · **22,898 道题库**（原始 docx 只读，其中 12,280 道可判分）
-组卷 → 打印 → 答题卡 → 拍照判卷 → 错题训练
-
-![封面](media/cover.jpg)
-
-![界面动图预览](media/preview.gif)
-
+沪科版七年级上 · **22,898 道题**（原始 `E:\OCR\00001.docx … 22898.docx`，只读）。
+组卷 → 打印 → 答题卡 → 拍照判卷 → 错题训练，全部在本机跑，不上传题库。
 
 > 判卷范围：选择题（认选项序号）+ 填空题 / 解答题（认最终答案）。解答过程不判。
-
-**它解决什么**：一次出 24 题只要 3 秒，卷面 + 机读答题卡自动生成（双面 3 张纸）；
-学生手写填完，手机拍一张，选择题秒判、填空解答自动识别；判不准的题进「待确认」而不是乱判；
-错题自动变成同类训练卷。
-
-| 实测 | 数字 |
-|---|---|
-| 题库 | 12,280 道可判题 / 34 个知识点 / 2,091 个题族 |
-| 判卷 | 100 次合成样本：标定 100%、QR 100%、选择题判分 255/255、p95 0.06s |
-| 答案等价 | 等价 106/106、反例 41/41（根式、绝对值、立方根、中文数字、带分数） |
-| 省纸 | 24 题：9 页 → **6 页**（卷面 3 + 答题卡 3） |
-| 测试 | 859 条自动化测试全绿 |
-
-| | |
-|---|---|
-| ![组卷](docs/01-compose.png) | ![判卷结果](docs/06-grade-result.png) |
 
 ---
 
@@ -39,12 +16,23 @@
 | Word | 建议装 Microsoft Word 2016 或更新；不装也能组卷，但公式与排版可能失真 |
 
 ```bat
-cd /d E:\OCR\app
+cd /d <你把程序放到的目录>\app
 python -m pip install -r requirements.txt
 ```
 
-- 原始题库 `E:\OCR\*.docx` **只读**，程序不会修改、移动、删除它们。
-- 产物只写 `app\data`（数据库）与 `app\out`（卷子、答题卡、判卷裁切图）。
+**放在哪个目录都能跑**（不再绑死 `E:\OCR`）。题库（原始 `*.docx`）按下面的顺序找：
+
+1. 环境变量 `MATH_APP_QBDIR`（或旧名 `MATH_QB_ROOT`）
+2. `config.json` 的 `paths.qbank`
+3. `<程序目录>/qbank/`
+4. 老机器兜底：`E:\OCR`（这个目录存在时才会用）
+
+最省事的做法：把 22,898 份 docx 放进 `app\qbank\`，或者把 `config.json` 改成
+`{"paths": {"qbank": "D:/题库"}}`。`data/`、`out/` 同理（默认就在程序目录下，也可用
+`MATH_APP_DATA` / `MATH_APP_OUT` 或 `config.paths` 改）。
+
+- 原始题库 **只读**，程序不会修改、移动、删除它们。
+- 产物默认写 `app\data`（数据库）与 `app\out`（卷子、答题卡、判卷裁切图）。
 
 ## 启动
 
@@ -65,6 +53,20 @@ python -m uvicorn server:app --host 127.0.0.1 --port 8710
 - 想让手机拍答题卡：双击 `start_lan.bat`（LAN 模式，带 4 位访问码），详见下面「手机拍照判卷（局域网）」
 - 三种环境降级实测（端口占用 / Word 缺失 / 数据库缺失）见 [`docs/DEGRADED.md`](docs/DEGRADED.md)：
   端口被占 → 窗口退出时提示原因；没 Word → 卷面标「PDF 未生成」但答题卡照常出；没库 → 首页 503 并给建库命令
+
+## 设置（自己填 API Key / 换识别后端）
+
+打开 **设置**（<http://127.0.0.1:8710/settings>，导航里也有），可以：
+
+- **换识别后端**：`PaddleOCR-VL 云端` / `视觉模型（OpenAI 兼容）` / `本机离线（Windows OCR）` / `全人工确认`；
+- **自己填 Key**：PaddleOCR-VL 填 token（含 model、job_url），视觉模型填 base_url + key + 模型名；
+  **页面上只显示「已配置 · 尾号 abcd」**，输入框留空 = 不修改，点「清除」才删；
+- **测试连接**：用内置小图（`12 x 3 = 36`）真跑一次识别，显示结果 / 耗时 / 错误码，最多等 30 秒；
+- 保存会**只改 `config.json` 的 `ocr` 段**，其它键（server / paths / 备注）原样保留，并先备份 `config.json.bak`；
+- 改完**立刻生效**，不用重启。注意：如果设了 `OCR_BACKEND` / `OCR_TOKEN` / `OCR_KEY` 环境变量，
+  它们的优先级高于 config.json，页面会提示你。
+
+没有 Key 也能用：把后端选成「全人工确认」，填空/解答全部进待确认队列，选择题仍走 OMR 自动判。
 
 ## 手机拍照判卷（局域网）
 
@@ -147,6 +149,8 @@ python -m uvicorn server:app --host 127.0.0.1 --port 8710
 | 我的卷子（每行显示判卷次数、删除策略） | ![我的卷子](docs/02-papers-list.png) |
 | 卷子预览（打印须知 + 卷面/答题卡预览 + 题目清单 + 参数） | ![卷子预览](docs/05-paper-preview.png) |
 | 合并打印件（卷面第 1 页 / 答题卡页，看页脚与页码） | ![打印件第 1 页](docs/05b-print-page1.png) ![打印件第 2 页](docs/05c-print-page2.png) |
+| 首页「尚未配置识别服务」提示（manual 后端） | ![OCR 提示](docs/15-ocr-notice.png) |
+| 设置页（换后端 / 填 Key / 测试连接 / PDF 后端 / 当前路径） | ![设置](docs/14-settings.png) |
 | 换一套题（预览页「同参数换一套」+ 显示本次随机种子） | ![换一套](docs/13-seed-reroll.png) |
 | 手机扫码入口（局域网模式：二维码 + 局域网地址 + 访问码提示） | ![手机入口](docs/12-lan-qr.png) |
 | 省纸模式（组卷表单复选框 + 更密的版面预览） | ![省纸开关](docs/10-layout-form.png) ![省纸版面](docs/11-layout-compact.png) |
@@ -227,6 +231,9 @@ app\
   card.py              答题卡生成     grade.py   判卷流水线
   ocr.py               识别适配层     normalize.py 答案归一化
   train.py             错题训练规划   build_db.py  建库
+  qbank\               题库（原始 *.docx；也可用 config.paths.qbank 指到别处）
+  paths.py             路径解析（qbank / data / out，去硬编码）
+  settings.html        设置页（模板，在 templates\ 下）
   data\                app.db、构建报告
   out\                 卷子 PDF/PNG、答题卡、判卷裁切图
   tests\               unittest（python -m unittest discover -s app\tests）
@@ -239,3 +246,29 @@ app\
   答题卡生成（ArUco + QR）、答案归一化、识别适配层、判卷流水线（两阶段）、Web 全链路（组卷/预览/下载/打印合并/上传判卷/
   待人工确认/训练卷）、软删与数据清理、打包文档与本验收报告。
 - 已知限制：见 `VERIFY.md` §10（语料「如图无图」2,932 题；真实手写识别率待验证）。
+
+## 非 Windows 平台（macOS / Linux）
+
+- **能做什么**：组卷选题、卷面排版、答题卡生成、拍照判卷、训练卷、Web 界面全部可用。
+- **PDF 怎么出**：Windows 上优先用 Microsoft Word（COM）；macOS/Linux（或 Windows 没装 Word）
+  自动回退 **LibreOffice**（soffice --headless --convert-to pdf）。装法：
+  - macOS：装 LibreOffice（dmg），soffice 默认在 /Applications/LibreOffice.app/Contents/MacOS/soffice
+  - Linux：`apt install libreoffice` / `dnf install libreoffice`（soffice 在 PATH 里）
+  - 自定义位置：设环境变量 LIBREOFFICE_PATH=/path/to/soffice
+  - 两个都没有 → 报 WordUnavailable("no_backend")，提示装 Word 或 LibreOffice
+- **如实说明差异**：LibreOffice 的字体回退、页脚域（第 X 页/共 Y 页）、表格边框粗细、公式基线
+  可能与 Word 有**细微差异**；判卷坐标按 A4 的 595.28×841.89pt 写死，所以两种后端都会校验 A4，
+  非 A4 会直接报 pdf_not_a4（打印会整体错位，必须先修页面尺寸）。
+- **便携版 exe 只适用于 Windows**（PyInstaller onedir）；macOS/Linux 请用源码运行
+  （python app/launcher.py 同样会自动探测后端）。
+- 当前状态（本机实测）：本开发机**没装 LibreOffice**，回退链路用伪造 soffice 验证过
+  （转换/落位/A4 校验/错误详情），**未在真实 LibreOffice 上验证**；Windows+Word 路径行为未变。
+- **未实测提醒**：LibreOffice 回退只用伪造的 `soffice` 跑通过，**没有在真实 LibreOffice 上实测**（命令行/profile/stderr/A4 校验都有测试，但字体与页脚域的真实差异未验证），本机也没装 LO，所以不能写成「已验证」。
+- **先自检**：装完 LibreOffice 先跑 `python -m render --check`（或 `--json`）确认探测结果再出卷——它只打印「Word / LibreOffice / 都没有」和实际路径，不动数据库、不写文件。
+
+## 开发者备注（打包）
+
+- **冻结环境丢 `select` 的坑**：`ocr.pin_stdlib_select()` 会把 `_internal` 临时移出 `sys.path` 再 `import select`；
+  打包后 `select.pyd` 就在 `_internal` 里 → `ModuleNotFoundError: No module named 'select'`，
+  表现为 **grade_routes 挂不上、判卷页全部 404**（源码版永远复现不了）。`launcher._install_frozen_stdlib_bridge()` 
+  用 meta_path finder 把 select 钉住；以后再引入「运行时才 import 的 stdlib 模块」，记得同样处理 + 补 `--hidden-import`。

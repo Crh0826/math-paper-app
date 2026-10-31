@@ -32,6 +32,8 @@
 """
 from __future__ import annotations
 
+import base64
+import csv
 import datetime as _dt
 import io
 import json
@@ -366,12 +368,21 @@ def _render_error(code: str, detail=None, status_code: int = 422,
 #: grade 新加、errors.py 还没登记的错误码 → 给一段人话（否则用户只看到「出了点问题（错误码 xxx）」）
 _GRADE_EXTRA_ERRORS = {
     "legacy_card": {
-        "title": "这张答题卡是旧版，判不了",
+        "title": "这张答题卡是旧版本，请重新打印答题卡",
         "what": "卡上的题目标识是旧版（4×4）格式，现在的判卷程序不认。",
         "why": "答题卡模板升级过：旧卡上的标识块和现在的不一样，硬判会错位，所以宁可拒绝。",
         "fix": "① 回组卷页重新生成这份卷子，重新打印答题卡\n"
                "② 用新打印的卡再拍一次（旧卡可以丢掉）",
         "retry_label": "重新打印答题卡",
+    },
+    "unknown_questions": {
+        "title": "这些题号不在本机题库里",
+        "what": "答题卡上的题号扫出来了，但本机题库里查不到对应的题（所以没有标准答案可比）。",
+        "why": "可能用的是别的题库/别的版本打出来的卡，或者这些题被删掉了。",
+        "fix": "① 确认答题卡是本机「题库组卷」生成的（卷号/题号都来自本机题库）\n"
+               "② 如果是别人给的卷子：让他用同一份题库重新生成答题卡\n"
+               "③ 只想对答案：在下面手工判定也能算分",
+        "retry_label": "重新拍照",
     },
     "no_question_ids": {
         "title": "照片里没找到题目标识",
@@ -385,14 +396,77 @@ _GRADE_EXTRA_ERRORS = {
 }
 
 
-def _render_grade_error(res: dict, retry_href: str = "/submissions", extra_note: str = ""):
+def _grade_error_note(res: dict, chosen_pid: str = "") -> str:
+    """判卷失败时给页面补一句「我们试过什么/该怎么办」（t45 免选卷号的解释）。"""
+    code = str(res.get("error") or "")
+    qr_pid, picked = _mismatch_pids(res)
+    if code == "pid_mismatch" and qr_pid and picked:
+        return ("二维码里是 %s，你选的是 %s —— 拍的多半不是这份卷子。"
+                "想省事就回判卷页把卷号留成「自动识别（推荐）」，系统自己认。"
+                % (qr_pid, picked))
+    if code in ("unknown_questions", "no_question_ids"):
+        return ("已改用每题标识识别（按每道题上的题号去题库查答案）——"
+                "所以卷号不在本机库里也能判，但题号必须在本机题库中。")
+    if code == "legacy_card":
+        return "已改用每题标识识别，但这张卡还是旧版 4×4 标识，认不出题号：请重新打印答题卡。"
+    return ""
+
+
+def _mismatch_pids(res: dict):
+    """从 grade 的 pid_mismatch 文案里抠出（二维码卷号, 用户选的卷号）。"""
+    text = str(res.get("detail") or "")
+    m = re.search(r"QR 卷号\s*(\S+)\s*[≠!=]+\s*传入\s*(\S+)", text)
+    if m:
+        return m.group(1), m.group(2)
+    detail = res.get("pid") or {}
+    if isinstance(detail, dict):
+        return str(detail.get("qr_pid") or ""), str(detail.get("pid") or "")
+    return "", ""
+
+
+def _diag_data_uri(stage_path: str, diag: dict, out_root: str) -> str:
+    """把 grade.diag_image 画出来的诊断图内联成 data URI（错误页直接显示，不落残留文件）。"""
+    if not stage_path or not diag:
+        return ""
+    try:
+        out_dir = os.path.join(out_root, "_diag")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, "diag-%s.png" % uuid.uuid4().hex[:8])
+        grade.diag_image(stage_path, diag, path)
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        if not raw:
+            return ""
+        return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    except Exception as exc:      # noqa: BLE001 - 诊断图是锦上添花，失败不许影响错误页
+        _log("诊断图生成失败：%s: %s" % (type(exc).__name__, exc))
+        return ""
+
+
+def _render_grade_error(res: dict, retry_href: str = "/submissions", extra_note: str = "",
+                        diag: dict = None, diag_uri: str = ""):
     """grade 的 error 回执 → 错误页。已知码走 errors.explain；grade 新加的码给专用文案。"""
     code = str(res.get("error") or "internal_error")
     detail = _error_detail(res)
+    qr_pid, picked = _mismatch_pids(res)
+    if code == "pid_mismatch" and qr_pid:
+        detail = {"pid": picked or "", "qr_pid": qr_pid,
+                  "message": str(res.get("detail") or "")}
+    diag = diag or {}
+    suggest = str(diag.get("suggest_text") or "")
+    extra = {"diag_uri": diag_uri, "diag_suggest": suggest,
+             "diag_found": diag.get("found"), "diag_expected": diag.get("expected")}
     aliases = getattr(errs, "_ALIASES", {}) or {}
     if code in errs.CODES or code.lower() in aliases:
-        return _render_error(code, detail, status_code=422, retry_href=retry_href,
-                             extra_note=extra_note)
+        info = errs.explain(code, detail or {})
+        return render("grade_error.html", status_code=422, page_title=info["title"],
+                      e=info, code=str(code), retry_href=retry_href,
+                      retry_label=info.get("retry_label") or "重试",
+                      extra_note=extra_note, **extra)
     info = _GRADE_EXTRA_ERRORS.get(code) or {
         "title": "这张答题卡判不了",
         "what": str(res.get("detail") or "判卷没给出原因。"),
@@ -402,7 +476,7 @@ def _render_grade_error(res: dict, retry_href: str = "/submissions", extra_note:
     }
     return render("grade_error.html", status_code=422, page_title=info["title"],
                   e=info, code=code, retry_href=retry_href,
-                  retry_label=info["retry_label"], extra_note=extra_note)
+                  retry_label=info["retry_label"], extra_note=extra_note, **extra)
 
 
 def _json_error(code: str, detail=None, status_code: int = 422, **extra):
@@ -544,7 +618,8 @@ def _render_upload(conn, pid: str = "", notice: dict = None, status_code: int = 
     except sqlite3.Error:
         papers = []
     return render("grade_upload.html", status_code=status_code, page_title="判卷",
-                  papers=papers, pid=pid or "", notice=notice)
+                  papers=papers, pid=pid or "", notice=notice,
+                  auto=not (pid or ""))
 
 
 @router.get("/submissions", response_class=HTMLResponse)
@@ -582,18 +657,15 @@ def _move_into_submission(out_root: str, pid: str, sid: str, stage_path: str) ->
 @router.post("/submissions")
 async def create_submission(request: Request, pid: str = Form(""),
                             file: UploadFile = File(None)):
-    """multipart(pid + file) → 存图 → grade_image → 302 /submissions/{sid}。"""
+    """multipart(pid + file) → 存图 → grade_image → 302 /submissions/{sid}。
+
+    t45：`pid` 可以不选（空）——卷号由答题卡右上角的二维码认；认出来库里没有，
+    就降级按每题标识判（t46），不再要求用户先挑卷子。
+    """
     pid = (pid or "").strip()
     out_root = _out_root(request)
 
-    if not pid:
-        return _guard(request, lambda conn: _render_upload(
-            conn, "", {"tone": "warn", "title": "先填卷号",
-                       "detail": "请填这份答题卡上的卷号（pid），或在下面的最近卷子里点一个，再上传照片。",
-                       "hints": ["卷号印在答题卡右上角的二维码旁边，形如 P20261031-001",
-                                 "找不到卷号：回组卷页看看最近生成的那份卷子"]},
-            status_code=400))
-    if not pid_is_safe(pid):
+    if pid and not pid_is_safe(pid):
         return _guard(request, lambda conn: _render_upload(
             conn, pid, {"tone": "warn", "title": "卷号格式不对",
                         "detail": "卷号里只能有字母、数字和 - _ .，且不超过 %d 个字符。" % PID_MAX_LEN,
@@ -631,33 +703,33 @@ async def create_submission(request: Request, pid: str = Form(""),
                                   "扫描件先导出成 jpg 再传；PDF 判不了（要先截图/导出图片）"]},
             status_code=400))
 
-    stage_path = _stage_upload(out_root, pid, data)
+    stage_path = _stage_upload(out_root, pid or "_auto", data)
 
     def run(conn):
-        # 先确认卷子在 papers 里：不在就直接给「找不到这份卷子」，
-        # 别让 grade 走到按题目标识扫描那条路再报 no_question_ids（那个码对用户没意义）
-        try:
-            known = conn.execute("SELECT 1 FROM papers WHERE pid=? LIMIT 1", (pid,)).fetchone()
-        except sqlite3.Error:
-            known = True
-        if known is None:
-            return _render_error("paper_not_found",
-                                 {"pid": pid, "message": "papers 表里没有 %s" % pid},
-                                 status_code=422,
-                                 retry_href="/submissions?pid=%s" % quote(pid),
-                                 retry_label="重新选卷")
+        # t45：pid 可以不选 —— grade 会先看二维码里的卷号；库里没有就降级按每题标识判（t46）
         res = grade.grade_image(conn, pid, stage_path, out_dir=out_root)
         if res.get("error"):
+            diag = res.get("diag") or {}
+            if not diag:
+                try:
+                    diag = grade.diagnose(stage_path).get("diag") or {}
+                except Exception as exc:      # noqa: BLE001 - 诊断失败不影响报错
+                    _log("诊断失败：%s: %s" % (type(exc).__name__, exc))
+                    diag = {}
             return _render_grade_error(
-                res, retry_href="/submissions?pid=%s" % quote(pid),
-                extra_note="这张照片留在 %s（可删）。" % _rel(stage_path))
+                res, retry_href="/submissions" + ("?pid=%s" % quote(pid) if pid else ""),
+                extra_note=_grade_error_note(res, pid),
+                diag=diag, diag_uri=_diag_data_uri(stage_path, diag, out_root))
         sid = str(res.get("sid") or "")
         if not sid:
             return _render_error("internal_error", {"message": "判卷没有返回提交编号"},
-                                 status_code=500, retry_href="/submissions?pid=%s" % quote(pid))
-        target = _move_into_submission(out_root, pid, sid, stage_path)
+                                 status_code=500, retry_href="/submissions")
+        # 真正的卷号：不选 pid 时就是答题卡二维码里的那个
+        resolved = str(res.get("pid") or pid or "UNKNOWN")
+        target = _move_into_submission(out_root, resolved, sid, stage_path)
         try:
-            conn.execute("UPDATE submissions SET image_path=? WHERE sid=?", (target, sid))
+            conn.execute("UPDATE submissions SET image_path=?, pid=? WHERE sid=?",
+                         (target, resolved, sid))
             conn.commit()
         except sqlite3.Error:
             pass
@@ -665,14 +737,19 @@ async def create_submission(request: Request, pid: str = Form(""),
         if int(res.get("pending") or 0) > 0 and _auto_ocr(request):
             _start_ocr_job(request.app, sid, _db_path(request), _recognizer(request),
                            reason="upload")
-        return RedirectResponse("/submissions/%s" % sid, status_code=302)
+        by_ids = str(res.get("identified_by") or "") == "question_id"
+        qs = "?by_ids=1" if by_ids else ""
+        if by_ids and resolved:
+            qs += ("&" if qs else "?") + "qr=%s" % quote(resolved)
+        return RedirectResponse("/submissions/%s%s" % (sid, qs), status_code=302)
 
     return _guard(request, run)
 
 
 # --------------------------------------------------------------------------- 结果页
 def _render_result(conn, sid: str, reocr: bool = False, filled: int = 0, left: int = 0,
-                   empty_batch: bool = False, changed=None, status_code: int = 200):
+                   empty_batch: bool = False, changed=None, status_code: int = 200,
+                   by_ids: bool = False, qr_pid: str = ""):
     row, detail = _load_submission(conn, sid)
     if row is None:
         return _render_error("submission_not_found", {"sid": sid}, status_code=404,
@@ -689,6 +766,26 @@ def _render_result(conn, sid: str, reocr: bool = False, filled: int = 0, left: i
     # 空批提示只在「还有东西等着人工确认」或「刚点过重新识别」时出现：
     # 全部确认完还挂着这条黄色告示，只会变成噪音。
     show_empty = is_empty and (pending > 0 or bool(empty_batch))
+
+    # t45：这次是按每题标识判的（卷号来自二维码）→ 说清楚判分依据，别让人以为漏了卷子
+    ident = str(detail.get("identified_by") or "")
+    if by_ids or ident == "question_id":
+        by_ids = True
+        known = False
+        try:
+            known = conn.execute("SELECT 1 FROM papers WHERE pid=? LIMIT 1",
+                                 (row["pid"],)).fetchone() is not None
+        except sqlite3.Error:
+            known = False
+        if known:
+            by_ids_note = ("这次是按每题标识识别的：卷号 %s 是从答题卡二维码自动认出来的，"
+                           "答案按每道题的题号查题库比对。" % (row["pid"] or "—"))
+        else:
+            by_ids_note = ("卷号 %s 不在本机库中，已改用每题标识识别："
+                           "答案按每道题的题号查题库比对（所以没有卷子记录也能判）。"
+                           % (row["pid"] or qr_pid or "—"))
+    else:
+        by_ids_note = ""
 
     notice = None
     if changed is not None:
@@ -720,6 +817,7 @@ def _render_result(conn, sid: str, reocr: bool = False, filled: int = 0, left: i
                   pct=int(round(100.0 * score / full)) if full else 0,
                   rows=rows, pending=pending, unsure=unsure, filled=filled_n,
                   empty_batch=show_empty, notice=notice,
+                  by_ids=by_ids, by_ids_note=by_ids_note,
                   recognized_at=detail.get("recognized_at") or "",
                   confirmed_at=detail.get("confirmed_at") or "",
                   show_blank=any(r["blank"] != 1 for r in rows),
@@ -730,11 +828,12 @@ def _render_result(conn, sid: str, reocr: bool = False, filled: int = 0, left: i
 @router.get("/submissions/{sid}", response_class=HTMLResponse)
 @router.get("/submissions/{sid}/", response_class=HTMLResponse)
 def result_page(request: Request, sid: str, reocr: int = 0, filled: int = 0, left: int = 0,
-                empty_batch: int = 0, changed: int = None):
+                empty_batch: int = 0, changed: int = None, by_ids: int = 0, qr: str = ""):
     """结果页：总分 + 逐题表 + 待确认裁切图 + 识别中轮询。"""
     return _guard(request, lambda conn: _render_result(
         conn, sid, reocr=bool(reocr), filled=filled, left=left,
-        empty_batch=bool(empty_batch), changed=changed))
+        empty_batch=bool(empty_batch), changed=changed,
+        by_ids=bool(by_ids), qr_pid=(qr or "").strip()))
 
 
 # --------------------------------------------------------------------------- 重新识别
@@ -1473,3 +1572,152 @@ def delete_record(request: Request, sid: str):
         return RedirectResponse("/records?deleted=1", status_code=302)
 
     return _guard(request, run)
+
+
+# --------------------------------------------------------------------------- CSV 学情导出（t49）
+#: 判卷明细的列（老师直接拿去 Excel 透视）
+CSV_DETAIL_HEAD = ("题号", "题型", "空号", "知识点ID", "知识点名称", "标准答案",
+                   "识别值", "判定", "是否人工确认", "待确认原因")
+CSV_REPORT_HEAD = ("知识点ID", "名称", "题数", "答对", "答错", "待确认", "正确率")
+CSV_RECORDS_HEAD = ("时间", "卷号", "标题", "得分", "满分", "待确认", "提交号")
+
+
+def _csv_response(rows, header, file_name: str, head_lines=()) -> Response:
+    """CSV 回执：UTF-8 **带 BOM**（Excel 双击不乱码）+ CRLF + RFC5987 文件名。"""
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")
+    for line in head_lines or ():
+        writer.writerow([line])
+    writer.writerow(list(header))
+    for row in rows or ():
+        writer.writerow(list(row))
+    body = ("\ufeff" + buf.getvalue()).encode("utf-8")
+    return Response(
+        content=body, media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition":
+                "attachment; filename=\"grade.csv\"; filename*=UTF-8''%s" % quote(file_name),
+            "X-Csv-Filename": quote(file_name),
+            "Cache-Control": "no-store",
+        })
+
+
+def _kp_map(conn, nos) -> dict:
+    """题号 → (知识点ID, 知识点名)；题库里没有就返回空串（不报错）。"""
+    wanted = sorted({str(n) for n in (nos or []) if str(n or "").strip()})
+    if not wanted:
+        return {}
+    marks = ",".join("?" * len(wanted))
+    out = {}
+    try:
+        for r in conn.execute("SELECT no, kp_id, kp FROM questions WHERE no IN (%s)" % marks,
+                              wanted):
+            out[str(r["no"])] = (str(r["kp_id"] or ""), str(r["kp"] or ""))
+    except sqlite3.Error:
+        return {}
+    return out
+
+
+@router.get("/submissions/{sid}/export.csv")
+def submission_export_csv(request: Request, sid: str):
+    """判卷明细 CSV：一行一个作答单元（选择/填空/解答的每个空）。"""
+    def run(conn):
+        row, detail = _load_submission(conn, sid)
+        if row is None:
+            return JSONResponse({"error": "submission_not_found", "sid": sid}, status_code=404)
+        units = detail.get("items") or []
+        kps = _kp_map(conn, [u.get("no") for u in units])
+        rows = []
+        for u in units:
+            kp_id, kp = kps.get(str(u.get("no") or ""), ("", ""))
+            verdict = str(u.get("verdict") or "")
+            try:
+                blank = int(u.get("blank", 1) or 1)
+            except (TypeError, ValueError):
+                blank = 1
+            rows.append([
+                str(u.get("no") or u.get("idx") or ""),
+                str(u.get("qtype") or ""),
+                blank, kp_id, kp,
+                str(u.get("expected") or ""),
+                str(u.get("picked") or ""),
+                VERDICT_LABELS.get(verdict, verdict or "—"),
+                "是" if u.get("confirmed") else "否",
+                str(u.get("unsure_reason") or u.get("reason") or ""),
+            ])
+        score, full = _as_int(row["score"]), _as_int(row["full"])
+        head = ["判卷明细 · 卷号 %s · 提交 %s" % (row["pid"] or "—", sid),
+                "时间 %s · 得分 %s / %s · 识别后端 %s"
+                % (_fmt_when(row["created_at"]), score, full,
+                   detail.get("backend") or "manual")]
+        file_name = "判卷_%s_%s.csv" % (row["pid"] or "unknown", sid[-6:])
+        return _csv_response(rows, CSV_DETAIL_HEAD, file_name, head_lines=head)
+
+    return _guard(request, run, json_errors=True)
+
+
+@router.get("/papers/{pid}/report.csv")
+def paper_report_csv(request: Request, pid: str):
+    """按知识点聚合错率（同一份卷多次提交取最近一次）。"""
+    def run(conn):
+        try:
+            sub = conn.execute(
+                "SELECT sid FROM submissions WHERE pid=?"
+                " ORDER BY created_at DESC, sid DESC LIMIT 1", (pid,)).fetchone()
+        except sqlite3.Error:
+            sub = None
+        rows = []
+        if sub is not None:
+            row, detail = _load_submission(conn, sub["sid"])
+            units = detail.get("items") or []
+            kps = _kp_map(conn, [u.get("no") for u in units])
+            # 按「题」聚合（同题多空：一空错算整题错），题数才不会被多空题重复计
+            per_item = {}
+            for u in units:
+                kp_id, kp = kps.get(str(u.get("no") or ""), ("", ""))
+                key = (kp_id, kp, str(u.get("idx")))
+                per_item.setdefault(key, []).append(str(u.get("verdict") or ""))
+            agg = {}
+            for (kp_id, kp, _idx), verdicts in per_item.items():
+                slot = agg.setdefault(kp_id or "未标注", [kp or "未标注", 0, 0, 0, 0])
+                if slot[0] in ("", "未标注") and kp:
+                    slot[0] = kp
+                slot[1] += 1
+                if "wrong" in verdicts:
+                    slot[3] += 1
+                elif "unsure" in verdicts or "pending" in verdicts:
+                    slot[4] += 1
+                elif verdicts and all(v == "correct" for v in verdicts):
+                    slot[2] += 1
+                else:
+                    slot[4] += 1
+            for kp_id in sorted(agg):
+                name, total, ok, bad, unsure = agg[kp_id]
+                pct = "%d%%" % int(round(100.0 * ok / total)) if total else "—"
+                rows.append([kp_id, name, total, ok, bad, unsure, pct])
+        return _csv_response(rows, CSV_REPORT_HEAD, "知识点报告_%s.csv" % pid)
+
+    return _guard(request, run, json_errors=True)
+
+
+@router.get("/records.csv")
+def records_csv(request: Request):
+    """全部判卷记录汇总 CSV。"""
+    def run(conn):
+        rows = []
+        try:
+            found = conn.execute(
+                "SELECT s.sid, s.pid, s.created_at, s.score, s.full, s.warp_ok,"
+                " s.detail_json, COALESCE(p.title, '') AS title"
+                " FROM submissions s LEFT JOIN papers p ON p.pid = s.pid"
+                " ORDER BY s.created_at DESC, s.sid DESC LIMIT %d" % RECORDS_LIMIT).fetchall()
+        except sqlite3.Error:
+            found = []
+        for r in found:
+            item = _record_row(r)
+            rows.append([item["when"], item["pid"], item["title"], item["score"], item["full"],
+                         item["pending_items"], item["sid"]])
+        name = "判卷记录_%s.csv" % _dt.datetime.now().strftime("%Y%m%d-%H%M")
+        return _csv_response(rows, CSV_RECORDS_HEAD, name)
+
+    return _guard(request, run, json_errors=True)

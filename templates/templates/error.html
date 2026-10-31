@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h1>出错了</h1>
+  <p class="lede">按上面「怎么办」里的一条走就行；必要时把自检页的原始 JSON 一起反馈。</p>
+</div>
+
+<div class="empty-state">
+  <p>
+    {% if links %}
+      {% for link in links %}
+      <a class="btn{% if loop.first %} btn-primary{% endif %}" href="{{ link.href }}">{{ link.label }}</a>
+      {% endfor %}
+    {% else %}
+      <a class="btn btn-primary" href="/">回组卷首页</a>
+      <a class="btn" href="/guide">看使用指南</a>
+      <a class="btn" href="/health">打开自检页</a>
+    {% endif %}
+  </p>
+</div>
+{% endblock %}

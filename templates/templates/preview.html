@@ -1,0 +1,158 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h1>卷子 {{ pid }}</h1>
+  <p class="lede">
+    {{ title }}
+    <span class="muted">· 建卷时间 {{ created_at }} · 共 {{ n_items }} 题</span>
+  </p>
+  <p class="page-count">共 {{ total_n }} 页（卷面 {{ paper_n }} 页 + 答题卡 {{ card_n }} 页）</p>
+</div>
+
+{% if degraded %}
+<div class="banner banner-warn" role="status">
+  <div class="banner-head">
+    <span class="banner-dot" aria-hidden="true"></span>
+    <strong>
+      {% if degraded_kind == "render" %}卷面渲染失败{% else %}卷面 PDF 未生成（本机未检测到 Word）{% endif %}
+    </strong>
+    <span class="banner-code mono">{% if degraded_kind == "render" %}RenderError{% else %}WordUnavailable{% endif %}</span>
+  </div>
+  <p class="banner-detail">{{ degraded_reason }} 答题卡仍可打印。</p>
+  <p class="banner-hint-title">怎么办</p>
+  <ol class="banner-hints">
+    {% if degraded_kind == "render" %}
+    <li>先下载答题卡 PDF 打印，把这份卷面用别的方式出（或换台装了 Word 的机器再生成）</li>
+    <li>把上面这条报错和 /healthz 的 JSON 一起反馈——卷面渲染由 paper/render 模块负责</li>
+    <li>看 <a href="/health">自检页</a> 确认 Word 与产物目录是否正常</li>
+    {% else %}
+    <li>先下载答题卡 PDF 打印，卷面用别的方式出（或用已打印好的旧卷）</li>
+    <li>装 Microsoft Word 2016+，装完重启本程序，重新点「生成试卷」</li>
+    <li>详细说明见 <a href="/guide#err-WordUnavailable">使用指南 · 错误速查</a></li>
+    {% endif %}
+  </ol>
+</div>
+{% endif %}
+
+<div class="card print-note">
+  <h2>打印须知</h2>
+  <ul class="checklist">
+    <li><strong>A4 纸、100% 比例</strong>：打印对话框选「实际大小 / Actual size」。</li>
+    <li><strong>不要勾「适应页面」「缩放以适合纸张」</strong>——一缩放，答题卡四角黑块与选项框就跟程序算出的坐标对不上，判卷会失败。</li>
+    <li>「合并打印」PDF 已按 <strong>卷面在前、答题卡在后</strong> 排好，一次打印即可。</li>
+    <li>打印后别折叠答题卡四角；拍照上传前先看 <a href="/guide#photo">拍照要求</a>。</li>
+  </ul>
+  <div class="download-row">
+    {% if has_paper_pdf %}
+    <a class="btn" href="/papers/{{ pid }}/pdf">下载卷面 PDF（{{ paper_n }} 页）</a>
+    {% endif %}
+    {% if has_card_pdf %}
+    <a class="btn" href="/papers/{{ pid }}/card.pdf">下载答题卡 PDF（{{ card_n }} 页）</a>
+    {% endif %}
+    {% if has_paper_pdf and has_card_pdf %}
+    <a class="btn btn-primary" href="/papers/{{ pid }}/print.pdf">合并打印 PDF（{{ total_n }} 页）</a>
+    {% endif %}
+    <a class="btn" href="/">再组一份</a>
+  </div>
+</div>
+
+<section class="card">
+  <h2>卷面预览</h2>
+  {% if paper_pages %}
+  <div class="paper-list">
+    {% for src in paper_pages %}
+    <figure class="paper-figure">
+      <a class="paper-link" href="{{ src }}" target="_blank" rel="noopener" title="点开看大图">
+        <img class="paper-img" src="{{ src }}" alt="卷面第 {{ loop.index }} 页" loading="lazy">
+      </a>
+      <figcaption>卷面第 {{ loop.index }} / {{ paper_n }} 页</figcaption>
+    </figure>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="muted">卷面还没有生成图片{% if degraded %}（本机没有可用的 Word，卷面 PDF 生成不了）{% endif %}。</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>答题卡预览</h2>
+  {% if card_pages %}
+  <div class="paper-list">
+    {% for src in card_pages %}
+    <figure class="paper-figure">
+      <a class="paper-link" href="{{ src }}" target="_blank" rel="noopener" title="点开看大图">
+        <img class="paper-img" src="{{ src }}" alt="答题卡第 {{ loop.index }} 页" loading="lazy">
+      </a>
+      <figcaption>答题卡第 {{ loop.index }} / {{ card_n }} 页（打印后拍这张）</figcaption>
+    </figure>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="muted">答题卡还没有生成图片。</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>题目清单</h2>
+  <table class="items-table">
+    <thead>
+      <tr><th>序号</th><th>题号</th><th>题型</th><th>知识点</th><th>答案</th></tr>
+    </thead>
+    <tbody>
+      {% for it in items %}
+      <tr>
+        <td>{{ it.idx }}</td>
+        <td class="mono">{{ it.no }}</td>
+        <td>{{ it.qtype }}</td>
+        <td>
+          {% if it.kp_id %}<span class="muted mono">{{ it.kp_id }}</span> {{ it.kp }}{% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td>
+          {% if it.has_answer %}<span class="pill pill-ok">有</span> <span class="mono">{{ it.answer }}</span>
+          {% else %}<span class="pill pill-warn">无</span> <span class="muted">判卷时算未判</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="field-hint">无答案的题判卷时记「未判」，不会算错；要全都可判就打开「只选有答案题」重新组卷。</p>
+</section>
+
+<section class="card no-print">
+  <h2>换一套题</h2>
+  <p class="muted">题量、范围、版面都不变，只换 seed —— 重新抽一批题。</p>
+  <form class="inline-form" method="post" action="/papers">
+    <input type="hidden" name="title" value="{{ reroll.title }}">
+    <input type="hidden" name="n_choice" value="{{ reroll.n_choice }}">
+    <input type="hidden" name="n_fill" value="{{ reroll.n_fill }}">
+    <input type="hidden" name="n_solution" value="{{ reroll.n_solution }}">
+    {% for c in reroll.chapters %}<input type="hidden" name="chapters" value="{{ c }}">{% endfor %}
+    {% for k in reroll.kps %}<input type="hidden" name="kps" value="{{ k }}">{% endfor %}
+    <input type="hidden" name="kp_mode" value="{{ reroll.kp_mode }}">
+    <input type="hidden" name="layout" value="{{ reroll.layout }}">
+    {% if reroll.need_answer %}<input type="hidden" name="need_answer" value="on">{% endif %}
+    <input type="hidden" name="exclude_empty" value="1">
+    <button class="btn btn-primary" type="submit">同参数换一套</button>
+  </form>
+  <p class="field-hint">手机上也能点；生成要重新排版，约十几秒。</p>
+</section>
+
+<section class="card">
+  <h2>这份卷子的参数</h2>
+  <dl class="kv">
+    <dt>标题</dt><dd>{{ title }}</dd>
+    <dt>随机种子</dt>
+    <dd><span class="mono" id="paper-seed">{{ params.seed }}</span>
+      <span class="muted">（填这个数可以复现完全一样的卷）</span></dd>
+    <dt>题量</dt><dd>{% for q, n in (params.mix or {}).items() %}{{ q }} {{ n }}{% if not loop.last %} · {% endif %}{% endfor %}</dd>
+    <dt>范围</dt><dd>
+      {% if params.scope and params.scope.chapters %}{{ params.scope.chapters | join("、") }}
+      {% elif params.scope and params.scope.kps %}{{ params.scope.kps | join("、") }}
+      {% else %}全库不限{% endif %}
+    </dd>
+    <dt>只选有答案</dt><dd>{% if params.requirements and params.requirements.need_answer %}是{% else %}否{% endif %}</dd>
+    <dt>版面</dt><dd>{% if layout == "normal" %}宽裕（默认页边距与行距）{% else %}省纸（页边距与行距收紧）{% endif %}</dd>
+    <dt>产物目录</dt><dd class="mono">{{ out_dir }}</dd>
+  </dl>
+</section>
+{% endblock %}

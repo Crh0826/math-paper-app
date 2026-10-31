@@ -28,6 +28,33 @@
 > 题型池：选择 5,012 / 解答 4,323 / 填空 2,787 / 其他 62 / 判断 0。
 > 原始 22,898 份 docx 仍只读保留，随时可重建；任何统计脚本不要硬编码 22,898。
 
+### 1.1 外部题库导入（`import_qbank.py`，2026-10-31 增）
+
+```bash
+python import_qbank.py --from json|excel|csv|docx --file <路径> [--db <app.db>] \
+                       [--subject 数学] [--grade 七年级上] [--version 沪科版] \
+                       [--dry-run] [--report] [--list-subjects]
+```
+
+统一 JSON 结构（顶层也接受裸数组）：
+
+```json
+{"subject":"数学","grade":"七年级上","version":"沪科版","items":[
+  {"no":"00001","qtype":"选择","stem":"…","options":["A．…","B．…"],
+   "answer":"B","analysis":"…","kp_id":"1.2","chapter":"第1章 有理数",
+   "figures":["media/1.png"]}]}
+```
+
+- `qtype`：选择 / 判断 / 填空 / 解答 / 其他（单选、多选题、判断题、计算题、简答题、证明题 自动映射）。
+- Excel/CSV：表头别名（题号/编号、题型/类型、题干/题目、答案/正确答案、解析、知识点/考点、章节、图片）；
+  选项可 A/B/C/D 四列，或一列竖线分隔 `A．1|B．2|C．3|D．4`；CSV 自动识别 UTF-8-BOM / UTF-8 / GBK。
+- **幂等**：按 `no` upsert；重复导入只更新不重复插入。
+- 坏行（缺 `no`/`answer`、`qtype` 非法）只进报告，不落库；报告写 `data/import_report.json`。
+- 多学科：`subjects(subject_pk, name, grade, version)` + `questions.subject_pk` + `kps.subject_pk`；
+  老库自动迁移并把存量归到 `math7a`；`picker` 用 `importers.subject_scope()` 过滤学科。
+- 导入的题**不自动生成** `quality_flags`，需另跑 `python quality.py`。
+
+
 `questions(no TEXT PK, qtype, option_count, sub_count, is_empty, media_count, text_len, text_plain,
  tokens_json, fmt, src_title, src_para, family_key, kp_id, chapter, kp, kp_source,
  answer_raw, check_status)`
@@ -57,11 +84,17 @@
                    "exclude_fig_missing": true, "exclude_mismatch": true, "strict": false},
   "seed": 42,
   "layout": "compact",
+  "calibration": true,
   "space": {"选择": 0, "填空": 0, "解答": 0},
   "nos": ["00012", "00457"],
   "exclude_nos": ["00001"]
 }
 ```
+- `calibration`（默认 **true**）：卷面 PDF 前附一页 **100mm 校准页**（100×100mm 方框 + 10mm 刻度尺 +
+  A4 外框 + 四角标记 + 「打印后量一下，不是 100mm 说明被缩放，请选实际大小/100%」说明；本页不判卷）。
+  840 打印设置一旦缩放，答题卡的 Aruco/QR 坐标就全废 —— 这页是给用户的物理校准手段。
+  卷面页数仍按内容页算（`manifest.paper.pages`），答题卡页码接着内容页数走，不受校准页影响；
+  关掉它（`false`）就只出内容页。`/print.pdf` = 1(校准) + 卷面 + 答题卡。
 - `layout`（默认 **compact**）：版式。`compact` = 省纸模式（页边距 1.4cm、行距 1.0、段距 1pt、
   题框内边距减半、题间空段 0.5pt；10 题 1 页 / 24 题 3 页 / 50 题 5 页，每页墨迹 ≥2.5%）；
   `normal` = 原来的宽松版面（2cm 边距 / 1.15 行距 / 题间 6pt）。**不动**：字号、公式与图片尺寸、
@@ -159,7 +192,10 @@ def render_paper(manifest: dict, out_dir: str, *, name="paper", dpi=300, deep_ch
 #     dangling=0（r:id/r:embed/r:link 全部能在 word/_rels/document.xml.rels 找到）
 #     media_missing=[]（原始 docx 的媒体 sha1 全部进了卷面）、oMath/object/drawing/pict 数与题数一致
 #     deep_check=True 时用 Word COM 真打开一次，打不开 → FidelityError(code="word_cannot_open")
-#   出卷后把卷面页数写回 manifest["paper"] = {"pages", "dpi", "w_px", "h_px"}（card.py 据此接页码）
+#   出卷后把卷面页数写回 manifest["paper"] = {"pages", "dpi", "w_px", "h_px", "calibration"}
+#   （card.py 据此接页码；pages 只数内容页，不含校准页）
+#   硬闸门：PDF 每页必须是 A4（595.28×841.89pt ±0.5），否则 FidelityError(code="pdf_not_a4")；
+#   card.build_card 同样校验并把 page_size_pt 写进返回的 health
 #   页码口径：卷面与答题卡**各自编号**（卷面页脚「卷面 · 第 N 页 / 共 A 页」，
 #   答题卡页脚「答题卡 · 第 M 页 / 共 B 页 ·（卷面续页 P{A+M}）」），合并件不盖统一页脚。
 

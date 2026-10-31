@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h1>自检</h1>
+  <p class="lede">
+    本机环境与数据检查。机器可读版本：<a href="/healthz">/healthz</a>
+    <span class="muted">（JSON，诊断口永远 200，健康与否看 ok / status 字段）</span>
+  </p>
+</div>
+
+<div class="status-strip status-{{ h.status }}">
+  <span class="status-dot" aria-hidden="true"></span>
+  <strong>
+    {% if h.status == "ok" %}全部正常{% elif h.status == "degraded" %}可用，但有告警{% else %}有阻塞项，先修再组卷{% endif %}
+  </strong>
+  <span class="muted">生成于 {{ h.generated_at }} · 已运行 {{ h.app.uptime_s }} 秒 · Python {{ h.app.python }}</span>
+</div>
+
+{% if h.hints %}
+<section class="card">
+  <h2>怎么办</h2>
+  <ol class="hints">
+    {% for hint in h.hints %}<li>{{ hint }}</li>{% endfor %}
+  </ol>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>检查项</h2>
+  <table class="checks">
+    <thead>
+      <tr><th>状态</th><th>项目</th><th>结果</th></tr>
+    </thead>
+    <tbody>
+      {% for c in h.checks %}
+      <tr class="check-{{ c.status }}">
+        <td>
+          <span class="pill pill-{{ c.status }}">
+            {% if c.status == "ok" %}正常{% elif c.status == "warn" %}告警{% else %}阻塞{% endif %}
+          </span>
+        </td>
+        <td class="check-label">{{ c.label }}</td>
+        <td>
+          {{ c.detail }}
+          {% if c.hints %}
+          <ul class="inline-hints">
+            {% for hint in c.hints %}<li>{{ hint }}</li>{% endfor %}
+          </ul>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<div class="grid grid-2">
+  <section class="card">
+    <h2>题库数据库</h2>
+    <dl class="kv">
+      <dt>路径</dt><dd class="mono">{{ h.db.path }}</dd>
+      <dt>存在</dt><dd>{% if h.db.exists %}是{% else %}否{% endif %}</dd>
+      <dt>大小</dt><dd>{% if h.db.size_mb is not none %}{{ h.db.size_mb }} MB{% else %}—{% endif %}</dd>
+      <dt>题目</dt><dd>{{ h.db.counts.questions | num }}</dd>
+      <dt>知识点</dt><dd>{{ h.db.counts.kps | num }}</dd>
+      <dt>题族</dt><dd>{{ h.db.counts.families | num }}</dd>
+      <dt>已建卷</dt><dd>{{ h.db.counts.papers | num }}</dd>
+      <dt>已判卷</dt><dd>{{ h.db.counts.submissions | num }}</dd>
+    </dl>
+    {% if h.db.error %}<p class="inline-error">{{ h.db.error }}</p>{% endif %}
+  </section>
+
+  <section class="card">
+    <h2>Word（docx 排版 / 转 PDF）</h2>
+    <dl class="kv">
+      <dt>可用</dt><dd>{% if h.word.available %}是{% else %}否{% endif %}</dd>
+      <dt>pywin32</dt><dd>{% if h.word.com %}可用{% else %}不可用{% endif %}</dd>
+      <dt>WINWORD.EXE</dt><dd class="mono">{{ h.word.path or "未找到" }}</dd>
+    </dl>
+    {% if h.word.reason %}<p class="inline-warn">{{ h.word.reason }}</p>{% endif %}
+    <p class="field-hint">只探测路径，不会启动 Word（不弹窗、不占用文档）。</p>
+  </section>
+
+  <section class="card">
+    <h2>OCR 后端（填空 / 解答识别）</h2>
+    <dl class="kv">
+      <dt>backend</dt><dd class="mono">{{ h.ocr.backend or "未配置" }}</dd>
+      <dt>来源</dt><dd>{{ h.ocr.source or "—" }}</dd>
+      <dt>模型</dt><dd class="mono">{{ h.ocr.model or "—" }}</dd>
+      <dt>token</dt><dd>{% if h.ocr.token_present %}已配置（不显示内容）{% else %}未配置{% endif %}</dd>
+      <dt>超时 / 轮询</dt><dd>{{ h.ocr.timeout_s or "—" }} 秒 / {{ h.ocr.poll_s or "—" }} 秒</dd>
+      <dt>配置文件</dt><dd class="mono">{{ h.ocr.config_path }}</dd>
+    </dl>
+    {% if h.ocr.error %}<p class="inline-warn">{{ h.ocr.error }}</p>{% endif %}
+  </section>
+
+  <section class="card">
+    <h2>数据目录</h2>
+    <dl class="kv">
+      <dt>数据可用</dt><dd>{% if h.data_dir.writable %}可写{% else %}不可写{% endif %}</dd>
+      <dt>数据路径</dt><dd class="mono">{{ h.data_dir.path }}</dd>
+      <dt>产物可用</dt><dd>{% if h.out_dir.writable %}可写{% else %}不可写{% endif %}</dd>
+      <dt>产物路径</dt><dd class="mono">{{ h.out_dir.path }}</dd>
+      <dt>产物占用</dt><dd>{{ h.out_dir_mb }} MB（共 {{ h.papers_count }} 份卷子）</dd>
+      <dt>判卷证据</dt><dd>{{ h.papers_with_submissions_mb }} MB（有判卷记录的卷子，软删也保留）</dd>
+    </dl>
+    <p class="field-hint">
+      原始 docx 只读；所有产物只写 app\data 与 app\out。清理旧卷子：
+      <a href="/papers">我的卷子</a> → 删除。
+    </p>
+  </section>
+</div>
+
+<section class="card">
+  <h2>运行环境</h2>
+  <dl class="kv">
+    <dt>服务</dt><dd class="mono">{{ h.server.host }}:{{ h.server.port }}</dd>
+    <dt>地址</dt><dd class="mono">{{ h.server.url }}</dd>
+    <dt>代码目录</dt><dd class="mono">{{ h.app.base_dir }}</dd>
+    <dt>平台</dt><dd class="mono">{{ h.app.platform }}</dd>
+    <dt>启动时间</dt><dd class="mono">{{ h.app.started_at }}</dd>
+    <dt>版本</dt><dd class="mono">v{{ h.app.version }}</dd>
+  </dl>
+</section>
+
+<details class="card raw">
+  <summary>原始 JSON（可整段复制反馈）</summary>
+  <pre class="mono">{{ json_pretty }}</pre>
+</details>
+{% endblock %}

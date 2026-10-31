@@ -14,7 +14,12 @@
 * 分页：单页放不下自动翻页；每页都有独立 ArUco 四角 + QR + 页码 + 题型标注。
 
 对外 API：
-    build_card(manifest, out_dir) -> {"pdf", "png": [...], "card": {...}, "manifest": manifest}
+    build_card(manifest, out_dir)
+        -> {"pdf", "png": [...], "card": {...}, "manifest": manifest, "health": {...}}
+
+依赖说明（别误会成循环依赖）：出卡后**复用 paper.check_pdf_a4 做页面尺寸校验**
+（本模块只加校验、不改版式）。依赖方向是 card → paper 单向；paper.py 不 import card.py，
+所以在 build_card 里用函数内 `import paper` 就够，模块顶层不引。
     encode_idx_bits(idx) -> list[int]  # 16 个 0/1
     decode_idx_bits(bits) -> int | None
 """
@@ -868,8 +873,14 @@ def build_card(manifest: dict, out_dir: str) -> dict:
     pdf = pngs_to_pdf(pngs, os.path.join(out_dir, CARD_PDF_NAME),
                       title=(manifest.get("title") or "答题卡") + " · 答题卡")
 
+    # 打印容错：卡的 Aruco/QR 坐标全按 A4 pt 写死，页面尺寸一被改（Letter/缩放）判卷必错
+    import paper as _paper              # 只在生成时导入：A4 规则只有 paper.check_pdf_a4 一份
+    sizes = _paper.check_pdf_a4(pdf)
+    health = {"page_size_pt": [round(sizes[0][0], 2), round(sizes[0][1], 2)],
+              "pages": len(sizes), "a4_ok": True}
+
     manifest["card"] = card
-    return {"pdf": pdf, "png": pngs, "card": card, "manifest": manifest}
+    return {"pdf": pdf, "png": pngs, "card": card, "manifest": manifest, "health": health}
 
 
 # ---------------------------------------------------------------- 自检 CLI

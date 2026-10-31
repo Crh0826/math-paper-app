@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<base href="/submissions/{{ sid }}/">
+<title>{{ page_title }} · 数学题库工作台</title>
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  /* 判卷结果页自带的最小布局：分数卡 / 裁切图 / 改判控件 / 待确认提示 */
+  .banner-ok { background: var(--ok-soft); border-color: #c5e5cf; }
+  .banner-ok .banner-head { color: #14632c; }
+  /* 手机：导航项多，390px 放不下（app.css 的 .topbar-inner 不换行）→ 允许换行并缩小间距 */
+  .topbar-inner { flex-wrap: wrap; }
+  .nav { flex-wrap: wrap; }
+  @media (max-width: 520px) {
+    .topbar-inner { gap: 8px; padding: 8px 12px; }
+    .nav { gap: 2px; }
+    .nav-item { padding: 4px 7px; font-size: 13px; }
+    .ghost-link { display: none; }
+  }
+
+  .by-ids-note {
+    margin: 0 0 12px; padding: 10px 14px; border-radius: 10px; font-size: 13.5px;
+    background: var(--warn-soft, #fff8e6); border: 1px solid #f0dca8; color: #6b4e00;
+  }
+  .by-ids-note strong { color: #8a5a00; }
+
+  .footer {
+    max-width: 1080px; margin: 0 auto; padding: 18px 20px 42px;
+    color: var(--muted); font-size: 12.5px;
+    display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+  .score-card { display: grid; grid-template-columns: 200px 1fr; gap: 20px; align-items: center; }
+  .score-main { text-align: center; padding: 6px 0; }
+  .score-num { font-size: 46px; font-weight: 700; color: var(--accent); line-height: 1.05; }
+  .score-sep { font-size: 26px; color: var(--muted); margin: 0 4px; }
+  .score-full { font-size: 26px; color: var(--ink-2); }
+  .score-pct { display: block; margin-top: 6px; font-size: 13px; color: var(--muted); }
+  .score-kv { margin: 0; }
+  .poll-card h2 { display: flex; align-items: center; gap: 8px; }
+  .poll-dot {
+    width: 9px; height: 9px; border-radius: 50%; background: var(--accent);
+    display: inline-block; animation: poll-pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes poll-pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+  .grade-table td { vertical-align: top; }
+  .grade-table .cell-verdict { white-space: nowrap; }
+  .grade-table .cell-fix { min-width: 250px; }
+  .crop {
+    display: block; max-width: 220px; max-height: 96px; border: 1px solid var(--line);
+    border-radius: 6px; background: #fbfcfd;
+  }
+  .crop-fig { margin: 0 0 8px; }
+  .crop-fig figcaption { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+  .cands { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .btn-xs { padding: 2px 10px; font-size: 12.5px; border-radius: 6px; }
+  .ans { width: 100%; max-width: 220px; padding: 5px 8px; font: inherit; font-size: 13px;
+         border: 1px solid var(--line); border-radius: 6px; }
+  .verdict-sel { padding: 5px 8px; font: inherit; font-size: 13px; border-radius: 6px;
+                 border: 1px solid var(--line); background: #fff; }
+  .quick { display: flex; gap: 6px; margin-top: 6px; }
+  .reason { margin: 6px 0 0; font-size: 12px; color: var(--warn); max-width: 240px; }
+  .row-correct { background: #fbfdfb; }
+  .row-wrong { background: #fffafa; }
+  .row-pending, .row-unsure { background: #fffdf5; }
+  .sticky-save { position: sticky; bottom: 0; background: rgba(255,255,255,.96);
+                 border-top: 1px solid var(--line); padding: 10px 2px; }
+  .legend { margin: -4px 2px 14px; font-size: 12.5px; line-height: 1.9; }
+  .legend b { font-weight: 600; }
+  .lg-ok { color: #0a7a2f; }
+  .lg-fail { color: #c62828; }
+  .lg-warn { color: #b56b00; }
+  .lg-pending { color: #0b5fbe; }
+  .why-link { margin-left: 6px; font-size: 12px; white-space: nowrap; }
+  .score-chip {
+    display: inline-block; margin-left: 10px; padding: 1px 12px; border-radius: 999px;
+    background: var(--accent-soft); color: var(--accent); font-size: 15px; font-weight: 600;
+    vertical-align: 3px;
+  }
+  .pending-chip {
+    display: inline-block; margin-left: 10px; padding: 1px 12px; border-radius: 999px;
+    background: var(--warn-soft); color: var(--warn); font-size: 13px; font-weight: 600;
+    border: 1px solid #f0dca8;
+  }
+  .pending-chip:hover { text-decoration: none; border-color: #e2c67a; }
+  .pending-chip.is-done { background: var(--ok-soft); color: var(--ok); border-color: #c5e5cf; }
+  .pill-done { background: var(--line-soft); color: var(--ink-2); }
+  .grade-table tr[id^="row-"] { scroll-margin-top: 84px; }
+  tr.flash { animation: row-flash 1.1s ease-out 1; }
+  @keyframes row-flash { 0% { background: #fff6d6; } 100% { background: transparent; } }
+  .why-backdrop { position: fixed; inset: 0; background: rgba(16, 24, 40, .32); z-index: 40; }
+  .why-drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(580px, 96vw);
+    background: #fff; border-left: 1px solid var(--line); z-index: 41;
+    display: flex; flex-direction: column; box-shadow: -8px 0 24px rgba(16, 24, 40, .12);
+  }
+  .why-drawer[hidden], .why-backdrop[hidden] { display: none; }
+  .why-drawer-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 14px 16px; border-bottom: 1px solid var(--line);
+  }
+  .why-drawer-body { padding: 14px 16px 30px; overflow: auto; }
+  .why-saved { font-size: 12.5px; padding: 2px 10px; border-radius: 999px; }
+  .why-saved.is-ok { background: var(--ok-soft); color: var(--ok); }
+  .why-saved.is-error { background: var(--danger-soft); color: var(--danger); }
+  @media (max-width: 760px) {
+    .score-card { grid-template-columns: 1fr; }
+    .grade-table .cell-fix { min-width: 0; }
+    .crop { max-width: 100%; }
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">Σ</span>
+      <span class="brand-text">
+        <strong>数学题库工作台</strong>
+        <small>沪科版七年级上 · 拍照判卷</small>
+      </span>
+    </a>
+    <nav class="nav" aria-label="主导航">
+      <a class="nav-item" href="/">组卷</a>
+      <a class="nav-item" href="/papers">我的卷子</a>
+      <a class="nav-item is-active" href="/submissions" aria-current="page">判卷</a>
+      <a class="nav-item" href="/records">判卷记录</a>
+      <a class="nav-item" href="/train">训练</a>
+      <a class="nav-item" href="/guide">使用指南</a>
+      <a class="nav-item" href="/health">自检</a>
+    </nav>
+    <a class="ghost-link mono" href="/healthz" target="_blank" rel="noopener" title="自检数据（JSON）">healthz</a>
+  </div>
+</header>
+
+<main class="page">
+  {% from "_banner.html" import banner %}
+  <div class="page-head">
+    <h1>判卷结果 <span class="score-chip" id="score-chip">{{ score }} / {{ full }} 分</span></h1>
+    <p class="lede">
+      卷号 <span class="mono">{{ pid }}</span> · 提交 <span class="mono">{{ sid }}</span>
+      {% if created_at %}<span class="muted">· {{ created_at }}</span>{% endif %}
+      {% if pending_items %}
+      <a class="pending-chip" id="pending-chip"
+         href="#row-{{ first_pending.idx }}-{{ first_pending.blank }}"
+         title="点一下滚到第一条待确认">待确认 {{ pending_items }} 题</a>
+      {% else %}
+      <span class="pending-chip is-done" id="pending-chip">全部确认</span>
+      {% endif %}
+    </p>
+  </div>
+
+  {% if notice %}{{ banner(notice, notice.tone) }}{% endif %}
+
+  {% if by_ids_note %}
+  <p class="by-ids-note" id="by-ids-note">
+    <strong>按每题标识识别</strong> · {{ by_ids_note }}
+  </p>
+  {% endif %}
+
+  <section class="card score-card" data-sid="{{ sid }}" data-score="{{ score }}" data-full="{{ full }}">
+    <div class="score-main">
+      <span class="score-num" id="score-num">{{ score }}</span><span class="score-sep">/</span><span class="score-full" id="score-full">{{ full }}</span>
+      <span class="score-pct" id="score-pct">得分 {{ pct }}%（按判分单元计）</span>
+    </div>
+    <dl class="kv score-kv">
+      <dt>卷号</dt><dd class="mono">{{ pid }}</dd>
+      <dt>提交号</dt><dd class="mono">{{ sid }}</dd>
+      <dt>判分单元</dt><dd>{{ n_units }} 个（无标准答案的题不计入分母）</dd>
+      <dt>卷号二维码</dt>
+      <dd>{% if qr_ok %}读到{% if qr and qr.pid %}（{{ qr.pid }}）{% endif %}{% else %}没读到 —— 按你选的卷号判，结果一样准{% endif %}</dd>
+      <dt>识别后端</dt><dd class="mono">{{ backend }}</dd>
+      {% if recognized_at %}<dt>识别时间</dt><dd class="mono">{{ recognized_at }}</dd>{% endif %}
+      {% if confirmed_at %}<dt>人工确认</dt><dd class="mono">{{ confirmed_at }}</dd>{% endif %}
+      {% if image_path %}<dt>照片</dt><dd class="mono muted">{{ image_path }}</dd>{% endif %}
+    </dl>
+  </section>
+
+  {% if pending %}
+  <section class="card poll-card{% if empty_batch %} poll-failed{% endif %}">
+    {% if empty_batch %}
+    {# 识别失败/整批空：别再假装「识别中」，否则用户会一直等下去（P0 现场就是卡在这里） #}
+    <h2>识别没成功</h2>
+    <p class="muted">
+      这一批作答格没识别出文字（识别服务暂时无响应）。<strong>请点「重新识别」再试一次，或直接在下面「确认／改判」里手工判定</strong>
+      —— 手工判定同样算分，也不会重复计分。
+    </p>
+    {% else %}
+    <h2><span class="poll-dot" aria-hidden="true"></span>识别中（约 30 秒）</h2>
+    <p class="muted">
+      还有 <strong>{{ pending }}</strong> 个填空／解答的作答格在等云端识别。识别完本页会自动刷新；
+      识别不出来会留在「待人工确认」，不会判错。
+    </p>
+    <p class="mono muted" id="poll-state">已等 0 秒…</p>
+    {% endif %}
+    <form method="post" action="reocr">
+      <button class="btn" type="submit">重新识别</button>
+    </form>
+  </section>
+  {% endif %}
+
+  <div class="form-actions">
+    <a class="btn" href="/records">← 返回判卷记录</a>
+    <a class="btn btn-primary" href="annotated.png" target="_blank" rel="noopener"
+       title="把判卷过程画回原图：每个框为什么判对／判错都标在图上">查看批注图</a>
+    <a class="btn" href="export.zip"
+       title="打包批注图 + 每题裁切图 + evidence.json（本次判卷的全部证据）">导出证据包</a>
+    <a class="btn" href="/submissions/{{ sid }}/export.csv"
+       title="每题一行：题号/题型/空号/知识点/标准答案/识别值/判定/是否人工确认，Excel 直接打开">导出 CSV（本题明细）</a>
+    <a class="btn" href="/submissions">换一张照片</a>
+    <a class="btn" href="/submissions?pid={{ pid }}">重拍这份卷</a>
+    <a class="btn" href="/guide#photo">拍照要求</a>
+    {% if unsure %}<span class="muted">还有 {{ unsure }} 个空判不准（待确认），在下面「确认／改判」里定一下。</span>{% endif %}
+  </div>
+  <p class="legend muted">
+    批注图配色：<b class="lg-ok">绿=判对</b>、<b class="lg-fail">红=判错</b>、<b class="lg-warn">橙虚线=待确认</b>、<b class="lg-pending">蓝=待识别</b>；
+    框内小字是识别文本与期望答案。每行的「为什么」能看这道题的原始证据（识别值／期望／墨迹占比）。
+  </p>
+
+  <form method="post" action="confirm" class="grade-form">
+    <section class="card">
+      <h2>逐题判定</h2>
+      <table class="checks grade-table">
+        <thead>
+          <tr>
+            <th>题号</th>
+            {% if show_blank %}<th>空</th>{% endif %}
+            <th>题型</th>
+            <th>你的答案</th>
+            <th>标准答案</th>
+            <th>判定</th>
+            <th>置信度</th>
+            <th>确认／改判</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+          <tr id="row-{{ r.idx }}-{{ r.blank }}" class="row-{{ r.verdict }}">
+            <td class="mono">{{ r.idx }}</td>
+            {% if show_blank %}<td class="mono">{{ r.blank }}</td>{% endif %}
+            <td>{{ r.qtype }}</td>
+            <td id="picked-{{ r.idx }}-{{ r.blank }}">{{ r.picked if r.picked else '—' }}</td>
+            <td>{{ r.expected if r.expected else '—' }}</td>
+            <td class="cell-verdict">
+              <span class="pill verdict-pill{% if r.tone %} pill-{{ r.tone }}{% endif %}"
+                    id="verdict-pill-{{ r.idx }}-{{ r.blank }}">{{ r.label }}</span>
+              <span class="pill pill-done" id="done-pill-{{ r.idx }}-{{ r.blank }}"
+                    title="人工确认过"{% if not r.confirmed %} hidden{% endif %}>已确认</span>
+              <a class="why-link" href="item/{{ r.idx }}/why?format=html" data-why="{{ r.idx }}"
+                 title="看这道题的识别证据（识别文本／期望／墨迹占比）">为什么</a>
+            </td>
+            <td class="mono" id="conf-{{ r.idx }}-{{ r.blank }}">{{ r.conf_text }}</td>
+            <td class="cell-fix">
+              {% if r.editable %}
+                {% if r.crop_ok %}
+                <figure class="crop-fig">
+                  <a href="crop/{{ r.crop_name }}" target="_blank" rel="noopener" title="点开看原图">
+                    <img class="crop" src="crop/{{ r.crop_name }}" alt="第 {{ r.idx }} 题第 {{ r.blank }} 空作答裁切图" loading="lazy">
+                  </a>
+                  <figcaption>作答原图（点开看大图）</figcaption>
+                </figure>
+                {% endif %}
+                {% if r.options %}
+                <div class="cands">
+                  {% for opt in r.options %}
+                  <button type="button" class="btn btn-xs" data-fill="text_{{ r.idx }}_{{ r.blank }}"
+                          data-value="{{ opt }}">{{ opt }}</button>
+                  {% endfor %}
+                </div>
+                {% endif %}
+                <input class="ans" type="text" id="text_{{ r.idx }}_{{ r.blank }}"
+                       name="text_{{ r.idx }}_{{ r.blank }}" value="{{ r.picked }}"
+                       placeholder="学生实际答案（可空）" autocomplete="off" spellcheck="false">
+                <div class="quick">
+                  <select class="verdict-sel" id="verdict_{{ r.idx }}_{{ r.blank }}"
+                          name="verdict_{{ r.idx }}_{{ r.blank }}" aria-label="第 {{ r.idx }} 题判定">
+                    <option value="pending"{% if r.verdict == 'pending' %} selected{% endif %}>待确认</option>
+                    <option value="correct"{% if r.verdict == 'correct' %} selected{% endif %}>判对</option>
+                    <option value="wrong"{% if r.verdict == 'wrong' %} selected{% endif %}>判错</option>
+                  </select>
+                  <button type="button" class="btn btn-xs" data-verdict="verdict_{{ r.idx }}_{{ r.blank }}"
+                          data-value="correct">✓ 判对</button>
+                  <button type="button" class="btn btn-xs" data-verdict="verdict_{{ r.idx }}_{{ r.blank }}"
+                          data-value="wrong">✗ 判错</button>
+                </div>
+                {% if r.reason %}<p class="reason">{{ r.reason }}</p>{% endif %}
+              {% elif r.crop_ok %}
+                <a href="crop/{{ r.crop_name }}" target="_blank" rel="noopener">看裁切图</a>
+              {% else %}
+                <span class="muted">—</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <div class="sticky-save">
+        <button class="btn btn-primary" type="submit">保存改判</button>
+        <span class="muted">只提交改动过的行；重复提交是幂等的，不会重复计分。判对／判错会喂给错题训练。</span>
+      </div>
+    </section>
+  </form>
+
+  {# 「为什么这么判」抽屉：JS 拦截 .why-link 点击，把 item/{idx}/why?format=html&embed=1 片段塞进来 #}
+  <div class="why-backdrop" id="why-backdrop" hidden></div>
+  <aside class="why-drawer" id="why-drawer" hidden aria-label="为什么这么判">
+    <div class="why-drawer-head">
+      <strong id="why-title">为什么这么判</strong>
+      <span class="why-saved" id="why-saved" hidden></span>
+      <button type="button" class="btn btn-xs" id="why-close">关闭</button>
+    </div>
+    <div class="why-drawer-body" id="why-body">
+      <p class="muted">正在取这道题的识别证据…</p>
+    </div>
+  </aside>
+<section class="card no-print" id="train-box">
+  <h2>用错题生成训练卷</h2>
+  <p class="muted">按「同题族 → 同知识点 → 同章 → 跨章」抽同类题；原错题不会再出现。</p>
+  <div class="download-row">
+    <form class="inline-form" method="post" action="/train">
+      <input type="hidden" name="sid" value="{{ sid }}">
+      <input type="hidden" name="n_per" value="3">
+      <button class="btn btn-primary" type="submit">用错题生成训练卷</button>
+    </form>
+    <a class="btn" href="/train?sid={{ sid }}">先看看会抽哪些题</a>
+  </div>
+</section>
+
+  <div class="form-actions">
+    <a class="btn" href="/records">← 返回判卷记录</a>
+    <a class="btn" href="/submissions">判新的一份</a>
+  </div>
+</main>
+
+
+
+<footer class="footer">
+  <span>题库组卷 · 答题卡生成 · 拍照判卷 · 错题训练</span>
+  <span class="mono">本地运行，数据不出机器</span>
+</footer>
+
+<script>
+(function () {
+  // 候选按钮：把选项填进输入框；快捷判定按钮：直接拨下拉框
+  document.addEventListener('click', function (ev) {
+    var fill = ev.target.closest('[data-fill]');
+    if (fill) {
+      var input = document.getElementById(fill.getAttribute('data-fill'));
+      if (input) { input.value = fill.getAttribute('data-value'); input.focus(); }
+      ev.preventDefault();
+      return;
+    }
+    var quick = ev.target.closest('[data-verdict]');
+    if (quick) {
+      var sel = document.getElementById(quick.getAttribute('data-verdict'));
+      if (sel) { sel.value = quick.getAttribute('data-value'); }
+      ev.preventDefault();
+    }
+  });
+
+  // 还有 pending 就轮询 status；识别完自动刷新
+  var pending = {{ pending }};
+  var pollAllowed = {{ 'false' if empty_batch else 'true' }};
+  var state = document.getElementById('poll-state');
+  if (pending > 0 && pollAllowed && window.fetch) {
+    var tries = 0;
+    var tick = function () {
+      tries += 1;
+      if (tries > 40) {
+        if (state) { state.textContent = '等了 2 分钟还没识别完：点上面「重新识别」再试，或直接在下面手动填答案。'; }
+        return;
+      }
+      fetch('status', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (d) {
+        // 识别完了，或者这一批没识别出来（empty_batch）→ 都刷新一次，让页面说实话
+        if (!d.pending || d.empty_batch) { window.location.reload(); return; }
+        if (state) { state.textContent = '已等 ' + (tries * 3) + ' 秒，还有 ' + d.pending + ' 个空待识别…'; }
+        setTimeout(tick, 3000);
+      }).catch(function () { setTimeout(tick, 5000); });
+    };
+    setTimeout(tick, 2500);
+  }
+
+  // 「为什么这么判」抽屉：拦截 .why-link，把 item/{idx}/why?format=html&embed=1 的片段塞进来
+  var drawer = document.getElementById('why-drawer');
+  var backdrop = document.getElementById('why-backdrop');
+  var whyBody = document.getElementById('why-body');
+  var whyTitle = document.getElementById('why-title');
+  var whySaved = document.getElementById('why-saved');
+  var savedTimer = null;
+  var currentWhyIdx = null;
+
+  function closeWhy() {
+    if (drawer) { drawer.hidden = true; }
+    if (backdrop) { backdrop.hidden = true; }
+    currentWhyIdx = null;
+  }
+
+  function showSaved(text, isError) {
+    if (!whySaved) { return; }
+    whySaved.hidden = false;
+    whySaved.textContent = text;
+    whySaved.className = 'why-saved ' + (isError ? 'is-error' : 'is-ok');
+    if (savedTimer) { clearTimeout(savedTimer); }
+    savedTimer = setTimeout(function () { whySaved.hidden = true; }, 5000);
+  }
+
+  function loadWhy(idx, keepOpen) {
+    if (!whyBody) { return; }
+    var url = 'item/' + idx + '/why?format=html&embed=1';
+    if (!keepOpen) {
+      whyBody.innerHTML = '<p class="muted">正在取这道题的识别证据…</p>';
+      if (drawer) { drawer.hidden = false; }
+      if (backdrop) { backdrop.hidden = false; }
+    }
+    fetch(url, { cache: 'no-store' }).then(function (r) { return r.text(); }).then(function (html) {
+      whyBody.innerHTML = html;
+    }).catch(function () {
+      if (!keepOpen) {
+        whyBody.innerHTML = '<p class="muted">取证据失败：可以直接打开 ' +
+          '<a href="item/' + idx + '/why?format=html">这道题的证据页</a>。</p>';
+      }
+    });
+  }
+
+  function openWhy(idx) {
+    if (!drawer || !whyBody) { window.location.href = 'item/' + idx + '/why?format=html'; return; }
+    currentWhyIdx = idx;
+    if (whyTitle) { whyTitle.textContent = '第 ' + idx + ' 题：为什么这么判'; }
+    if (whySaved) { whySaved.hidden = true; }
+    loadWhy(idx, false);
+  }
+
+  // 局部刷新：分数 / 待确认徽章 / 逐题行（不整页跳，抽屉保持打开）
+  function paintScore(d) {
+    var chip = document.getElementById('score-chip');
+    if (chip) { chip.textContent = d.score + ' / ' + d.full + ' 分'; }
+    var num = document.getElementById('score-num');
+    if (num) { num.textContent = d.score; }
+    var fullEl = document.getElementById('score-full');
+    if (fullEl) { fullEl.textContent = d.full; }
+    var pctEl = document.getElementById('score-pct');
+    if (pctEl) { pctEl.textContent = '得分 ' + d.pct + '%（按判分单元计）'; }
+    var card = document.querySelector('.score-card');
+    if (card) {
+      card.setAttribute('data-score', d.score);
+      card.setAttribute('data-full', d.full);
+    }
+    var chipPending = document.getElementById('pending-chip');
+    if (chipPending) {
+      if (d.pending_items) {
+        chipPending.className = 'pending-chip';
+        chipPending.textContent = '待确认 ' + d.pending_items + ' 题';
+        if (d.first_pending) {
+          chipPending.setAttribute('href', '#row-' + d.first_pending.idx + '-' + d.first_pending.blank);
+        }
+      } else {
+        chipPending.className = 'pending-chip is-done';
+        chipPending.textContent = '全部确认';
+        chipPending.removeAttribute('href');
+      }
+    }
+  }
+
+  function paintRows(d) {
+    (d.items || []).forEach(function (it) {
+      var row = document.getElementById('row-' + it.idx + '-' + it.blank);
+      if (row) {
+        row.className = 'row-' + it.verdict + ' flash';
+        setTimeout(function () { row.classList.remove('flash'); }, 1200);
+      }
+      var pill = document.getElementById('verdict-pill-' + it.idx + '-' + it.blank);
+      if (pill) {
+        pill.className = 'pill verdict-pill' + (it.tone ? ' pill-' + it.tone : '');
+        pill.textContent = it.label;
+      }
+      var done = document.getElementById('done-pill-' + it.idx + '-' + it.blank);
+      if (done) { done.hidden = !it.confirmed; }
+      var picked = document.getElementById('picked-' + it.idx + '-' + it.blank);
+      if (picked) { picked.textContent = it.picked || '—'; }
+      var conf = document.getElementById('conf-' + it.idx + '-' + it.blank);
+      if (conf) { conf.textContent = it.conf_text; }
+      var inp = document.getElementById('text_' + it.idx + '_' + it.blank);
+      if (inp && it.picked) { inp.value = it.picked; }
+      var sel = document.getElementById('verdict_' + it.idx + '_' + it.blank);
+      if (sel) { sel.value = it.verdict; }
+    });
+  }
+
+  // 抽屉里的逐空改判：fetch 提交 → 局部更新 → 抽屉不关（无 JS 时表单照旧 POST）
+  document.addEventListener('submit', function (ev) {
+    var form = ev.target.closest ? ev.target.closest('form.ajax-confirm') : null;
+    if (!form) { return; }
+    ev.preventDefault();
+    var btn = form.querySelector('button[type="submit"]');
+    if (btn) { btn.disabled = true; }
+    fetch('confirm?format=json', {
+      method: 'POST',
+      body: new FormData(form),
+      headers: { 'Accept': 'application/json' }
+    }).then(function (r) {
+      return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+    }).then(function (res) {
+      if (btn) { btn.disabled = false; }
+      var d = res.d || {};
+      if (!res.ok || !d.ok) {
+        var msg = d.what || d.message || d.title || '保存失败';
+        if (d.fix) { msg += '　' + String(d.fix).replace(/\n/g, ' '); }
+        showSaved(msg, true);
+        return;
+      }
+      paintRows(d);
+      paintScore(d);
+      showSaved((d.notice || '已保存') + '（' + d.score + ' / ' + d.full + ' 分）', false);
+      if (currentWhyIdx !== null) { loadWhy(currentWhyIdx, true); }
+    }).catch(function () {
+      if (btn) { btn.disabled = false; }
+      showSaved('保存失败：网络或服务异常，稍后再点一次（刷新后表单仍可用）', true);
+    });
+  });
+
+  document.addEventListener('click', function (ev) {
+    var link = ev.target.closest('.why-link');
+    if (link) {
+      ev.preventDefault();
+      openWhy(link.getAttribute('data-why'));
+      return;
+    }
+    if (ev.target.closest('#why-close') || ev.target === backdrop) { closeWhy(); }
+  });
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape') { closeWhy(); }
+  });
+})();
+</script>
+</body>
+</html>
