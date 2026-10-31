@@ -1,0 +1,52 @@
+name: 🐛 缺陷报告
+description: 判卷判错、出卷失败、页面报错等
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！**请不要粘贴学生的真实姓名、照片**，涉及答题卡时请把姓名/学校打码。
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么
+      description: 一句话说清现象，例如「填空题 1.6×10^12 被判错」
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 组卷：10 选择 / 8 填空 / 6 解答
+        2. 打印后写答案，拍照上传
+        3. 第 5 题被判错，实际写对了
+    validations:
+      required: true
+  - type: textarea
+    id: expect
+    attributes:
+      label: 你期望的结果
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: 环境
+      placeholder: Windows 11 / Python 3.14 / Word 2021 / 浏览器 Chrome
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 报错信息（可选）
+      description: 页面上的错误码、`/healthz` 输出、或控制台最后几行
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 我确认已移除姓名、学校、照片等个人信息
+          required: true

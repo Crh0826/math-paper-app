@@ -1,0 +1,32 @@
+name: ✨ 功能建议
+description: 想要的新能力（新题型、导出、统计等）
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 描述场景，不要只写「加个导出功能」
+      placeholder: 一个班 40 人，判完想按知识点看全班薄弱项
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你想到的做法（可选）
+  - type: dropdown
+    id: area
+    attributes:
+      label: 涉及模块
+      options:
+        - 组卷（picker）
+        - 卷面排版（paper）
+        - 答题卡（card）
+        - 判卷（grade / ocr）
+        - 答案等价（normalize）
+        - 训练卷（train）
+        - 网页界面（server / templates）
+        - 打包与其他
+    validations:
+      required: true

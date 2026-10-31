@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 使用手册
+    url: https://github.com/Crh0826/math-paper-app#readme
+    about: 安装、打印要求、拍照要求、错误码，先看这里
+  - name: 🔍 已知限制
+    url: https://github.com/Crh0826/math-paper-app/blob/master/VERIFY.md
+    about: 真实手写识别率、强反光、题库数据口径等已验证/未验证项
