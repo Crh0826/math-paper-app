@@ -1,0 +1,32 @@
+# 运行产物
+out/
+data/app.db
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/snapshots/
+*.log
+
+# 本机配置（含云端 OCR Token，绝不入库）
+config.json
+
+# 原始题库（22,898 份 docx，另见 README 的数据说明）
+qbank/
+questionbank/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器/系统
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# 构建
+dist/
+build/
+*.spec.bak

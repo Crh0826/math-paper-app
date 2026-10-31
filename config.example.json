@@ -1,0 +1,22 @@
+{
+  "_note": "脱敏模板：复制成 app/config.json 再填真实 Token。真实值只放 config.json，不要提交/外发。",
+  "ocr": {
+    "backend": "manual",
+    "timeout_s": 120,
+    "poll_s": 2,
+    "paddle_vl": {
+      "token": "",
+      "model": "PaddleOCR-VL-1.6",
+      "job_url": "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+    },
+    "vlm": {
+      "base_url": "",
+      "key": "",
+      "model": ""
+    }
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8710
+  }
+}

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>需要访问码 · 数学题库工作台</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #f5f6f8; color: #1f2430;
+    font: 16px/1.65 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    padding: 20px;
+  }
+  .box { width: 100%; max-width: 420px; background: #fff; border: 1px solid #e3e6ec; border-radius: 14px;
+         padding: 26px 22px; box-shadow: 0 8px 30px rgba(20, 30, 60, .06); }
+  h1 { margin: 0 0 6px; font-size: 20px; }
+  p { margin: 8px 0; color: #4a5160; font-size: 14px; }
+  .bad { color: #b42318; font-weight: 600; }
+  form { margin: 16px 0 8px; display: flex; gap: 8px; }
+  input {
+    flex: 1; padding: 12px 14px; font-size: 22px; letter-spacing: 6px; text-align: center;
+    border: 1px solid #d5d9e2; border-radius: 10px; font-family: ui-monospace, Consolas, monospace;
+  }
+  input:focus { outline: none; border-color: #2f6feb; box-shadow: 0 0 0 3px rgba(47,111,235,.15); }
+  button {
+    padding: 12px 18px; font-size: 15px; font-weight: 600; color: #fff; background: #2f6feb;
+    border: 0; border-radius: 10px; cursor: pointer;
+  }
+  .hint { color: #6b7280; font-size: 13px; margin-top: 12px; }
+  code { background: #f1f3f7; border-radius: 5px; padding: 1px 5px; font-size: 12px; }
+</style>
+</head>
+<body>
+<main class="box">
+  <h1>需要访问码</h1>
+  <p>这台电脑开了局域网访问：请输入它启动窗口里显示的 <strong>4 位访问码</strong>。</p>
+  {% if bad %}<p class="bad">访问码不对，再试一次。</p>{% endif %}
+  <form method="get" action="{{ path }}">
+    <input name="pin" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="off"
+           autofocus placeholder="••••" aria-label="4 位访问码">
+    <button type="submit">进入</button>
+  </form>
+  <p class="hint">
+    访问码在电脑的黑色窗口里（也可以看 <code>config.json</code> 的 <code>server.pin</code>）。
+    一台手机只用输一次，会记 30 天；电脑本机 <code>127.0.0.1</code> 不用输。
+  </p>
+</main>
+</body>
+</html>

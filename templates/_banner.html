@@ -1,0 +1,17 @@
+{# 统一横幅：error = 红色（有「怎么办」），warn = 琥珀色。所有页面共用，别各写一套。 #}
+{% macro banner(b, kind) -%}
+<div class="banner banner-{{ kind }}" role="{% if kind == 'error' %}alert{% else %}status{% endif %}">
+  <div class="banner-head">
+    <span class="banner-dot" aria-hidden="true"></span>
+    <strong>{{ b.title }}</strong>
+    {% if b.code %}<span class="banner-code mono">{{ b.code }}</span>{% endif %}
+  </div>
+  {% if b.detail %}<p class="banner-detail">{{ b.detail }}</p>{% endif %}
+  {% if b.hints %}
+  <p class="banner-hint-title">怎么办</p>
+  <ol class="banner-hints">
+    {% for hint in b.hints %}<li>{{ hint }}</li>{% endfor %}
+  </ol>
+  {% endif %}
+</div>
+{%- endmacro %}

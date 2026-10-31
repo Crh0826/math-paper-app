@@ -1,0 +1,252 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h1>使用指南</h1>
+  <p class="lede">
+    打印、拍照、判卷三步的硬要求。照着做，判卷基本一次过。
+    <span class="muted">示意图都是页面内画的（不联网、不加载外部图片）。</span>
+  </p>
+  <nav class="anchor-nav" aria-label="本页目录">
+    <a href="#print">打印</a>
+    <a href="#photo">拍照</a>
+    <a href="#flow">判卷流程</a>
+    <a href="#errors">错误速查</a>
+  </nav>
+</div>
+
+<!-- ============================================================ 打印 -->
+<section class="card" id="print">
+  <h2>打印要求</h2>
+  <div class="callout callout-warn">
+    <strong>只要两条：A4 纸、100% 比例。</strong>
+    打印对话框里选「实际大小 / Actual size」，<em>不要</em>勾「适应页面」「缩放以适合纸张」「Fit to page」。
+  </div>
+
+  <div class="callout">
+    <strong>省纸模式不影响打印要求：</strong>组卷页勾着「省纸模式」时，卷面与答题卡的页边距、行距会收紧
+    （题更密、页数更少），但打印<em>仍然必须</em>是 A4 纸、100% 比例 ——
+    一缩放，答题卡四角黑块与选项框的坐标就和程序算的不一致，判卷会失败。
+  </div>
+
+  <div class="fig-row">
+    <figure class="figure">
+      <svg viewBox="0 0 300 380" role="img" aria-label="100% 打印：答题卡四角黑块与选项框落在程序算出的位置上">
+        <rect class="svg-page" x="6" y="6" width="288" height="368" rx="6"></rect>
+        <rect class="svg-card" x="32" y="52" width="236" height="276" rx="4"></rect>
+        <g class="svg-mark">
+          <rect x="40" y="60" width="22" height="22"></rect>
+          <rect x="238" y="60" width="22" height="22"></rect>
+          <rect x="40" y="298" width="22" height="22"></rect>
+          <rect x="238" y="298" width="22" height="22"></rect>
+        </g>
+        <g class="svg-mute">
+          <rect x="78" y="92" width="144" height="9" rx="3"></rect>
+          <circle cx="96" cy="124" r="6"></circle><circle cx="126" cy="124" r="6"></circle>
+          <circle cx="156" cy="124" r="6"></circle><circle cx="186" cy="124" r="6"></circle>
+          <rect x="78" y="146" width="144" height="9" rx="3"></rect>
+          <circle cx="96" cy="178" r="6"></circle><circle cx="126" cy="178" r="6"></circle>
+          <circle cx="156" cy="178" r="6"></circle><circle cx="186" cy="178" r="6"></circle>
+          <rect x="78" y="204" width="88" height="9" rx="3"></rect>
+          <rect x="78" y="228" width="120" height="9" rx="3"></rect>
+          <rect x="78" y="252" width="100" height="9" rx="3"></rect>
+        </g>
+        <g class="svg-ok">
+          <path d="M46 71 l5 6 l9 -11"></path>
+          <path d="M244 71 l5 6 l9 -11"></path>
+          <path d="M46 309 l5 6 l9 -11"></path>
+          <path d="M244 309 l5 6 l9 -11"></path>
+        </g>
+      </svg>
+      <figcaption>
+        <strong class="ok-text">100%（实际大小）✓</strong>
+        四角黑块和选项框正好落在程序算出的坐标上，拍完照能对得上。
+      </figcaption>
+    </figure>
+
+    <figure class="figure">
+      <svg viewBox="0 0 300 380" role="img" aria-label="勾了适应页面：答题卡被缩放，选项框与四角坐标整体偏移，判卷对不齐">
+        <rect class="svg-page" x="6" y="6" width="288" height="368" rx="6"></rect>
+        <g class="svg-ghost">
+          <rect x="32" y="52" width="236" height="276" rx="4"></rect>
+          <rect x="40" y="60" width="22" height="22"></rect>
+          <rect x="238" y="60" width="22" height="22"></rect>
+          <rect x="40" y="298" width="22" height="22"></rect>
+          <rect x="238" y="298" width="22" height="22"></rect>
+        </g>
+        <rect class="svg-bad-card" x="58" y="76" width="192" height="224" rx="4"></rect>
+        <g class="svg-mark">
+          <rect x="64" y="82" width="18" height="18"></rect>
+          <rect x="226" y="82" width="18" height="18"></rect>
+          <rect x="64" y="276" width="18" height="18"></rect>
+          <rect x="226" y="276" width="18" height="18"></rect>
+        </g>
+        <g class="svg-bad">
+          <path d="M40 60 l10 10 M50 60 l-10 10"></path>
+          <path d="M238 298 l10 10 M248 298 l-10 10"></path>
+          <path d="M150 190 l40 0"></path>
+          <path d="M184 186 l8 4 l-8 4"></path>
+          <text x="152" y="182" class="svg-label">整体缩放/偏移</text>
+        </g>
+      </svg>
+      <figcaption>
+        <strong class="bad-text">勾了「适应页面」✗</strong>
+        整张卡被缩小并居中，坐标整体偏了：选项框和四角定位块跟程序算出的位置<strong>对不齐</strong>，判卷会判错或直接失败。
+      </figcaption>
+    </figure>
+  </div>
+
+  <ul class="checklist">
+    <li>A4 纸；黑白激光够用（黑块和二维码的对比度足够）。</li>
+    <li>卷面与答题卡已经合并成一个 PDF（卷面在前、答题卡在后），<strong>一次打印</strong>，不用分两次。</li>
+    <li>打印出来的总页数 = 卷面 a 页 + 答题卡 b 页，预览页顶部会写清楚。</li>
+    <li><strong>别折叠、别压皱答题卡四角</strong>，也别裁掉页边——四角黑块是判卷定位用的。</li>
+    <li>纸面起皱会让拍照出现重阴影，尽量压平再拍。</li>
+  </ul>
+</section>
+
+<!-- ============================================================ 拍照 -->
+<section class="card" id="photo">
+  <h2>拍照要求</h2>
+  <div class="callout callout-warn">
+    <strong>一条铁律：答题卡四个角的黑色方块必须全部拍进画面。</strong>
+    缺一个就定位失败，后面全白拍。
+  </div>
+
+  <div class="fig-row">
+    <figure class="figure">
+      <svg viewBox="0 0 300 320" role="img" aria-label="取景示意：答题卡四角黑块全部在画面内，四周留白">
+        <rect class="svg-phone" x="8" y="8" width="284" height="304" rx="18"></rect>
+        <rect class="svg-frame" x="26" y="34" width="248" height="252" rx="6"></rect>
+        <rect class="svg-card" x="52" y="62" width="196" height="196" rx="4"></rect>
+        <g class="svg-mark">
+          <rect x="60" y="70" width="20" height="20"></rect>
+          <rect x="220" y="70" width="20" height="20"></rect>
+          <rect x="60" y="230" width="20" height="20"></rect>
+          <rect x="220" y="230" width="20" height="20"></rect>
+        </g>
+        <g class="svg-mute">
+          <rect x="96" y="100" width="108" height="8" rx="3"></rect>
+          <circle cx="112" cy="128" r="5"></circle><circle cx="140" cy="128" r="5"></circle>
+          <circle cx="168" cy="128" r="5"></circle><circle cx="196" cy="128" r="5"></circle>
+          <rect x="96" y="150" width="108" height="8" rx="3"></rect>
+          <circle cx="112" cy="178" r="5"></circle><circle cx="140" cy="178" r="5"></circle>
+          <circle cx="168" cy="178" r="5"></circle><circle cx="196" cy="178" r="5"></circle>
+        </g>
+        <g class="svg-ok">
+          <path d="M66 80 l5 6 l9 -11"></path>
+          <path d="M226 80 l5 6 l9 -11"></path>
+          <path d="M66 240 l5 6 l9 -11"></path>
+          <path d="M226 240 l5 6 l9 -11"></path>
+        </g>
+      </svg>
+      <figcaption>
+        <strong class="ok-text">一次一页、四角全进画面 ✓</strong>
+        卡片四周各留一点白边，四角黑块完整、清楚、不被遮挡。
+      </figcaption>
+    </figure>
+
+    <figure class="figure">
+      <svg viewBox="0 0 300 320" role="img" aria-label="正对拍摄示意：倾斜不超过 30 度">
+        <rect class="svg-phone" x="8" y="8" width="284" height="304" rx="18"></rect>
+        <rect class="svg-frame" x="26" y="34" width="248" height="252" rx="6"></rect>
+        <g transform="rotate(-12 150 148)">
+          <rect class="svg-card" x="72" y="84" width="156" height="128" rx="4"></rect>
+          <g class="svg-mark">
+            <rect x="80" y="92" width="16" height="16"></rect>
+            <rect x="204" y="92" width="16" height="16"></rect>
+            <rect x="80" y="188" width="16" height="16"></rect>
+            <rect x="204" y="188" width="16" height="16"></rect>
+          </g>
+        </g>
+        <path class="svg-angle" d="M96 254 A 58 58 0 0 1 150 236"></path>
+        <text x="160" y="252" class="svg-label">倾斜 ≤ 30°</text>
+      </svg>
+      <figcaption>
+        <strong>手机正对答题卡：倾斜别超过约 30°</strong>
+        斜拍会让复原变差，选项框和四角都可能认不准。
+      </figcaption>
+    </figure>
+  </div>
+
+  <ul class="checklist">
+    <li>手机<strong>横屏、竖屏都行</strong>，但<strong>一次只拍一页</strong>答题卡。</li>
+    <li><strong>四角黑块全部入画</strong>，四边各留一点白边；别贴边裁。</li>
+    <li>手、笔、橡皮、袖口不要挡住四角黑块和题号/选项框。</li>
+    <li>光线均匀，<strong>别开闪光灯</strong><span class="icon-flash" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><circle class="svg-flash-off" cx="12" cy="12" r="8"></circle><path class="svg-flash-slash" d="M5 19 L19 5"></path></svg>
+    </span>（反光会盖住黑块和填涂，直接判不出来）。</li>
+    <li>分辨率不低于 <strong>1600 px 宽</strong>：手机默认拍照都够，别用缩略图、别用被压缩过的转发图。</li>
+    <li>拍完先自己看一眼：<strong>四角清楚、字能看清</strong>，再上传。</li>
+  </ul>
+</section>
+
+<!-- ============================================================ 判卷流程 -->
+<section class="card" id="flow">
+  <h2>判卷流程</h2>
+  <ol class="steps">
+    <li class="step">
+      <span class="step-no">1</span>
+      <div class="step-body">
+        <strong>上传答题卡照片</strong>
+        <span class="muted">一次一页；选对卷号（用答题卡顶部的卷号）。</span>
+      </div>
+    </li>
+    <li class="step">
+      <span class="step-no">2</span>
+      <div class="step-body">
+        <strong>选择题秒出分数</strong>
+        <span class="muted">标定 + 卷号 + 涂卡识别在本地完成，通常 1 秒内。</span>
+      </div>
+    </li>
+    <li class="step">
+      <span class="step-no">3</span>
+      <div class="step-body">
+        <strong>填空 / 解答显示「识别中（约 30 秒）」</strong>
+        <span class="muted">后台把作答格拼一张长图，一次识别回来；页面会自己刷新，也可以手动刷新。</span>
+      </div>
+    </li>
+    <li class="step">
+      <span class="step-no">4</span>
+      <div class="step-body">
+        <strong>过一遍「待人工确认」队列</strong>
+        <span class="muted">识别不清、超时、没额度的题都在这里，逐题看裁切图确认或改判，页面不会卡死。</span>
+      </div>
+    </li>
+    <li class="step">
+      <span class="step-no">5</span>
+      <div class="step-body">
+        <strong>重算分数 → 出结果 / 生成训练卷</strong>
+        <span class="muted">确认完自动重算总分；结果页可直接按错题生成训练卷。</span>
+      </div>
+    </li>
+  </ol>
+  <p class="field-hint">
+    识别一直不出结果？先点「重新识别」（重复识别是幂等的，不会重复计分）；还是不行就翻下面的错误速查。
+  </p>
+</section>
+
+<!-- ============================================================ 错误速查 -->
+<section class="card" id="errors">
+  <h2>错误速查</h2>
+  <p class="field-hint">每一条都对应程序里真实的错误码；结果页上的报错可以直接跳到对应行。</p>
+  <table class="err-table">
+    <thead>
+      <tr><th>错误码</th><th>发生了什么 / 为什么</th><th>怎么办</th><th>按钮</th></tr>
+    </thead>
+    <tbody>
+      {% for e in entries %}
+      <tr id="err-{{ e.code }}">
+        <td class="mono err-code">{{ e.code }}</td>
+        <td>
+          <strong>{{ e.title }}</strong>
+          <span class="err-what">{{ e.what }}</span>
+          <span class="err-why">{{ e.why }}</span>
+        </td>
+        <td class="err-fix">{{ e.fix }}</td>
+        <td class="err-retry"><span class="pill pill-ok">{{ e.retry_label }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

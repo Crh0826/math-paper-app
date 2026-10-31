@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page_title }} · 数学题库工作台</title>
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  /* 判卷错误页：一条横幅 + 为什么 + 怎么办（fix 保留 ①②③ 的换行） */
+  .footer {
+    max-width: 1080px; margin: 0 auto; padding: 18px 20px 42px;
+    color: var(--muted); font-size: 12.5px;
+    display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+  .why-fix h2 { margin: 0 0 8px; font-size: 15px; font-weight: 600; }
+  .why-fix h2 + p { margin: 0 0 16px; color: var(--ink-2); }
+  .why-fix .err-fix { white-space: pre-line; font-size: 14px; color: var(--ink); line-height: 1.8; }
+  .err-code-line { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">Σ</span>
+      <span class="brand-text">
+        <strong>数学题库工作台</strong>
+        <small>沪科版七年级上 · 拍照判卷</small>
+      </span>
+    </a>
+    <nav class="nav" aria-label="主导航">
+      <a class="nav-item" href="/">组卷</a>
+      <a class="nav-item" href="/papers">我的卷子</a>
+      <a class="nav-item is-active" href="/submissions" aria-current="page">判卷</a>
+      <a class="nav-item" href="/train">训练</a>
+      <a class="nav-item" href="/guide">使用指南</a>
+      <a class="nav-item" href="/health">自检</a>
+    </nav>
+    <a class="ghost-link mono" href="/healthz" target="_blank" rel="noopener" title="自检数据（JSON）">healthz</a>
+  </div>
+</header>
+
+<main class="page">
+  {% from "_banner.html" import banner %}
+  <div class="page-head">
+    <h1>判卷没成功</h1>
+    <p class="lede">按下面「怎么办」里的一条走就行；卷子、答题卡照片都没丢，重拍一张即可。</p>
+  </div>
+
+  {{ banner({"title": e.title, "detail": e.what, "code": code}, "error") }}
+
+  <section class="card why-fix">
+    <h2>为什么会这样</h2>
+    <p>{{ e.why }}</p>
+    <h2>怎么办</h2>
+    <p class="err-fix">{{ e.fix }}</p>
+    <p class="err-code-line">错误码 <span class="mono">{{ code }}</span>
+      {% if extra_note %}· {{ extra_note }}{% endif %}</p>
+  </section>
+
+  <div class="empty-state">
+    <a class="btn btn-primary" href="{{ retry_href }}">{{ retry_label }}</a>
+    <a class="btn" href="/guide#err-{{ code }}">看使用指南</a>
+    <a class="btn" href="/submissions">回判卷页</a>
+    <a class="btn" href="/health">打开自检页</a>
+  </div>
+</main>
+
+<footer class="footer">
+  <span>题库组卷 · 答题卡生成 · 拍照判卷 · 错题训练</span>
+  <span class="mono">本地运行，数据不出机器</span>
+</footer>
+</body>
+</html>

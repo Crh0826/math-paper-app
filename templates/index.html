@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h1>组卷</h1>
+  <p class="lede">
+    从题库里按章节／知识点抽题，生成卷面与答题卡。
+    {% if db_summary %}
+    <span class="muted">当前题库：{{ db_summary.questions | num }} 题 · {{ db_summary.kps }} 个知识点 · {{ db_summary.families | num }} 个题族。</span>
+    {% endif %}
+  </p>
+</div>
+
+{% if error %}
+{# 库缺失/损坏：不摆一个装不了的表单，只给 banner + 回到自检的入口。 #}
+<div class="empty-state">
+  <p>题库读不出来，先把数据库修好再回来组卷。</p>
+  <p><a class="btn" href="/health">打开自检页看详情</a></p>
+</div>
+{% else %}
+
+{% if lan and lan.on %}
+<section class="card lan-card">
+  <h2>手机拍照判卷</h2>
+  <div class="lan-row">
+    {% if lan.qr %}<img class="lan-qr" src="{{ lan.qr }}" alt="手机扫码打开判卷页" width="132" height="132">{% endif %}
+    <div class="lan-text">
+      <p>手机连同一个 WiFi，<strong>扫一下这个二维码</strong> 就能拍照上传答题卡（访问码已带在码里，扫完不用再输）。</p>
+      {% if lan.url %}<p class="mono">手机打开：{{ lan.url }}submissions</p>{% endif %}
+      <p class="field-hint">访问码在电脑那个黑色窗口里（4 位，也写在 config.json 的 server.pin）；一台手机只输一次，记 30 天。
+        只在自己家的 WiFi 上开 LAN 模式。</p>
+    </div>
+  </div>
+</section>
+{% else %}
+<p class="field-hint">想让手机直接拍答题卡上传？双击 <code>start_lan.bat</code>（电脑和手机连同一个 WiFi），首页会出现二维码。</p>
+{% endif %}
+
+{#
+  字段 → 契约 §2 参数映射（server._params_from_values 负责真正的转换）：
+    title                              → params.title
+    n_choice / n_fill / n_solution     → params.mix {"选择","填空","解答"}
+    chapters（多选，空=不限）          → params.scope.chapters
+    kps（多选，空=不限）               → params.scope.kps（勾章会自动联带勾上该章知识点）
+    kp_mode                            → params.scope.kp_mode（any/all）
+    need_answer / exclude_empty        → params.requirements（exclude_empty 固定 true）
+    seed                               → params.seed
+#}
+<form class="form" id="paper-form" method="post" action="/papers" novalidate>
+
+  <section class="card">
+    <h2>卷面</h2>
+    <div class="grid grid-2">
+      <label class="field">
+        <span class="field-label">试卷标题</span>
+        <input type="text" name="title" value="{{ values.title }}" maxlength="80" autocomplete="off">
+        <span class="field-hint">印在卷面与答题卡顶部，同时写入 papers.title。</span>
+      </label>
+      <label class="field">
+        <span class="field-label">随机种子 seed（可留空）</span>
+        <input type="number" name="seed" value="{{ values.seed_text or '' }}" min="0" max="999999"
+               step="1" placeholder="自动（每份卷不同）" autocomplete="off">
+        <span class="field-hint">留空 = 每次自动换一套题（每份卷不同）；填数字 = 用这个种子，可精确复现同一份卷。</span>
+      </label>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>题量配比</h2>
+    <div class="grid grid-3">
+      {% for s in stats %}
+      <label class="field">
+        <span class="field-label">{{ s.qtype }}题</span>
+        <input type="number" name="{{ s.field }}" value="{{ values[s.field] }}" min="0" max="99" step="1" data-qtype="{{ s.qtype }}">
+        <span class="field-hint">
+          {% if available is not none and s.qtype in available %}
+          可出 <strong>{{ available[s.qtype] }}</strong> 题
+          {% else %}
+          可出题量暂时算不出来（见自检页）
+          {% endif %}
+        </span>
+      </label>
+      {% endfor %}
+    </div>
+    <p class="field-hint">
+      填 0 表示不放这类题。「可出 N 题」按下面勾选的范围算；改完勾选点一下
+      <button class="btn btn-small" type="button" id="refresh-counts" title="按当前勾选范围重新算可出题量">刷新可出题量</button>
+    </p>
+  </section>
+
+  <section class="card" id="range">
+    <h2>范围</h2>
+    {% if chapters %}
+    <p class="field-hint">
+      勾选章节 = 勾上该章全部知识点（两者会一起提交，章节非空时以章节为准）；都不勾 = 全库不限制。
+      标「仅 N 题」的知识点题量很少（少于 20），填的数量别超过这个数，否则会抽不满。
+    </p>
+    <div class="chapter-list">
+      {% for ch in chapters %}
+      {% set chapter_index = loop.index0 %}
+      <fieldset class="chapter">
+        <legend>
+          <label class="check-inline chapter-head">
+            <input type="checkbox" name="chapters" value="{{ ch.chapter }}" data-chapter-toggle="{{ chapter_index }}"
+                   {% if ch.chapter in values.chapters %}checked{% endif %}>
+            <span>{{ ch.chapter }}</span><span class="count">（合计 {{ ch.n_questions }} 题）</span>
+          </label>
+        </legend>
+        <div class="kp-grid">
+          {% for k in ch.kps %}
+          <label class="kp-item">
+            <input type="checkbox" name="kps" value="{{ k.kp_id }}" data-chapter="{{ chapter_index }}"
+                   {% if k.kp_id in values.kps %}checked{% endif %}>
+            <span class="kp-label"><span class="kp-chapter">{{ ch.chapter }}</span> <span class="sep">›</span> <span class="kp-name">{{ k.kp_id }} {{ k.kp }}</span>{% if k.n_questions < 20 %}<span class="pill pill-warn kp-thin" title="这个知识点题很少，填多了会抽不满">仅 {{ k.n_questions }} 题</span>{% else %}<span class="count">（{{ k.n_questions }} 题）</span>{% endif %}</span>
+          </label>
+          {% endfor %}
+        </div>
+      </fieldset>
+      {% endfor %}
+    </div>
+
+    <div class="mode-row">
+      <span class="field-label">组题口径</span>
+      <label class="check-inline">
+        <input type="radio" name="kp_mode" value="any" {% if values.kp_mode != "all" %}checked{% endif %}>
+        命中任一选中的知识点即可
+      </label>
+      <label class="check-inline">
+        <input type="radio" name="kp_mode" value="all" {% if values.kp_mode == "all" %}checked{% endif %}>
+        必须同时命中（复合知识点）
+      </label>
+    </div>
+    {% else %}
+    <p class="muted">题库里还没有知识点数据，修好数据库后这里会出现章节／知识点选择器。</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>选题要求</h2>
+    <div class="check-list">
+      <label class="check">
+        <input type="checkbox" name="need_answer" {% if values.need_answer %}checked{% endif %}>
+        <span>只选有答案题<em class="muted">（判卷必须有标准答案，关掉会出现判不了的题）</em></span>
+      </label>
+      {# 省纸模式：隐藏域先给 normal，勾上复选框再追加 compact，服务端取最后一个值（不依赖 JS） #}
+      <input type="hidden" name="layout" value="normal">
+      <label class="check">
+        <input type="checkbox" name="layout" value="compact"
+               {% if values.layout != "normal" %}checked{% endif %}>
+        <span>省纸模式（推荐）：页边距与行距收紧，10 题 1 页 / 24 题 3 页
+          <em class="muted">（取消勾选回到宽裕版面；打印要求不变，仍是 A4、100%）</em></span>
+      </label>
+    </div>
+    {# 空题没有题干、印不出卷，picker 会在 exclude_empty=False 时直接拒绝；
+       所以这里固定排除，不把它做成勾选框，免得用户点出错误状态。 #}
+    <input type="hidden" name="exclude_empty" value="1">
+    <p class="field-hint">空题（原始 docx 里题干为空）已固定排除，不需也不允许选。</p>
+    <p class="field-hint">卷面不留书写区（答案写在答题卡上，卷面只印题）；确实需要草稿区，可在接口里显式给
+      <code>space_解答</code> 等参数（单位：段）。</p>
+  </section>
+
+  <div class="form-actions">
+    <span class="muted">多人同时组卷会排队（每组约 10~40 秒），不是卡死。</span>
+    <span class="total">合计 <strong id="total-count">{{ values.n_choice + values.n_fill + values.n_solution }}</strong> 题</span>
+    <span class="muted" id="form-note">生成卷面 PDF 与答题卡要十几秒（排版要走 Word），请稍等。</span>
+    <button class="btn btn-primary" type="submit" id="compose-submit">生成试卷</button>
+  </div>
+</form>
+
+{# 提交遮罩：Word 排版要 7 秒左右，别让用户对着白屏；返回/错误页时由 app.js 收起 #}
+<div class="overlay" id="compose-overlay" hidden aria-hidden="true">
+  <div class="overlay-card" role="status" aria-live="polite">
+    <div class="spinner" aria-hidden="true"></div>
+    <strong>正在排版（约 7 秒）…</strong>
+    <p class="muted">卷面要走 Word 排版，再生成答题卡与二维码，别关这个页面。</p>
+    <div class="progress" aria-hidden="true"><span></span></div>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

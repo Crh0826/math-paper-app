@@ -1,0 +1,31 @@
+# 数学题库工作台 · 运行依赖（本机实测版本，写成兼容区间）
+# 装法：python -m pip install -r requirements.txt
+# 说明：Windows + Python 3.11+（本机实测 3.14.2）
+
+# —— Web 服务（server.py / templates / static）——
+fastapi>=0.162,<1.0
+uvicorn>=0.54,<1.0
+python-multipart>=0.0.32,<1.0
+jinja2>=3.1.6,<4.0
+
+# —— 题库与卷面（docx_rich / compose / picker / paper）——
+python-docx>=1.2,<2.0
+lxml>=6.1,<7.0
+openpyxl>=3.1,<4.0
+
+# —— 图片处理（卷面渲染 / 答题卡 / 判卷标定）——
+pillow>=12.1,<13.0
+numpy>=2.4,<3.0
+opencv-python>=5.0,<6.0
+pymupdf>=1.28,<2.0
+reportlab>=5.0,<6.0
+qrcode>=8.2,<9.0
+
+# —— Windows 集成（Word 排版 / 转 PDF；Document 只在渲染时启动）——
+pywin32>=312,<313
+
+# —— 云端 OCR（PaddleOCR-VL / VLM 适配层）——
+requests>=2.34,<3.0
+
+# —— 可选：HEIC 支持（装不上不影响启动，HEIC 会走 unsupported_format 文案）——
+pillow-heif>=1.8,<2.0

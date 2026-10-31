@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page_title }} · 数学题库工作台</title>
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  /* 判卷页自带的最小布局：只补 app.css 里没有的几块（横幅 ok 态 / 上传区 / 分数卡 / 裁切图） */
+  .banner-ok { background: var(--ok-soft); border-color: #c5e5cf; }
+  .banner-ok .banner-head { color: #14632c; }
+  /* 手机：导航项多，390px 放不下（app.css 的 .topbar-inner 不换行）→ 允许换行并缩小间距 */
+  .topbar-inner { flex-wrap: wrap; }
+  .nav { flex-wrap: wrap; }
+  @media (max-width: 520px) {
+    .topbar-inner { gap: 8px; padding: 8px 12px; }
+    .nav { gap: 2px; }
+    .nav-item { padding: 4px 7px; font-size: 13px; }
+    .ghost-link { display: none; }
+  }
+
+  .footer {
+    max-width: 1080px; margin: 0 auto; padding: 18px 20px 42px;
+    color: var(--muted); font-size: 12.5px;
+    display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+  .upload-grid { display: grid; grid-template-columns: 1fr 260px; gap: 18px; align-items: start; }
+  .shot-preview {
+    border: 1px dashed var(--line); border-radius: var(--radius); padding: 10px;
+    min-height: 128px; display: grid; place-items: center;
+    text-align: center; color: var(--muted); font-size: 12.5px; background: #fbfcfd;
+  }
+  .shot-preview img { max-width: 100%; max-height: 240px; border-radius: 6px; display: block; }
+  .shot-hints { margin: 10px 0 0; padding-left: 20px; color: var(--ink-2); font-size: 13px; }
+  .shot-hints li { margin: 3px 0; }
+  .file-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .file-row input[type="file"] { max-width: 100%; }
+  @media (max-width: 760px) { .upload-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">Σ</span>
+      <span class="brand-text">
+        <strong>数学题库工作台</strong>
+        <small>沪科版七年级上 · 拍照判卷</small>
+      </span>
+    </a>
+    <nav class="nav" aria-label="主导航">
+      <a class="nav-item" href="/">组卷</a>
+      <a class="nav-item" href="/papers">我的卷子</a>
+      <a class="nav-item is-active" href="/submissions" aria-current="page">判卷</a>
+      <a class="nav-item" href="/records">判卷记录</a>
+      <a class="nav-item" href="/train">训练</a>
+      <a class="nav-item" href="/guide">使用指南</a>
+      <a class="nav-item" href="/health">自检</a>
+    </nav>
+    <a class="ghost-link mono" href="/healthz" target="_blank" rel="noopener" title="自检数据（JSON）">healthz</a>
+  </div>
+</header>
+
+<main class="page">
+  {% from "_banner.html" import banner %}
+  <div class="page-head">
+    <h1>判卷</h1>
+    <p class="lede">
+      上传答题卡照片：选择题立刻出分，填空／解答在后台识别（约 30 秒），识别不出来就留在「待人工确认」——
+      绝不猜答案，也不会判错。
+    </p>
+  </div>
+
+  {% if notice %}{{ banner(notice, notice.tone) }}{% endif %}
+
+  <form method="post" action="/submissions" enctype="multipart/form-data" class="grade-upload">
+    <section class="card">
+      <h2>1. 这是哪份卷子</h2>
+      <label class="field">
+        <span class="field-label">卷号 pid</span>
+        <input type="text" name="pid" value="{{ pid }}" list="paper-pids" placeholder="P20261031-001"
+               autocomplete="off" spellcheck="false" required>
+        <datalist id="paper-pids">
+          {% for p in papers %}<option value="{{ p.pid }}">{{ p.title }}（{{ p.n_items }} 题）</option>{% endfor %}
+        </datalist>
+        <span class="field-hint">答题卡右上角、二维码旁边印着卷号；也可以直接输入，或在下面最近的卷子里点「判这张卷」。</span>
+      </label>
+    </section>
+
+    <section class="card">
+      <h2>2. 上传答题卡照片</h2>
+      <div class="upload-grid">
+        <div>
+          <div class="file-row">
+            <input type="file" id="shot" name="file" accept="image/*" capture="environment" required>
+          </div>
+          <ul class="shot-hints">
+            <li>四个角的黑色定位块全部入画，四边各留一点白边</li>
+            <li>手机正对答题卡，倾斜别超过 30°；别开闪光灯、别压皱</li>
+            <li>一次只拍一页答题卡；照片长边 ≥1600px</li>
+          </ul>
+          <p class="field-hint">
+            <a href="/guide#photo">拍照要求（带图）</a> ·
+            <a href="/guide#print">打印设置：A4、100%，别勾「适应页面」</a>
+          </p>
+        </div>
+        <div class="shot-preview" id="shot-preview">还没选图片</div>
+      </div>
+    </section>
+
+    <div class="form-actions">
+      <button class="btn btn-primary" type="submit">上传并判卷</button>
+      <span class="muted">判卷只判选择题序号与填空／解答的最终答案；过程区不判分。</span>
+    </div>
+  </form>
+
+  <section class="card">
+    <h2>最近的卷子</h2>
+    {% if papers %}
+    <table class="checks">
+      <thead>
+        <tr><th>卷号</th><th>标题</th><th>题数</th><th>生成时间</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for p in papers %}
+        <tr>
+          <td class="mono">{{ p.pid }}</td>
+          <td>{{ p.title }}</td>
+          <td class="mono">{{ p.n_items }}</td>
+          <td class="mono muted">{{ p.created_at }}</td>
+          <td><a class="btn" href="/submissions?pid={{ p.pid }}">判这张卷</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">
+      <p>还没有生成过卷子。</p>
+      <p><a class="btn btn-primary" href="/">先去组卷</a></p>
+    </div>
+    {% endif %}
+  </section>
+</main>
+
+<footer class="footer">
+  <span>题库组卷 · 答题卡生成 · 拍照判卷 · 错题训练</span>
+  <span class="mono">本地运行，数据不出机器</span>
+</footer>
+
+<script>
+(function () {
+  var input = document.getElementById('shot');
+  var box = document.getElementById('shot-preview');
+  if (!input || !box) { return; }
+  input.addEventListener('change', function () {
+    var file = input.files && input.files[0];
+    if (!file) { box.textContent = '还没选图片'; return; }
+    var url = URL.createObjectURL(file);
+    box.innerHTML = '<div><img alt="待上传的答题卡照片" src="' + url + '">' +
+                    '<div class="muted" style="margin-top:6px"></div></div>';
+    box.querySelector('.muted').textContent = file.name || '';
+  });
+})();
+</script>
+</body>
+</html>

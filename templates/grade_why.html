@@ -1,0 +1,197 @@
+{% macro drawer(w, legend) %}
+<style>
+  /* 抽屉自带样式：注入结果页和独立页都用同一份（<style> 随片段注入同样生效） */
+  .why { font-size: 14px; }
+  .why-head { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+              padding-bottom: 10px; border-bottom: 1px solid var(--line); margin-bottom: 12px; }
+  .why-head strong { font-size: 16px; }
+  .why-kv { margin: 0 0 14px; }
+  .why-kv dt { color: var(--muted); font-size: 12.5px; }
+  .why-kv dd { margin: 0 0 8px; color: var(--ink); word-break: break-all; }
+  .why-kv dd.warn-text { color: var(--warn); }
+  .why h4 { margin: 16px 0 8px; font-size: 13px; color: var(--ink-2); font-weight: 600; }
+  .ink-table td, .blank-table td { vertical-align: middle; }
+  .ink-table tr.ink-picked { background: var(--ok-soft); }
+  .ink-bar { display: inline-block; width: 120px; height: 9px; border-radius: 999px;
+             background: var(--line-soft); overflow: hidden; vertical-align: middle; }
+  .ink-bar i { display: block; height: 100%; background: var(--accent); }
+  .ink-picked .ink-bar i { background: var(--ok); }
+  .blank-fix { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .blank-fix .ans { max-width: 130px; }
+  .why-note td { border-bottom: 1px dashed var(--line-soft); padding-top: 0; font-size: 12.5px; }
+  .crop-row { display: flex; gap: 14px; flex-wrap: wrap; }
+  .why-foot { margin: 16px 0 0; font-size: 12.5px; }
+  .why .crop { display: block; max-width: 220px; max-height: 96px; border: 1px solid var(--line);
+               border-radius: 6px; background: #fbfcfd; }
+  .why .crop-fig { margin: 0; }
+  .why .crop-fig figcaption { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+  .why .ans { padding: 4px 8px; font: inherit; font-size: 13px; border: 1px solid var(--line);
+              border-radius: 6px; width: 100%; }
+  .why .btn-xs { padding: 2px 10px; font-size: 12.5px; border-radius: 6px; }
+</style>
+<section class="why" data-idx="{{ w.idx }}">
+  <header class="why-head">
+    <div>
+      <strong>第 {{ w.idx }} 题 · {{ w.qtype }}</strong>
+      <div class="muted mono">题号 {{ w.no }}{% if w.page %} · 卡第 {{ w.page }} 页{% endif %}</div>
+    </div>
+    <span class="pill{% if w.tone %} pill-{{ w.tone }}{% endif %}">{{ w.label }}</span>
+  </header>
+
+  <dl class="kv why-kv">
+    <dt>识别文本</dt>
+    <dd>{% if w.picked %}{{ w.picked }}{% else %}<span class="muted">（没识别出文字，留在待人工确认）</span>{% endif %}</dd>
+    <dt>期望答案</dt>
+    <dd>{% if w.expected %}{{ w.expected }}{% else %}<span class="muted">（该题没有标准答案，不判分）</span>{% endif %}</dd>
+    <dt>判定理由</dt>
+    <dd>{% if w.reason %}{{ w.reason }}{% else %}<span class="muted">—</span>{% endif %}</dd>
+    {% if w.unsure_reason %}<dt>为什么待确认</dt><dd class="warn-text">{{ w.unsure_reason }}</dd>{% endif %}
+    <dt>识别后端</dt>
+    <dd class="mono">{{ w.backend }}{% if w.empty_batch %}<span class="muted">（这一批识别服务返回空）</span>{% endif %}</dd>
+  </dl>
+
+  {% if w.is_omr %}
+  <h4>墨迹占比（原始值：最大格 ≥35% 且领先次优 ≥15% 才算涂了）</h4>
+  <table class="checks ink-table">
+    <thead><tr><th>选项</th><th>墨迹占比</th><th></th></tr></thead>
+    <tbody>
+      {% for row in w.ink_rows %}
+      <tr class="{% if row.picked %}ink-picked{% endif %}">
+        <td class="mono">{{ row.opt }}</td>
+        <td><span class="ink-bar"><i style="width: {{ row.pct }}%"></i></span>
+            <span class="mono">{{ row.pct }}%</span></td>
+        <td>{% if row.picked %}<span class="pill pill-ok">选中</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <h4>逐空明细{% if w.multi %}（{{ w.blanks | length }} 个空，可单独改判，不影响别的空）{% endif %}</h4>
+  <table class="checks blank-table">
+    <thead>
+      <tr><th>空</th><th>识别值</th><th>期望</th><th>判定</th><th>置信度</th><th>单独改判</th></tr>
+    </thead>
+    <tbody>
+      {% for b in w.blanks %}
+      <tr>
+        <td class="mono">{{ b.blank }}</td>
+        <td>{{ b.picked if b.picked else '—' }}</td>
+        <td>{{ b.expected if b.expected else '—' }}</td>
+        <td><span class="pill{% if b.tone %} pill-{{ b.tone }}{% endif %}">{{ b.label }}</span></td>
+        <td class="mono">{{ b.conf_text }}</td>
+        <td>
+          <form class="blank-fix ajax-confirm" method="post" action="confirm">
+            <input class="ans" type="text" name="text_{{ w.idx }}_{{ b.blank }}" value="{{ b.picked }}"
+                   placeholder="识别值（可改）" autocomplete="off" spellcheck="false">
+            <button class="btn btn-xs" type="submit"
+                    name="verdict_{{ w.idx }}_{{ b.blank }}" value="correct">✓ 判对</button>
+            <button class="btn btn-xs" type="submit"
+                    name="verdict_{{ w.idx }}_{{ b.blank }}" value="wrong">✗ 判错</button>
+          </form>
+        </td>
+      </tr>
+      {% if b.unsure_reason or b.reason %}
+      <tr class="why-note">
+        <td></td>
+        <td colspan="5" class="muted">{{ b.unsure_reason or b.reason }}</td>
+      </tr>
+      {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% if w.crop_ok %}
+  <h4>作答裁切图</h4>
+  <div class="crop-row">
+    {% for b in w.blanks %}{% if b.crop_ok %}
+    <figure class="crop-fig">
+      <a href="crop/{{ b.crop_name }}" target="_blank" rel="noopener" title="点开看原图">
+        <img class="crop" src="crop/{{ b.crop_name }}"
+             alt="第 {{ w.idx }} 题第 {{ b.blank }} 空作答裁切图" loading="lazy">
+      </a>
+      <figcaption>空 {{ b.blank }}（点开看大图）</figcaption>
+    </figure>
+    {% endif %}{% endfor %}
+  </div>
+  {% endif %}
+
+  <p class="muted why-foot">
+    想看整页怎么判的：<a href="{{ w.annotated_href }}" target="_blank" rel="noopener">查看批注图</a>
+    （{{ legend }}）。
+  </p>
+</section>
+{% endmacro %}
+
+{% if standalone %}
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<base href="/submissions/{{ w.sid }}/">
+<title>{{ page_title }} · 数学题库工作台</title>
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  /* 手机：导航项多，390px 放不下（app.css 的 .topbar-inner 不换行）→ 允许换行并缩小间距 */
+  .topbar-inner { flex-wrap: wrap; }
+  .nav { flex-wrap: wrap; }
+  @media (max-width: 520px) {
+    .topbar-inner { gap: 8px; padding: 8px 12px; }
+    .nav { gap: 2px; }
+    .nav-item { padding: 4px 7px; font-size: 13px; }
+    .ghost-link { display: none; }
+  }
+
+  .footer {
+    max-width: 1080px; margin: 0 auto; padding: 18px 20px 42px;
+    color: var(--muted); font-size: 12.5px;
+    display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">Σ</span>
+      <span class="brand-text">
+        <strong>数学题库工作台</strong>
+        <small>沪科版七年级上 · 拍照判卷</small>
+      </span>
+    </a>
+    <nav class="nav" aria-label="主导航">
+      <a class="nav-item" href="/">组卷</a>
+      <a class="nav-item" href="/papers">我的卷子</a>
+      <a class="nav-item is-active" href="/submissions" aria-current="page">判卷</a>
+      <a class="nav-item" href="/records">判卷记录</a>
+      <a class="nav-item" href="/train">训练</a>
+      <a class="nav-item" href="/guide">使用指南</a>
+      <a class="nav-item" href="/health">自检</a>
+    </nav>
+    <a class="ghost-link mono" href="/healthz" target="_blank" rel="noopener">healthz</a>
+  </div>
+</header>
+
+<main class="page">
+  <div class="page-head">
+    <h1>为什么这么判</h1>
+    <p class="lede">卷号 <span class="mono">{{ w.pid }}</span> · 提交 <span class="mono">{{ w.sid }}</span>
+      · 第 {{ w.idx }} 题</p>
+  </div>
+  <section class="card">{{ drawer(w, legend) }}</section>
+  <div class="form-actions">
+    <a class="btn btn-primary" href="/submissions/{{ w.sid }}">回结果页</a>
+    <a class="btn" href="/guide#flow">判卷流程说明</a>
+  </div>
+</main>
+
+<footer class="footer">
+  <span>题库组卷 · 答题卡生成 · 拍照判卷 · 错题训练</span>
+  <span class="mono">本地运行，数据不出机器</span>
+</footer>
+</body>
+</html>
+{% else %}
+{{ drawer(w, legend) }}
+{% endif %}

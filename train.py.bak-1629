@@ -1,0 +1,381 @@
+# -*- coding: utf-8 -*-
+"""t6 · 错题训练规划：题族 → 知识点 → 章节 → 跨章 四级回退 + 掌握度曲线。
+
+给「拍照判卷 → 错题训练」这条链路提供组卷参数：`plan()` 返回的就是 CONTRACT §2 的
+参数字典（外加 `nos` / `exclude_nos` / `train` 三个扩展键），可直接喂
+`picker.build(params, conn)`。
+
+为什么训练卷要钉死题号：
+  错题训练的全部意义是「换一道同族/同知识点的题再练一遍」，所以必须保证
+  ① 原错题不再出现；② 选出来的题确实覆盖到错题所在的族或知识点；
+  ③ 同一批错题反复规划得到同一份卷子（老师/学生可复现）。
+  只给 picker scope+mix 的话，它会重新抽样，可能抽回原题 —— 所以 plan() 自己选好
+  题集放 `nos`，`exclude_nos` 再把原错题拉黑（picker 已支持这两个键）。
+
+选题优先级（严格按序，前面不够才退下一级）：
+  1) family  —— 同 `family_key` 的兄弟题（【例N】的同族【变式N-M】），排除原题；
+  2) kp      —— 同 `kp_id` + 同 `qtype`，难度相近优先（sub_count 差、option_count 是否同）；
+  3) chapter —— 同 `chapter` + 同 `qtype`；
+  4) cross   —— 跨章同 `qtype`（标记 shortfall 的邻近兜底，绝不重复用题、绝不放原题）。
+  同一级里 `due_at` 已到期（掌握度到复习日）的题排在前面。
+
+掌握度（`mastery` 表，见 db.py）：
+  答对 → 间隔 1→3→7→15 天逐级拉长（封顶 15）；答错 → 回到 1 天。`attempts/correct`
+  一直累加。`due_at` = 上次判分时间 + 间隔，`plan()` 用它做「到期优先」。
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import hashlib
+import re
+from collections import Counter
+
+__all__ = ["plan", "record_result", "record_results", "due_nos", "get_mastery",
+           "INTERVALS", "LEVELS"]
+
+#: 答对后的复习间隔（天），逐级拉长并封顶最后一档
+INTERVALS = (1, 3, 7, 15)
+
+#: 四级回退，顺序即优先级
+LEVELS = ("family", "kp", "chapter", "cross")
+
+QT_ORDER = {"选择": 0, "填空": 1, "解答": 2, "判断": 3, "其他": 4}
+
+DEFAULT_SPACE = {"选择": 0, "填空": 2, "解答": 8}
+
+DEFAULT_REQUIREMENTS = {"need_answer": True, "exclude_empty": True, "exclude_no_family": False}
+
+_RE_CHOICE_ANSWER = re.compile(r"[A-Fa-f]")
+
+
+# ---------------------------------------------------------------- 时间/工具
+
+def _now(now=None) -> _dt.datetime:
+    if now is None:
+        return _dt.datetime.now().astimezone()
+    if isinstance(now, _dt.datetime):
+        return now if now.tzinfo else now.astimezone()
+    return _dt.datetime.fromisoformat(str(now).strip())
+
+
+def _iso(dt: _dt.datetime) -> str:
+    return dt.isoformat(timespec="seconds")
+
+
+def _parse_iso(s):
+    try:
+        return _dt.datetime.fromisoformat(str(s).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_correct(v) -> bool:
+    """判分结果既可能是 bool，也可能是 grade.py 的 verdict 字符串。"""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    t = str(v or "").strip().lower()
+    if t in ("correct", "right", "true", "1", "对", "正确", "√"):
+        return True
+    return False
+
+
+def _clean_nos(wrong_nos) -> list:
+    out = []
+    if not wrong_nos:
+        return out
+    for x in wrong_nos:
+        s = str(x or "").strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def _derive_seed(nos) -> int:
+    """同一批错题 → 同一个 seed（训练卷可复现），且不依赖入参顺序。"""
+    h = hashlib.sha1("|".join(sorted(nos)).encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % 900000 + 1000
+
+
+def _next_interval(cur) -> int:
+    try:
+        cur = int(cur or 0)
+    except (TypeError, ValueError):
+        cur = 0
+    if cur <= 0:
+        return INTERVALS[0]
+    for d in INTERVALS:
+        if d > cur:
+            return d
+    return INTERVALS[-1]
+
+
+def _usable(row) -> bool:
+    """训练题必须能判分：非空题 + 有答案；选择题的答案得是选项字母。"""
+    if row["is_empty"]:
+        return False
+    ans = (row["answer_raw"] or "").strip()
+    if not ans:
+        return False
+    if row["qtype"] == "选择" and not _RE_CHOICE_ANSWER.match(ans):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------- 掌握度
+
+def get_mastery(conn, no):
+    """读一道题的掌握度；没练过返回 None。"""
+    try:
+        row = conn.execute(
+            "SELECT key, attempts, correct, last_seen, interval_days, due_at"
+            " FROM mastery WHERE key=?", (str(no),)).fetchone()
+    except Exception:                     # noqa: BLE001 - 老库没这表也别炸
+        return None
+    if row is None:
+        return None
+    return {"key": row[0], "attempts": int(row[1] or 0), "correct": int(row[2] or 0),
+            "last_seen": row[3], "interval_days": int(row[4] or 0), "due_at": row[5]}
+
+
+def record_result(conn, no, correct, now=None, interval_days=None) -> dict:
+    """判完一题记一次掌握度：对 → 间隔拉长；错 → 回到 1 天。
+
+    :param correct: bool，或 grade.py 的 verdict（correct/right/对/1 …）
+    :param interval_days: 显式指定间隔（测试/手工矫正用），缺省按曲线算
+    :returns: 新的掌握度 dict
+    """
+    no = str(no or "").strip()
+    if not no:
+        raise ValueError("no 不能为空")
+    nowdt = _now(now)
+    old = get_mastery(conn, no) or {}
+    attempts = int(old.get("attempts") or 0) + 1
+    correct_cnt = int(old.get("correct") or 0)
+    ok = _as_correct(correct)
+    if ok:
+        correct_cnt += 1
+    if interval_days is not None:
+        interval = max(1, int(interval_days))
+    elif ok:
+        interval = _next_interval(old.get("interval_days"))
+    else:
+        interval = INTERVALS[0]
+    due = nowdt + _dt.timedelta(days=interval)
+    conn.execute(
+        "INSERT INTO mastery(key, attempts, correct, last_seen, interval_days, due_at)"
+        " VALUES(?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET"
+        " attempts=excluded.attempts, correct=excluded.correct, last_seen=excluded.last_seen,"
+        " interval_days=excluded.interval_days, due_at=excluded.due_at",
+        (no, attempts, correct_cnt, _iso(nowdt), interval, _iso(due)))
+    conn.commit()
+    return {"key": no, "attempts": attempts, "correct": correct_cnt,
+            "last_seen": _iso(nowdt), "interval_days": interval, "due_at": _iso(due)}
+
+
+def record_results(conn, results, now=None, interval_days=None) -> list:
+    """批量记掌握度：[(no, 判对与否)] 或 [{"no":…, "correct"/"verdict":…}]。"""
+    out = []
+    for item in results or []:
+        if isinstance(item, dict):
+            no = item.get("no")
+            ok = item.get("correct", item.get("verdict"))
+            iv = item.get("interval_days", interval_days)
+        else:
+            no, ok = item[0], item[1]
+            iv = interval_days
+        out.append(record_result(conn, no, ok, now=now, interval_days=iv))
+    return out
+
+
+def due_nos(conn, now=None) -> list:
+    """已到复习日的题号（due_at <= now），按到期时间升序。"""
+    now_iso = _iso(_now(now))
+    nowdt = _parse_iso(now_iso)
+    try:
+        rows = conn.execute(
+            "SELECT key, due_at FROM mastery WHERE due_at IS NOT NULL"
+            " ORDER BY due_at, key").fetchall()
+    except Exception:                     # noqa: BLE001 - 老库没这表
+        return []
+    out = []
+    for key, due in rows:
+        ddt = _parse_iso(due)
+        if ddt is not None and nowdt is not None:
+            if ddt <= nowdt:
+                out.append(key)
+        elif str(due) <= now_iso:         # 解析不了就退回字符串比较
+            out.append(key)
+    return out
+
+
+# ---------------------------------------------------------------- 候选池
+
+_CAND_SQL = ("SELECT q.no, q.qtype, q.kp_id, q.chapter, q.family_key, q.sub_count,"
+             " q.option_count, q.answer_raw, q.is_empty, m.due_at"
+             " FROM questions q LEFT JOIN mastery m ON m.key = q.no"
+             " WHERE q.is_empty=0 AND q.answer_raw<>''")
+
+_CAND_SQL_NO_MASTERY = ("SELECT no, qtype, kp_id, chapter, family_key, sub_count,"
+                        " option_count, answer_raw, is_empty, NULL AS due_at"
+                        " FROM questions WHERE is_empty=0 AND answer_raw<>''")
+
+
+def _load_candidates(conn) -> list:
+    try:
+        rows = conn.execute(_CAND_SQL).fetchall()
+    except Exception:                     # noqa: BLE001 - 裸连接/老库没有 mastery 也能跑
+        rows = conn.execute(_CAND_SQL_NO_MASTERY).fetchall()
+    out = []
+    for r in rows:
+        c = {"no": r[0], "qtype": r[1], "kp_id": r[2], "chapter": r[3], "family_key": r[4],
+             "sub_count": int(r[5] or 0), "option_count": int(r[6] or 0),
+             "answer_raw": r[7] or "", "is_empty": int(r[8] or 0), "due_at": r[9]}
+        if _usable(c):
+            out.append(c)
+    return out
+
+
+def _load_wrong(conn, nos) -> dict:
+    out = {}
+    chunk = ",".join("?" * len(nos))
+    for r in conn.execute(
+            "SELECT no, qtype, kp_id, chapter, family_key, sub_count, option_count,"
+            " is_empty, answer_raw FROM questions WHERE no IN (%s)" % chunk, list(nos)):
+        out[r[0]] = {"no": r[0], "qtype": r[1], "kp_id": r[2], "chapter": r[3],
+                     "family_key": r[4], "sub_count": int(r[5] or 0),
+                     "option_count": int(r[6] or 0), "is_empty": int(r[7] or 0),
+                     "answer_raw": r[8] or ""}
+    return out
+
+
+def _index(cands):
+    by_family, by_kp, by_chapter, by_qtype = {}, {}, {}, {}
+    for c in cands:
+        if c["family_key"]:
+            by_family.setdefault(c["family_key"], []).append(c)
+        by_kp.setdefault((c["kp_id"], c["qtype"]), []).append(c)
+        by_chapter.setdefault((c["chapter"], c["qtype"]), []).append(c)
+        by_qtype.setdefault(c["qtype"], []).append(c)
+    return by_family, by_kp, by_chapter, by_qtype
+
+
+def _rank_key(c: dict, w: dict, due: set):
+    """同一级里的排序：到期优先 → 难度最接近 → 题号（保证可复现）。"""
+    is_due = 0 if c["no"] in due else 1
+    difficulty = abs(c["sub_count"] - w["sub_count"])
+    if c["option_count"] != w["option_count"]:
+        difficulty += 0.5
+    return (is_due, difficulty, c["no"])
+
+
+def _paper_order(item):
+    """卷面顺序：题型 → 章 → 知识点 → 题号。"""
+    kp = []
+    for piece in str(item.get("kp_id") or "").split("."):
+        try:
+            kp.append(int(piece))
+        except ValueError:
+            kp.append(99)
+    return (QT_ORDER.get(item.get("qtype"), 9), item.get("chapter") or "", tuple(kp),
+            item.get("no") or "")
+
+
+# ---------------------------------------------------------------- 规划
+
+def plan(conn, wrong_nos, n_per: int = 3, *, now=None, seed=None, title=None,
+         space=None) -> dict:
+    """把错题变成组卷参数（CONTRACT §2 + nos/exclude_nos/train）。
+
+    :param wrong_nos: 错题题号列表（顺序无关，自动去重）
+    :param n_per: 每道错题配几道训练题
+    :param now: 测试用固定时间（掌握度到期判断）
+    :param seed: 固定抽样种子；缺省由错题集合派生（同批错题 → 同 seed）
+    :raises ValueError: 错题列表为空，或一道替代题都找不到
+    """
+    nos = _clean_nos(wrong_nos)
+    if not nos:
+        raise ValueError("wrong_nos 为空：训练卷至少需要一道错题")
+    try:
+        n_per = int(n_per)
+    except (TypeError, ValueError):
+        raise ValueError("n_per 必须是整数：%r" % (n_per,))
+    if n_per < 1:
+        raise ValueError("n_per 必须 >= 1：%r" % (n_per,))
+
+    nowdt = _now(now)
+    wrong_map = _load_wrong(conn, nos)
+    skipped = [n for n in nos if n not in wrong_map]
+    # 按题号排序处理：入参顺序不影响选题结果（同一批错题 → 同一份训练卷）
+    wrong = [wrong_map[n] for n in sorted(n for n in nos if n in wrong_map)]
+    if not wrong:
+        raise ValueError("wrong_nos 里的题号库里都没有：%s" % "、".join(nos[:10]))
+
+    cands = _load_candidates(conn)
+    by_family, by_kp, by_chapter, by_qtype = _index(cands)
+    due = set(due_nos(conn, now=nowdt))
+
+    excluded = set(nos)                   # 原错题永不入选
+    chosen, sources, shortfall = [], [], {}
+    for w in wrong:
+        pools = {
+            "family": by_family.get(w["family_key"]) if w["family_key"] else None,
+            "kp": by_kp.get((w["kp_id"], w["qtype"])),
+            "chapter": by_chapter.get((w["chapter"], w["qtype"])),
+            "cross": by_qtype.get(w["qtype"]),
+        }
+        picks, levels = [], []
+        for level in LEVELS:
+            if len(picks) >= n_per:
+                break
+            pool = [c for c in (pools.get(level) or []) if c["no"] not in excluded]
+            pool.sort(key=lambda c, w=w: _rank_key(c, w, due))
+            for c in pool:
+                if len(picks) >= n_per:
+                    break
+                picks.append(c)
+                levels.append(level)
+                excluded.add(c["no"])
+        chosen.extend(picks)
+        sources.append({
+            "no": w["no"], "qtype": w["qtype"], "kp_id": w["kp_id"],
+            "chapter": w["chapter"], "family_key": w["family_key"],
+            "picked": [c["no"] for c in picks], "levels": levels,
+        })
+        if len(picks) < n_per:
+            shortfall[w["no"]] = {"need": n_per, "got": len(picks), "qtype": w["qtype"],
+                                  "levels": levels}
+
+    if not chosen:
+        raise ValueError("没有可用的替代题（原题不重复使用）：%s"
+                         % "、".join("%s 差 %d 道" % (k, v["need"] - v["got"])
+                                     for k, v in shortfall.items()))
+
+    chosen.sort(key=_paper_order)
+    mix = Counter(c["qtype"] for c in chosen)
+    params = {
+        "title": str(title).strip() if title else "错题训练卷 · %d 题" % len(chosen),
+        "mix": {qt: n for qt, n in mix.items() if n > 0},
+        "scope": {
+            "chapters": sorted({c["chapter"] for c in chosen if c["chapter"]}),
+            "kps": sorted({c["kp_id"] for c in chosen if c["kp_id"]}),
+            "kp_mode": "all",
+        },
+        "requirements": dict(DEFAULT_REQUIREMENTS),
+        "seed": _derive_seed(nos) if seed is None else int(seed),
+        "space": dict(space or DEFAULT_SPACE),
+        # —— 以下三个键是 train 的扩展，picker 已按此契约支持 ——
+        "nos": [c["no"] for c in chosen],       # 精确题集，顺序即卷面顺序
+        "exclude_nos": sorted(nos),             # 原错题拉黑
+        "train": {
+            "n_per": n_per,
+            "n_items": len(chosen),
+            "sources": sources,
+            "shortfall": shortfall,
+            "skipped": skipped,
+            "levels_used": sorted({lvl for s in sources for lvl in s["levels"]}),
+            "due_first": [c["no"] for c in chosen if c["no"] in due],
+        },
+    }
+    return params
