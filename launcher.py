@@ -127,16 +127,65 @@ def bootstrap_file(rel: str, base: str = None, bundle: str = None,
     return dst
 
 
+def find_shared_home(base: str = None, levels: int = 4) -> str | None:
+    """找本机的"开发版主目录"，让便携版和它**共用一套配置与数据**。
+
+    规则：从 exe 所在目录往上最多 ``levels`` 层，找名为 ``app`` 且同时有
+    ``config.json`` 与 ``data/app.db`` 的目录；找到就返回它。
+    也可以显式指定：环境变量 ``MATH_APP_HOME`` 优先。
+    """
+    env_home = str(os.environ.get("MATH_APP_HOME") or "").strip()
+    if env_home and os.path.isfile(os.path.join(env_home, CONFIG_REL)):
+        return os.path.abspath(env_home)
+    cur = os.path.abspath(base or base_dir())
+    for _ in range(max(0, int(levels)) + 1):
+        for name in ("app", "ocr-app"):
+            cand = os.path.join(cur, name)
+            if (os.path.isfile(os.path.join(cand, CONFIG_REL))
+                    and os.path.isfile(os.path.join(cand, DB_REL))):
+                return cand
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
 def prepare_paths(base: str = None, bundle: str = None, db: str = None,
-                  config: str = None, out: str = None, bootstrap: bool = True) -> dict:
+                  config: str = None, out: str = None, bootstrap: bool = True,
+                  shared: bool = None) -> dict:
     """算好本次运行用到的全部路径。
 
     ``bootstrap=True``（默认）会把 _internal 里的 config.json / data/app.db 复制到 exe 旁边；
     ``--check`` 走 ``bootstrap=False``：**只体检、不落盘**（否则在 dist 里跑一次 --check
     就会把 120MB 数据库复制进包里，打 zip 时白白多 120MB）。
+
+    **共用模式**（``shared=True`` 或自动探测到 ``find_shared_home``）：直接用本机开发版
+    的 ``app/config.json`` 与 ``app/data/app.db``，不再往 exe 旁边复制副本 ——
+    便携版与本地版始终同一套配置、同一个库。U 盘拿到别的电脑上没有开发版目录时，
+    自动回落成"自带副本"，行为不变。
     """
     base = base or base_dir()
     bundle = bundle or bundle_dir()
+    shared_home = None
+    if shared is None:
+        shared_home = find_shared_home(base)
+    elif shared:
+        shared_home = find_shared_home(base) or base
+    if shared_home:
+        cfg_path = os.path.join(shared_home, CONFIG_REL)
+        db_path = os.path.join(shared_home, DB_REL)
+        info = {
+            "base": base,
+            "bundle": bundle,
+            "qbank": resolve_qb_root(base, [os.path.join(os.path.dirname(shared_home), "qbank"),
+                                            os.path.join(shared_home, "qbank")]),
+            "db": db_path,
+            "config": cfg_path,
+            "out": os.path.abspath(out) if out else os.path.join(shared_home, OUT_REL),
+            "shared": shared_home,
+        }
+        return info
     if bootstrap:
         db_path = os.path.abspath(db) if db else bootstrap_file(DB_REL, base, bundle)
         cfg_path = os.path.abspath(config) if config else bootstrap_file(CONFIG_REL, base, bundle)
@@ -155,6 +204,7 @@ def prepare_paths(base: str = None, bundle: str = None, db: str = None,
         "db": db_path,
         "config": cfg_path,
         "out": os.path.abspath(out) if out else os.path.join(base, OUT_REL),
+        "shared": None,
     }
     return info
 

@@ -75,6 +75,9 @@ _RE_MIXED_SPACE = re.compile(r"(?<![\d.])(\d+)\s+(\d+)\s*/\s*(\d+)(?![\d/])")
 #: 分子必须小于分母，后面不能紧跟数字或字母（`2*(5)/(7)`、`2x(5)/(7)` 不转）。
 _RE_MIXED_PAREN = re.compile(r"(?<![\d.a-zA-Z*^])(-?)(\d+)\((\d+)\)/\((\d+)\)(?![\dA-Za-z])")
 
+#: 简单分数 a/b（分子分母都是整数，允许括号与空白）—— 用于"分数被 OCR 拆成两个数"的兜底比对
+_FRAC_RE = re.compile(r"^\(?\s*(-?\d+)\s*\)?\s*/\s*\(?\s*(-?\d+)\s*\)?$")
+
 _RE_SQRT = re.compile(r"(?:√|根号下?)\s*(\([^()]*\)|\d+(?:\.\d+)?|[a-zA-Z])")
 _RE_CBRT = re.compile(r"(?:∛|三次根号下?)\s*(\([^()]*\)|\d+(?:\.\d+)?|[a-zA-Z])")
 _RE_ABS = re.compile(r"\|([^|]*)\|")
@@ -760,6 +763,19 @@ def _cmp_body(pa, pb):
             r = _cmp_chunk("*".join(ca), "*".join(cb), pa.circled, pb.circled)
             if r is not None and r[0]:
                 return True, "隐含乘号等价（%s）" % r[1]
+        # 分数被 OCR 拆成两个整数（"2026 4053" 其实是 2026/4053）：只在"两个数正好
+        # 等于对面分数的分子分母"时才认，避免把真·多值答案并成一个分数。
+        def _frac_parts(s: str):
+            m = _FRAC_RE.match(s.strip())
+            if not m:
+                return None
+            return m.group(1), m.group(2)
+
+        for x, y in ((a, b), (b, a)):
+            fx = _frac_parts(x)
+            cy = [t for t in re.split(r"[\s,，]+", y.strip()) if t]
+            if fx and len(cy) == 2 and fx[0] == cy[0].strip() and fx[1] == cy[1].strip():
+                return True, "分数被识别成两个数（%s/%s），数值等价" % (fx[0], fx[1])
         return False, "项数不同：%d vs %d" % (len(ca), len(cb))
     return _cmp_chunk(a, b, pa.circled, pb.circled)
 

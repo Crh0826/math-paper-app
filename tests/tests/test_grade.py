@@ -1572,5 +1572,61 @@ class TestLegacyCardSupport(unittest.TestCase):
         self.assertEqual("legacy_card", res.get("error"), res.get("detail"))
 
 
+class TestRealPhotoByIds(unittest.TestCase):
+    """t54 回归：用户真实照片（P20261101-002，7×? 列版式）by_ids 要把 4 个标识全解出来。
+
+    这张卡是 5×5 新卡（不是旧卡）：之前 id_*.png 是 108px 只是因为裁切时 inset=6
+    （120-12=108），不是尺度问题；真正的 bug 是扫描按固定坐标、没有本地对齐。
+    """
+
+    APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    PHOTO = os.path.join(APP, "tests", "fixtures", "t54", "p20261101_002_source.jpg")
+    if not os.path.exists(PHOTO):
+        PHOTO = os.path.join(APP, "out", "P20261101-002",
+                             "sub_S20261101-103711-b813ae", "source.jpg")
+    EXPECT = ["10101", "12665", "11198", "05852"]
+
+    def setUp(self):
+        if not os.path.exists(self.PHOTO):
+            self.skipTest("没有 t54 真实照片")
+
+    def test_four_ids_decode(self):
+        scan = grade.scan_ids(self.PHOTO)
+        got = [b.get("no") for b in scan["blocks"] if b.get("no")]
+        self.assertEqual(self.EXPECT, got, "四个标识都要解出题号：%s" % (got,))
+        self.assertEqual(0, len(scan["unreadable"]), "不该再有「题目标识不可读」")
+
+    def test_ids_exist_in_bank(self):
+        conn = db.connect(os.path.join(self.APP, "data", "app.db"))
+        try:
+            scan = grade.scan_ids(self.PHOTO)
+            for b in scan["blocks"]:
+                row = grade._question_row(conn, b["no"])
+                self.assertIsNotNone(row, "题库里查不到 %s" % b["no"])
+        finally:
+            conn.close()
+
+    def test_by_ids_judges_nine_units(self):
+        conn = db.connect(os.path.join(self.APP, "data", "app.db"))
+        try:
+            res = grade.grade_by_ids(conn, self.PHOTO,
+                                     out_dir=os.path.join(self.APP, "out", "_t54_test"))
+            self.assertIsNone(res.get("error"), res.get("detail"))
+            self.assertEqual("question_id", res.get("identified_by"))
+            nos = {u["no"] for u in res["items"]}
+            self.assertEqual(set(self.EXPECT), nos, "9 个作答单元应覆盖这 4 道题")
+            # 没有 OCR（manual）时填空/解答应是 pending，不是「题目标识不可读」
+            self.assertFalse([u for u in res["items"]
+                              if "题目标识不可读" in (u.get("reason") or "")])
+        finally:
+            conn.close()
+
+    def test_scan_is_fast(self):
+        import time as _t
+        t0 = _t.perf_counter()
+        grade.scan_ids(self.PHOTO)
+        self.assertLess(_t.perf_counter() - t0, 3.0, "扫描不该超过 3 秒")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

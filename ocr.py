@@ -472,17 +472,46 @@ class Recognizer:
             self.last_error = "%s: %s" % (type(e).__name__, e)
             return _degraded("vlm")
 
+    def _vlm_image_b64(self, image_path: str, scale: float = 1.0):
+        """读图 → (mime, base64)。``scale`` 用来放大过小的作答框。
+
+        实测（DeepSeek-V4.1-Flash，2026-11-01）：405×106 的分数作答框**原样**送进去
+        返回空内容；放大 2 倍 → 正确识别 '2026/4053'。所以小图先放大。
+        """
+        ext = os.path.splitext(image_path)[1].lower()
+        mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
+        if scale <= 1.0001:
+            with open(image_path, "rb") as f:
+                return mime, base64.b64encode(f.read()).decode("ascii")
+        import io
+
+        from PIL import Image
+        with Image.open(image_path) as im:
+            im = im.convert("RGB")
+            im = im.resize((max(1, int(im.width * scale)), max(1, int(im.height * scale))),
+                           Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, "PNG")
+        return "image/png", base64.b64encode(buf.getvalue()).decode("ascii")
+
     def _vlm_read(self, image_path: str, kind: str = None) -> dict:
         if not os.path.exists(image_path):
             raise FileNotFoundError(image_path)
-        ext = os.path.splitext(image_path)[1].lower()
-        mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
-        with open(image_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
+        # 小图（作答框通常只有 100px 高）先放大 2 倍；原尺寸留作第二次尝试
+        try:
+            from PIL import Image as _I
+            with _I.open(image_path) as _im:
+                _h, _w = _im.height, _im.width
+            scale = 2.0 if (_h < 200 or _w < 480) else 1.0
+        except Exception:                     # noqa: BLE001 - 没 pillow 就原样送
+            scale = 1.0
+        mime, b64 = self._vlm_image_b64(image_path, scale)
         payload = {
             "model": self.vlm_model,
             "temperature": 0,
-            "max_tokens": 128,
+            # DeepSeek-V4.1-Flash 默认带"思考模式"，128 token 会被推理内容吃光，
+            # 正文变空（表现为 empty content、backend=vlm->manual）。给 512 留余量。
+            "max_tokens": 512,
             "messages": [
                 {"role": "system", "content": VLM_PROMPT},
                 {"role": "user", "content": [
@@ -491,7 +520,17 @@ class Recognizer:
                 ]},
             ],
         }
-        url = self.base_url.rstrip("/") + "/v1/chat/completions"
+        # base_url 归一化：DeepSeek 文档给的 base_url 是 https://api.deepseek.com
+        # （也接受 https://api.deepseek.com/v1），而这里原先无条件拼 "/v1/chat/completions"，
+        # 于是填了带 /v1 的地址就变成 .../v1/v1/chat/completions → HTTP 404，
+        # 表现就是"vlm->manual、没识别出文字"。三种写法都要吃得下。
+        base = str(self.base_url or "").rstrip("/")
+        if base.endswith("/chat/completions"):
+            url = base
+        elif base.endswith("/v1"):
+            url = base + "/chat/completions"
+        else:
+            url = base + "/v1/chat/completions"
         headers = {"Content-Type": "application/json"}
         if self.key:
             headers["Authorization"] = "Bearer " + self.key

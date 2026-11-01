@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 <#
 .SYNOPSIS
     打包「数学题库工作台」便携版（PyInstaller onedir + qbank 题库 + 一键 zip）。

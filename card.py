@@ -604,7 +604,8 @@ def _draw_header(d, manifest: dict, page_no: int, n_pages: int, label: int):
     _text(d, left, 170, line1, _font(size, True))
 
     hint = ("姓名：__________　班级：________　日期：__________　·　"
-            "选择题涂黑方框；填空/解答写在框内，勿越界；左侧 4×4 黑白格是机读题号，勿涂改")
+            "选择题涂黑方框；填空/解答写在框内，勿越界；左侧 %d×%d 黑白格是机读题号，勿涂改"
+            % (ID_GRID, ID_GRID))
     size = _fit_size(d, hint, right - left, 24)
     _text(d, left, 232, hint, _font(size), fill=80)
 

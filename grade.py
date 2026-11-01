@@ -516,7 +516,8 @@ def _classify_block(gray, x0, y0, grid, cell):
     vals, stds = [], []
     for r in range(grid):
         for c in range(grid):
-            m, sd = _cell_stats(gray, x0 + c * cell, y0 + r * cell, cell)
+            m, sd = _cell_stats(gray, x0 + round(c * cell), y0 + round(r * cell),
+                                max(8, int(round(cell))))
             if m is None:
                 return "none", None
             vals.append(m)
@@ -606,30 +607,127 @@ def _scan_column(gray, base_x: int, col: int, out: dict):
         out["unreadable"].append({"x": base_x, "y": yb, "col": col})
 
 
-def scan_id_blocks(gray) -> dict:
-    """扫页面上所有标识块（5×5=25 位，编码题号）。
+def _align_decode(gray, x: int, y: int, grid: int, cell: float, span: int = 6):
+    """在 ±span 内微调（由小到大逐圈，先命中即返回）→ (dx, dy, no) 或 None。"""
+    for rad in (1, 2, 3, 5, 8, max(8, span)):
+        for dy in range(-rad, rad + 1):
+            for dx in range(-rad, rad + 1):
+                kind, bits = _classify_block(gray, x + dx, y + dy, grid, cell)
+                if kind != "bits" or not bits:
+                    continue
+                no = (card.decode_id_bits(bits) if grid == card.ID_GRID
+                      else card.legacy_idx_bits(bits))
+                if no is not None:
+                    return dx, dy, no
+    return None
 
-    只在每列标识左缘（`card.ID_ORIGIN_X`）所在的竖带里找，靠「25 格黑白分明 + CRC-5」
-    确认，所以顶行全白、光照不匀都不会漏；解不出校验的块记 `unreadable`（该题进 unsure）。
+
+def _frame_corner_dark(gray, x: int, y: int, size: int) -> bool:
+    """标识块左上那一圈黑框（上边+左边各 2px）在不在 —— 比四边都亮/暗更稳。"""
+    h, w = gray.shape[:2]
+    if x - 3 < 0 or y - 3 < 0 or x + size > w or y + size > h:
+        return False
+    top = gray[y - 3:y - 1, x:x + size]
+    left = gray[y:y + size, x - 3:x - 1]
+    return bool(top.size and left.size and float(top.mean()) < 150 and float(left.mean()) < 150)
+
+
+def _candidate_rects(gray):
+    """标识块候选 (x, y, size)：轮廓法 + 列扫黑框兜底（粘连时轮廓不是方的）。"""
+    h = gray.shape[0]
+    rects = []
+    try:
+        bin_ = (gray < 100).astype(np.uint8) * 255
+        cnts, _ = cv2.findContours(bin_, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            x, y, cw, ch = cv2.boundingRect(c)
+            if 88 <= cw <= 140 and 88 <= ch <= 140 and abs(cw - ch) <= 14:
+                yy = int(y) + 3
+                if card.BODY_RECT[1] - 60 <= yy <= card.BODY_RECT[1] + card.BODY_RECT[3]:
+                    rects.append((int(x) + 3, yy, int(max(cw, ch)) - 6))
+    except Exception:
+        pass
+    y_from = max(0, card.BODY_RECT[1] - 50)
+    y_to = min(h, card.BODY_RECT[1] + card.BODY_RECT[3])
+    for base_x in card.ID_ORIGIN_X:
+        for size in (card.ID_SIZE, card.ID_SIZE * card.LEGACY_ID_GRID // card.ID_GRID):
+            y = y_from
+            while y + size <= y_to:
+                if _frame_corner_dark(gray, base_x, y, size):
+                    rects.append((base_x, y, size))
+                    y += size + 4
+                    continue
+                y += 8
+    out = []
+    for r in sorted(rects, key=lambda t: (t[1], t[0])):
+        if any(abs(r[0] - o[0]) < 50 and abs(r[1] - o[1]) < 50 for o in out):
+            continue
+        out.append(r)
+    return out
+
+
+def _sweep_column(*_a, **_kw):      # 兼容旧名（不再使用）
+    return None
+
+
+def scan_id_blocks(gray) -> dict:
+    """扫页面上的标识块：候选（轮廓/黑框）→ 按实测块宽自适应 5×5 或 4×4 → ±6px 对齐解码。
+
+    * 块宽 ~120 → 5×5（编码题号）；~96 → 4×4（旧卡，编码卷内题序，只兼容）；
+    * 候选实测尺寸决定 cell，不写死 24px（打印缩放/手机透视图都能扛）；
+    * 解不出 CRC → unreadable（该题进 unsure），绝不静默判错。
     """
     out = {"blocks": [], "unreadable": [], "legacy": 0}
+    for (x, y, size) in _candidate_rects(gray):
+        grid = card.ID_GRID if size >= 108 else card.LEGACY_ID_GRID
+        cell = (float(size) - 2.0) / grid
+        got = _align_decode(gray, x, y, grid, cell, span=8)
+        col = 0 if x < card.PAGE_W // 2 else 1
+        if not got:
+            out["unreadable"].append({"x": x, "y": y, "col": col})
+            continue
+        dx, dy, no = got
+        if grid == card.LEGACY_ID_GRID:
+            out["legacy"] += 1
+            out["blocks"].append({"x": x + dx, "y": y + dy, "no": None, "idx": no,
+                                  "col": col, "grid": grid})
+        else:
+            out["blocks"].append({"x": x + dx, "y": y + dy, "no": no, "col": col, "grid": grid})
+
+    # 补一遍 5×5 列扫：边框与答题框粘连时轮廓/黑框都可能漏
+    y_from = max(0, card.BODY_RECT[1] - 40)
+    y_to = min(gray.shape[0], card.BODY_RECT[1] + card.BODY_RECT[3])
     for col, base_x in enumerate(card.ID_ORIGIN_X):
-        _scan_column(gray, base_x, col, out)
-    # 去重：同一个坏块可能被相邻几个窗口重复命中
-    def _dedupe(items):
+        y = y_from
+        while y + card.ID_SIZE <= y_to:
+            if any(abs(base_x - b["x"]) < 60 and abs(y - b["y"]) < 130 for b in out["blocks"]):
+                y += 8
+                continue
+            kind, _bits = _classify_block(gray, base_x, y, card.ID_GRID, card.ID_CELL)
+            if kind == "bits":          # 先便宜地筛一遍，只有像网格才做对齐搜索
+                got = _align_decode(gray, base_x, y, card.ID_GRID, card.ID_CELL, span=4)
+                if got:
+                    dx, dy, no = got
+                    out["blocks"].append({"x": base_x + dx, "y": y + dy, "no": no,
+                                          "col": col, "grid": card.ID_GRID})
+                    y += card.ID_SIZE + 4
+                    continue
+            y += 8
+
+    def _dedupe(items, gap=110):
         keep = []
-        for it in sorted(items, key=lambda x: (x["col"], x["y"])):
-            if keep and it["col"] == keep[-1]["col"] and it["y"] - keep[-1]["y"] < card.ID_SIZE + 8:
+        for it in sorted(items, key=lambda b: (b["x"], b["y"])):
+            if any(abs(it["x"] - o["x"]) < 70 and abs(it["y"] - o["y"]) < gap for o in keep):
                 continue
             keep.append(it)
         return keep
 
     out["blocks"] = _dedupe(out["blocks"])
     out["unreadable"] = _dedupe([u for u in out["unreadable"]
-                                 if not any(abs(u["y"] - b["y"]) < card.ID_SIZE
-                                            and u["col"] == b["col"] for b in out["blocks"])])
-    out["blocks"].sort(key=lambda b: (b["y"], b["col"]))
-    out["unreadable"].sort(key=lambda b: (b["y"], b["col"]))
+                                 if not any(abs(u["x"] - b["x"]) < 70 and
+                                            abs(u["y"] - b["y"]) < 130 for b in out["blocks"])])
+    out["blocks"].sort(key=lambda b: (b["y"], b["x"]))
+    out["unreadable"].sort(key=lambda b: (b["y"], b["x"]))
     return out
 
 
@@ -752,11 +850,13 @@ def _grade_by_ids(conn, image_path, out_root):
         items.append(it)
         by_idx[seq] = {"answer_key": key, "qtype": qtype, "no": b["no"]}
 
+    if not items and scan["blocks"] and all(b.get("no") is None for b in scan["blocks"]):
+        return _err("legacy_card_need_pid", LEGACY_NEED_PID_MSG, pid_hint)
     if not items and unknown:
         return _err("unknown_questions",
                     "扫到 %d 个题目标识，但本机题库里没有这些题号（%s…）。"
                     "可能是别的题库/别的版本，或题目被删了。" % (
-                        len(unknown), "、".join(unknown[:5])), pid_hint)
+                        len(unknown), "、".join(str(n) for n in unknown[:5] if n)), pid_hint)
     units, pending_units = _units_for_page(norm, items, by_idx, crop_dir)
     units.extend(unreadable_units)
 
