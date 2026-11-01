@@ -660,7 +660,10 @@ class TestStitch(unittest.TestCase):
             png, ranges = stitch_cells([("1-1", a), ("2-1", b)], os.path.join(tmp, "s.png"))
             self.assertTrue(os.path.exists(png))
             with Image.open(png) as im:
-                self.assertEqual(ocrmod.STITCH_W, im.width, "拼图宽度统一 900px")
+                # 2026-11-01 起：拼图先贴到「一页纸」画布（1200×1600）再送云端——
+                # 条状长图会被版面模型整批丢掉（实测 0 个 block），所以宽度不再是 900。
+                self.assertEqual(ocrmod.PAGE_CANVAS[0], im.width, "拼图已页面化：宽 = PAGE_CANVAS")
+                self.assertEqual(ocrmod.PAGE_CANVAS[1], im.height, "拼图已页面化：高 = PAGE_CANVAS")
                 W, H = im.size
             self.assertEqual(["1-1", "2-1"], [r["key"] for r in ranges])
             # 顺序、不重叠、格间纯白 ≥8px
