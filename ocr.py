@@ -67,7 +67,7 @@ import urllib.error  # noqa: E402
 import urllib.request  # noqa: E402
 
 # ---------------------------------------------------------------- 常量
-BACKENDS = ("manual", "vlm", "glm_ocr", "paddle_vl", "local")
+BACKENDS = ("manual", "vlm", "glm_ocr", "local_formula", "paddle_vl", "local")
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 EXAMPLE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.example.json")
@@ -503,6 +503,22 @@ class Recognizer:
         self.glm_model = str(pick("glm_model", ("OCR_GLM_MODEL",), go.get("model"), "glm-ocr"))
         self.glm_fallback = bool(go.get("fallback", True))   # 读不出时用 vlm 兜底
 
+        # ---- local_formula（本机 CPU 跑 Qwen2.5-VL-3B，不联网）
+        # 实测 2026-11-01：9 张真实作答裁切 9/9 判对，平均 9.0s/张（i5-12490F，无 GPU）
+        lf = (ocr_cfg.get("local_formula") or {})
+        here = os.path.dirname(os.path.abspath(__file__))
+        default_py = os.path.join(os.path.dirname(here), ".tools", "venv_formula",
+                                  "Scripts", "python.exe")
+        self.lf_python = str(pick("lf_python", ("OCR_LOCAL_PY",), lf.get("python"), default_py)
+                             or default_py)
+        self.lf_bridge = str(pick("lf_bridge", (), lf.get("bridge"),
+                                  os.path.join(here, "tools", "local_vlm_bridge.py")) or "")
+        self.lf_model = str(pick("lf_model", ("OCR_LOCAL_MODEL",), lf.get("model"),
+                                 "Qwen/Qwen2.5-VL-3B-Instruct") or "")
+        self.lf_timeout = float(ov.get("lf_timeout_s") or lf.get("timeout_s") or 900.0)
+        self.lf_fallback = bool(lf.get("fallback", True))
+        self.lf_prompt = str(lf.get("prompt") or "")
+
     # ------------------------------------------------------------ read
     def read(self, image_path: str, kind: str = None) -> dict:
         """识别单个作答格 → {"text","confidence","backend"}；永不抛异常。"""
@@ -513,6 +529,9 @@ class Recognizer:
                 return self._vlm_guarded(image_path, kind)
             if self.backend == "glm_ocr":
                 return self._glm_guarded(image_path, kind)
+            if self.backend == "local_formula":
+                key = "%s-1" % (kind or "x")
+                return self.read_batch([(key, image_path)]).get(key) or _degraded("local_formula")
             if self.backend == "paddle_vl":
                 key = "%s-1" % (kind or "x")
                 out = self.read_batch([(key, image_path)])
@@ -543,6 +562,8 @@ class Recognizer:
                 return {k: self._vlm_guarded(p, "fill") for k, p in pairs}
             if self.backend == "glm_ocr":
                 return {k: self._glm_guarded(p, "fill") for k, p in pairs}
+            if self.backend == "local_formula":
+                return self._local_formula_batch(pairs)
             if self.backend == "local":
                 return {k: self._local_guarded(p) for k, p in pairs}
             return {k: _manual() for k, _ in pairs}
@@ -597,6 +618,61 @@ class Recognizer:
         text = latex_to_plain("\n".join(parts))
         return {"text": text, "confidence": 0.9 if text else 0.0,
                 "backend": "glm_ocr", "elapsed_s": round(time.time() - t0, 2)}
+
+    # ------------------------------------------------------------ local_formula（本机 CPU）
+    def _local_formula_batch(self, pairs) -> dict:
+        """一次子进程喂完所有裁切（模型只加载一次）；读不出的再用云端兜底。"""
+        import subprocess
+
+        out = {}
+        paths = [p for _k, p in pairs]
+        if not (os.path.isfile(self.lf_python) and os.path.isfile(self.lf_bridge)):
+            self.last_error = ("本机视觉模型没装好：%s / %s"
+                               % (self.lf_python, self.lf_bridge))
+            raise FileNotFoundError(self.last_error)
+
+        req = {"images": paths, "model": self.lf_model}
+        if self.lf_prompt:
+            req["prompt"] = self.lf_prompt
+        t0 = time.time()
+        proc = subprocess.run(
+            [self.lf_python, "-X", "utf8", self.lf_bridge],
+            input=json.dumps(req, ensure_ascii=False),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=self.lf_timeout)
+        if proc.returncode != 0:
+            raise RuntimeError("本地模型退出码 %s：%s"
+                               % (proc.returncode, (proc.stdout or proc.stderr or "")[-300:]))
+        lines = [ln for ln in (proc.stdout or "").strip().splitlines() if ln.strip().startswith("{")]
+        if not lines:
+            raise RuntimeError("本地模型没有返回 JSON：" + (proc.stderr or "")[-200:])
+        obj = json.loads(lines[-1])
+        if not obj.get("ok"):
+            raise RuntimeError("本地模型失败：" + str(obj.get("error"))[:200])
+        load_s = obj.get("model_load_s")
+        if load_s:
+            self.last_error = ""      # 模型加载成功，清掉历史错误
+
+        results = obj.get("results") or []
+        for (key, path), item in zip(pairs, results):
+            text = latex_to_plain(str(item.get("text") or ""))
+            if text:
+                out[key] = {"text": text, "confidence": 0.9, "backend": "local_formula",
+                            "elapsed_s": item.get("elapsed_s")}
+                continue
+            fb = None
+            if self.lf_fallback:
+                if self.glm_key:
+                    fb = self._glm_guarded(path, "fill")
+                if (not fb or not (fb.get("text") or "").strip()) and self.key and self.base_url:
+                    fb = self._vlm_guarded(path, "fill")
+            if fb and (fb.get("text") or "").strip():
+                fb = dict(fb)
+                fb["backend"] = "local_formula->%s" % (fb.get("backend") or "vlm")
+                out[key] = fb
+            else:
+                out[key] = {"text": "", "confidence": 0.0, "backend": "local_formula"}
+        return out
 
     # ------------------------------------------------------------ vlm
     def _vlm_guarded(self, image_path: str, kind: str = None) -> dict:

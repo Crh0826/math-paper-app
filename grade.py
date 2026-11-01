@@ -388,6 +388,29 @@ def _multi_value_verdict(text, expected, qtype):
         len(got_vals), len(exp_vals))
 
 
+def _sign_flip_variant_match(text: str, expected: str, qtype: str) -> bool:
+    """把某一个数的负号翻一下是否就等价了（= 很可能是 OCR 丢了负号）。
+
+    实测（Qwen2.5-VL 本地、GLM-OCR 都出现过）：手写的 `-6` 被读成 `6`、`-π` 读成 `π`。
+    这种"只差一个负号"的情况不该判错，交人工确认。
+    """
+    import re as _re
+
+    s = str(text or "")
+    # 逐个数字/符号 token 尝试翻负号
+    for m in _re.finditer(r"-?\s*(?:\d+(?:\.\d+)?|[πp])", s):
+        tok = m.group(0)
+        body = tok.lstrip("- ").strip()
+        flipped = body if tok.strip().startswith("-") else "-" + body
+        cand = s[:m.start()] + flipped + s[m.end():]
+        try:
+            if normalize.is_equivalent(cand, expected, qtype or "填空")[0]:
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
 def _judge(text: str, expected: str, qtype: str, confidence=None):
     """→ (verdict, reason)；expected 为空 = 该空不判分。
 
@@ -401,6 +424,8 @@ def _judge(text: str, expected: str, qtype: str, confidence=None):
         return "unsure", "归一化异常: %s" % e
     if ok:
         return "correct", reason
+    if _sign_flip_variant_match(text, expected, qtype):
+        return "unsure", "只差一个负号（可能是符号没识别出来），需人工确认"
     multi = _multi_value_verdict(text, expected, qtype)
     if multi:
         return multi        # 多值题给明确结论，不再被「含逗号=非数学字符」的启发式误导

@@ -473,7 +473,18 @@ def load_ocr_config(config_path: str | None = None) -> dict:
                       "url": glm_cfg.get("url") or "https://open.bigmodel.cn/api/paas/v4/layout_parsing",
                       "model": glm_cfg.get("model") or "glm-ocr",
                       "fallback": bool(glm_cfg.get("fallback", True))}
+    # 本机视觉模型（Qwen2.5-VL-3B，跑在独立 venv 里）
+    lf_cfg = ocr.get("local_formula") or {}
+    _def_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           ".tools", "venv_formula", "Scripts", "python.exe")
+    lf_py = lf_cfg.get("python") or _def_py
+    out["local_formula"] = {"python": lf_py,
+                            "python_exists": os.path.isfile(lf_py),
+                            "model": lf_cfg.get("model") or "Qwen/Qwen2.5-VL-3B-Instruct",
+                            "fallback": bool(lf_cfg.get("fallback", True)),
+                            "timeout_s": lf_cfg.get("timeout_s") or 900}
     out["backend_label"] = {
+        "local_formula": "本机视觉模型（Qwen2.5-VL-3B，离线）",
         "glm_ocr": "智谱 GLM-OCR（版面解析）",
         "paddle_vl": "PaddleOCR-VL 云端",
         "vlm": "视觉模型（OpenAI 兼容）",
@@ -2185,6 +2196,8 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
 
     # ---------------------------------------------------------------- 设置（OCR / AI Key）
     OCR_BACKENDS = (
+        ("local_formula", "本机视觉模型（Qwen2.5-VL-3B，离线）",
+         "不联网：本机 CPU 跑 Qwen2.5-VL-3B，实测 9/9 判对、约 9 秒/格；读不出时可用云端兜底"),
         ("glm_ocr", "智谱 GLM-OCR（版面解析）",
          "公式/手写最准：把作答格贴成一页纸发给 GLM-OCR，读不出时自动用下面的视觉模型兜底"),
         ("paddle_vl", "PaddleOCR-VL 云端", "把作答格拼图发给 PaddleOCR-VL，识别质量最好"),
@@ -2283,7 +2296,15 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
                 val = str(form.get(legacy) or "").strip()
             return val
 
-        if backend == "glm_ocr":
+        if backend == "local_formula":
+            lf = ocr_cfg.get("local_formula") if isinstance(ocr_cfg.get("local_formula"), dict) else {}
+            for new, old in (("lf_python", "python"), ("lf_model", "model")):
+                val = _text(new, old)
+                if val:
+                    lf[old] = val
+            lf.setdefault("fallback", True)
+            ocr_cfg["local_formula"] = lf
+        elif backend == "glm_ocr":
             glm = ocr_cfg.get("glm_ocr") if isinstance(ocr_cfg.get("glm_ocr"), dict) else {}
             if clear == "glm_ocr":
                 glm["key"] = ""

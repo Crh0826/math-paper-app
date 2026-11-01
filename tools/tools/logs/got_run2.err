@@ -1,0 +1,61 @@
+Fetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]Fetching 9 files: 100%|██████████| 9/9 [00:00<00:00, 2373.84it/s]
+<unknown>:623: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+<unknown>:859: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\8525eaf05674d346\modeling_GOT.py:623: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+  left_num = outputs.count('\left')
+C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\8525eaf05674d346\modeling_GOT.py:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
+C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\8525eaf05674d346\modeling_GOT.py:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
+C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\8525eaf05674d346\modeling_GOT.py:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
+C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\8525eaf05674d346\modeling_GOT.py:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
+C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\8525eaf05674d346\modeling_GOT.py:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
+C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\8525eaf05674d346\modeling_GOT.py:859: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+  left_num = outputs.count('\left')
+C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\8525eaf05674d346\modeling_GOT.py:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
+C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\8525eaf05674d346\modeling_GOT.py:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
+C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\8525eaf05674d346\modeling_GOT.py:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
+C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\8525eaf05674d346\modeling_GOT.py:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
+C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\8525eaf05674d346\modeling_GOT.py:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
+  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
+[transformers] Encountered exception while importing tiktoken: No module named 'tiktoken'
+Traceback (most recent call last):
+  File "E:\OCR\app\tools\run_got_ocr.py", line 72, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "E:\OCR\app\tools\run_got_ocr.py", line 43, in main
+    tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+  File "E:\OCR\.tools\venv_formula\Lib\site-packages\transformers\models\auto\tokenization_auto.py", line 961, in from_pretrained
+    tokenizer_class = get_class_from_dynamic_module(
+        class_ref, pretrained_model_name_or_path, code_revision=code_revision, **kwargs
+    )
+  File "E:\OCR\.tools\venv_formula\Lib\site-packages\transformers\dynamic_module_utils.py", line 614, in get_class_from_dynamic_module
+    final_module = get_cached_module_file(
+        repo_id,
+    ...<7 lines>...
+        repo_type=repo_type,
+    )
+  File "E:\OCR\.tools\venv_formula\Lib\site-packages\transformers\dynamic_module_utils.py", line 439, in get_cached_module_file
+    modules_needed = check_imports(resolved_module_file)
+  File "E:\OCR\.tools\venv_formula\Lib\site-packages\transformers\dynamic_module_utils.py", line 258, in check_imports
+    raise ImportError(
+    ...<2 lines>...
+    )
+ImportError: This modeling file requires the following packages that were not found in your environment: tiktoken. Run `pip install tiktoken`

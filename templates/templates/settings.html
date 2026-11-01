@@ -75,6 +75,27 @@
       </label>
     </div>
 
+    <div class="backend-fields" id="fields-local_formula" hidden>
+      <div class="grid grid-2">
+        <label class="field">
+          <span class="field-label">本机 venv 的 python.exe</span>
+          <input type="text" name="lf_python" value="{{ info.local_formula.python or '' }}" autocomplete="off">
+          <span class="field-hint">
+            {% if info.local_formula.python_exists %}<span class="pill pill-ok">已找到</span>{% else %}<span class="pill pill-bad">不存在</span>{% endif %}
+            需要装有 torch + transformers + qwen-vl-utils 的独立环境（见 docs\路线一-本地公式模型实测.md）。
+          </span>
+        </label>
+        <label class="field">
+          <span class="field-label">模型</span>
+          <input type="text" name="lf_model" value="{{ info.local_formula.model or 'Qwen/Qwen2.5-VL-3B-Instruct' }}" autocomplete="off">
+        </label>
+      </div>
+      <p class="field-hint">
+        离线：作答格在本机识别，不上传。实测 9 张真实裁切 <b>9/9 判对</b>，约 <b>9 秒/格</b>（8 张一批约 80 秒）；
+        读不出时可用上面的 GLM-OCR / 视觉模型兜底。判卷走异步，不会卡住页面。
+      </p>
+    </div>
+
     <div class="backend-fields" id="fields-glm_ocr" hidden>
       <div class="grid grid-2">
         <label class="field">
