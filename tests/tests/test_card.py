@@ -180,7 +180,7 @@ class TestSinglePage(_Base):
             self.assertAlmostEqual(ARUCO_SIZE, a["size"], delta=2)
             self.assertEqual((a["x"], a["y"]), ARUCO_POS[a["id"]])
         qr = page["qr"]
-        self.assertEqual({"pid": PID, "p": 1}, qr["payload"])
+        self.assertEqual({"pid": PID, "p": 1, "v": cardmod.CARD_VERSION}, qr["payload"])
         self.assertAlmostEqual(QR_SIZE, qr["size"], delta=2)
 
     def test_kinds_match_qtype(self):
@@ -283,8 +283,8 @@ class TestSinglePage(_Base):
             data, _, _ = det.detectAndDecode(crop)
             self.assertTrue(data, "QR 解不出来（解到空串）")
             self.assertEqual(
-                {"pid": PID, "p": page["page"]}, json.loads(data), "QR payload 与卡面不一致"
-            )
+                {"pid": PID, "p": page["page"], "v": cardmod.CARD_VERSION},
+                json.loads(data), "QR payload 与卡面不一致")
 
     def test_id_box_decodable_from_png(self):
         """按坐标采样渲染图上的 5×5 标识 → 必须解回题号（判卷侧取数路径）。"""
@@ -519,6 +519,44 @@ class TestDeterministic(unittest.TestCase):
                              json.dumps(b, sort_keys=True, ensure_ascii=False))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestCardVersion(unittest.TestCase):
+    """t50 回归：新卡版本号要跟着标识格式升到 2（旧卡文件里的 1 不动）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="ver_")
+        m = make_manifest([_item(i, "选择", 1) for i in range(1, 4)], pid="P20261101-001")
+        m["paper"] = {"pages": 1}
+        cls.res = build_card(m, cls.tmp)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_new_card_version_is_2(self):
+        self.assertEqual(2, cardmod.CARD_VERSION)
+        self.assertEqual(1, cardmod.LEGACY_CARD_VERSION)
+        self.assertEqual(2, self.res["card"]["version"])
+        self.assertEqual(2, self.res["manifest"]["card"]["version"], "要合并进 manifest")
+
+    def test_qr_payload_carries_version(self):
+        page = self.res["card"]["pages"][0]
+        payload = page["qr"]["payload"]
+        self.assertEqual(2, payload.get("v"), "QR 里要带卡版本")
+        self.assertEqual(page["page"], payload["p"], "p 仍是本卡页序（判卷按它选页）")
+
+    def test_id_bits_still_25(self):
+        for page in self.res["card"]["pages"]:
+            for it in page["items"]:
+                self.assertEqual(25, len(it["id_box"]["bits"]))
+                self.assertEqual(str(it["no"]), cardmod.decode_id_bits(it["id_box"]["bits"]))
+
+    def test_health_is_return_value_not_manifest(self):
+        self.assertIn("health", self.res, "health 是 build_card 的返回值")
+        self.assertNotIn("health", self.res["manifest"].get("card") or {},
+                         "health 不写进 manifest（docstring 已写明）")
 
 
 class TestPlanFromAnchor(unittest.TestCase):

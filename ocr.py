@@ -258,6 +258,22 @@ def stitch_cells(items, out_png: str, width: int = STITCH_W):
                        "y0": y0, "y1": y1, "label_y0": label_y0, "label_h": LABEL_H})
         y = y1 + STITCH_GAP
 
+    # 贴成"一页纸"：云端版面模型对长条图会一个 block 都不出（实测 2026-11-01），
+    # 页面化之后 ranges 跟着平移，归格逻辑不变。
+    dx, dy = 0, 0
+    pw, ph = PAGE_CANVAS
+    if canvas.width < pw - 40 or canvas.height < ph - 200:
+        page = Image.new("L", (pw, ph), 255)
+        dx = max(0, (pw - canvas.width) // 2)
+        dy = max(0, min(ph - canvas.height - 20, int(ph * 0.10)))
+        page.paste(canvas, (dx, dy))
+        canvas = page
+        for r in ranges:
+            r["x"] += dx
+            r["y0"] += dy
+            r["y1"] += dy
+            r["label_y0"] += dy
+
     os.makedirs(os.path.dirname(os.path.abspath(out_png)) or ".", exist_ok=True)
     canvas.save(out_png, "PNG", optimize=True)
     return out_png, ranges
@@ -284,7 +300,47 @@ def _request(url: str, data: bytes = None, headers: dict = None,
         return e.code, body
 
 
+#: 云端版面模型需要"像一页纸"：条状裁切图会一个 block 都解不出来（实测 2026-11-01）
+PAGE_CANVAS = (1200, 1600)
+STRIP_ASPECT = 2.5          # 宽/高 > 此值视为"一条字"
+STRIP_MIN_H = 400           # 高 < 此值也视为条状
+
+
+def as_page_image(raw: bytes) -> tuple:
+    """把条状裁切图贴到竖版白底画布上，返回 (png_bytes, 文件名)。
+
+    实测：788×106 的手写 "99" 直传 → 0 个 block；贴到 1200×1600 画布 → 认出 "99"；
+    另一张 405×106 的 "2026/4053" 同理（识别成 "2026 4053"）。
+    已经是"一页纸"比例的大图原样返回，避免无谓的重编码。
+    """
+    try:
+        import io
+
+        from PIL import Image
+    except Exception:                        # noqa: BLE001 - 没装 pillow 就原样上传
+        return raw, "crop.png"
+    try:
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+        w, h = im.size
+        if w <= 0 or h <= 0:
+            return raw, "crop.png"
+        if h >= STRIP_MIN_H and (w / h) <= STRIP_ASPECT:
+            return raw, "crop.png"
+        cw, ch = PAGE_CANVAS
+        scale = min(1.0, (cw * 0.9) / w)
+        if scale < 1.0:
+            im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+        canvas = Image.new("RGB", (cw, ch), "white")
+        canvas.paste(im, ((cw - im.width) // 2, max(40, int(ch * 0.12))))
+        buf = io.BytesIO()
+        canvas.save(buf, "PNG")
+        return buf.getvalue(), "page.png"
+    except Exception:                        # noqa: BLE001 - 预处理失败就用原图
+        return raw, "crop.png"
+
+
 def _multipart(fields: dict, files: list):
+
     """files=[(name, filename, data, content_type)] → (body, content_type)。"""
     boundary = "----ocr" + uuid.uuid4().hex
     chunks = []
@@ -505,6 +561,26 @@ class Recognizer:
             texts = _split_by_label("\n".join(markdowns), [r["key"] for r in ranges])
         else:
             raise RuntimeError("OCR 结果里没有可用的块")
+        # 兜底：整批一个空都没出 → 逐格单独识别（单图走"一页纸"画布，实测更稳）
+        # 预算 150s / 最多 6 格，避免一次判卷把用户挂太久
+        if not any(str(t or "").strip() for t in texts.values()):
+            budget = time.time() + 150.0
+            for key, path in pairs[:6]:
+                if time.time() > budget:
+                    break
+                try:
+                    b1, m1 = self._paddle_job(path)
+                except Exception:            # noqa: BLE001
+                    b1, m1 = None, []
+                got = ""
+                if b1:
+                    # block 结构是 {"bbox": [...], "content": "..."}（layout 解析结果）
+                    got = " ".join(str(x.get("content") or x.get("text") or "")
+                                   for x in b1).strip()
+                elif m1:
+                    got = "\n".join(m1).strip()
+                if got:
+                    texts[key] = got
         out = {}
         for key, _path in pairs:
             text = texts.get(key, "")
@@ -516,10 +592,12 @@ class Recognizer:
         """提交 job、轮询、取 jsonl → (blocks, markdowns)；失败返回 (None, [])。"""
         with open(image_path, "rb") as f:
             img = f.read()
+        # 条状裁切图直传会被云端版面模型丢掉（0 个 block），先贴成"一页纸"
+        img, _fname = as_page_image(img)
         body, ctype = _multipart(
             {"model": self.model,
              "optionalPayload": json.dumps(PADDLE_OPTIONAL_PAYLOAD, ensure_ascii=False)},
-            [("file", os.path.basename(image_path), img, "image/png")],
+            [("file", _fname, img, "image/png")],
         )
         headers = {"Content-Type": ctype,
                    "Authorization": "bearer %s" % self.token}

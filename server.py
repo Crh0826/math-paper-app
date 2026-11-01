@@ -2165,6 +2165,20 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
 
         if backend == "paddle_vl":
             pv = ocr_cfg.get("paddle_vl") if isinstance(ocr_cfg.get("paddle_vl"), dict) else {}
+            # 模型名护栏：PaddleOCR-VL 的 job 只认 PaddleOCR-VL-*。填成别的（例如把
+            # 视觉模型的 deepseek-flash 填进来）云端会一直返回"没有可用的块"，
+            # 用户看到的就是"识别服务暂时无响应、整批待确认"——当场拒绝，别让它发生。
+            model_in = _text("model")
+            if model_in and "paddle" not in model_in.lower():
+                ctx = _settings_ctx(status_code=400, notice={
+                    "kind": "bad",
+                    "text": ("模型名不对：PaddleOCR-VL 云端只接受 PaddleOCR-VL-* 系列"
+                             "（例如 PaddleOCR-VL-1.6）。填 %r 云端会返回空结果，没保存。"
+                             % model_in),
+                })
+                ctx.pop("status_code", None)
+                return render("settings.html", status_code=400, page_title="设置",
+                              nav_active="settings", **ctx)
             if clear == "paddle_vl":
                 pv["token"] = ""
             elif _text("token"):

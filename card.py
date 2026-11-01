@@ -70,7 +70,10 @@ QR_ECC = "H"
 BODY_RECT = (100, 800, 2240, 2320)   # x, y, w, h  → 100..2340 / 800..3120
 
 #: 每题标识格（t46）：5×5=25 位，前 20 位 = 题号，后 5 位 = CRC-5 校验
+CARD_VERSION = 2                  # 5×5 标识（编码题号）
+LEGACY_CARD_VERSION = 1           # 旧卡：4×4 标识（编码卷内题序），只兼容不生成
 ID_GRID = 5
+LEGACY_ID_GRID = 4                # 旧卡（manifest.card.version=1）的 4×4 标识
 ID_CELL = 24                      # 约 2mm@300dpi，与旧版视觉一致
 ID_SIZE = ID_GRID * ID_CELL       # 120
 ID_TOP_DY = 6                     # id_box.y = 题块 top + 6
@@ -407,15 +410,17 @@ def plan_item(item: dict, kind: str, top: int, max_h: int = None, col: int = 0) 
 
 
 def plan_from_anchor(anchor_x: int, anchor_y: int, kind: str,
-                     n_options: int = 4, n_blanks: int = 1) -> dict:
+                     n_options: int = 4, n_blanks: int = 1, grid: int = None) -> dict:
     """只给标识块左上角 → 反推这一题的作答格几何（t46 无 manifest 判卷用）。
 
     标识块固定在每题块左上角（`id_box = (col_id_x, top + ID_TOP_DY)`），
     所以 `top = anchor_y - ID_TOP_DY`，列由 anchor_x 落在左/右半页决定。
     返回的几何与 `plan_item` 完全同源，两列排布同样成立。
     """
+    grid = int(grid or ID_GRID)
     col = 0 if int(anchor_x) < PAGE_W // 2 else 1
     top = int(anchor_y) - ID_TOP_DY
+    _ = grid        # 旧卡（4×4）的几何由 manifest 直接给；这里只为接口对称，不参与推算
     if kind == KIND_OMR:
         opts = [chr(ord("A") + i) for i in range(max(1, int(n_options or 4)))]
         item = {"idx": 1, "options": opts}
@@ -802,9 +807,12 @@ def pngs_to_pdf(png_paths: list, pdf_path: str, title: str = "答题卡") -> str
 
 # ---------------------------------------------------------------- 主入口
 def build_card(manifest: dict, out_dir: str) -> dict:
-    """生成答题卡 → {"pdf", "png": [...], "card": {...}, "manifest": manifest}
+    """生成答题卡 → {"pdf", "png": [...], "card": {...}, "manifest": manifest, "health": {...}}
 
-    card 字段同时合并进传入的 manifest（manifest["card"]），页码接卷面最后一页。
+    * `card` 字段同时合并进传入的 manifest（`manifest["card"]`），页码接卷面最后一页；
+    * `manifest["card"]["version"]` = `CARD_VERSION`（2 = 5×5 编码题号；1 = 旧卡 4×4，只兼容不生成）；
+    * QR payload = `{"pid", "p", "v"}`：`p` 是本卡页序（判卷按它选页），`v` 是卡版本；
+    * **`health` 是返回值，不写进 manifest**（`manifest["card"]["health"]` 一直为空，别去那里找）。
     """
     os.makedirs(out_dir, exist_ok=True)
     # 上游 manifest 字段不全时兜底（idx 缺 → 按顺序补；不影响 manifest 本身）
@@ -837,7 +845,8 @@ def build_card(manifest: dict, out_dir: str) -> dict:
             ]},
             "qr": {
                 "x": QR_POS[0], "y": QR_POS[1], "size": QR_SIZE,
-                "payload": {"pid": str(manifest.get("pid") or ""), "p": i},
+                # p = 本卡页序（判卷按它选页，多页卡必须逐页不同）；v = 卡版本
+                "payload": {"pid": str(manifest.get("pid") or ""), "p": i, "v": CARD_VERSION},
             },
             "headers": list(pg["headers"]),
             "items": [],
@@ -862,7 +871,7 @@ def build_card(manifest: dict, out_dir: str) -> dict:
         "dpi": DPI,
         "w_px": PAGE_W,
         "h_px": PAGE_H,
-        "version": 1,
+        "version": CARD_VERSION,
     }
 
     pngs = []

@@ -43,6 +43,10 @@ OMR_INK_THRESHOLD = 0.35   # 框内墨迹占比下限
 OMR_MARGIN = 0.15          # 与次优框的最小差距
 OMR_INSET_MIN = 5
 
+LEGACY_NEED_PID_MSG = (
+    "这是旧版答题卡（4×4 标识）。旧卡不能只靠题号判：请在上传页填上这份卷子的卷号"
+    "（卷子在本机库里就能判）；没有卷号请重新打印新版答题卡。")
+
 KIND_OMR = card.KIND_OMR
 KIND_FILL = card.KIND_FILL
 KIND_SOLUTION = card.KIND_SOLUTION
@@ -696,12 +700,12 @@ def _grade_by_ids(conn, image_path, out_root):
     pid_hint = (qr_payload or {}).get("pid")
 
     legacy_hits = _quick_legacy_probe(norm)
-    if legacy_hits >= 2:      # 旧卡：先给明确错误，别耗时间扫 5×5
-        return _err("legacy_card", "这张卡是旧版本（4×4 题目标识），请重新打印答题卡。", pid_hint)
+    if legacy_hits >= 2:      # 旧卡：没有卷号就判不了（旧卡标识只编码卷内题序）
+        return _err("legacy_card_need_pid", LEGACY_NEED_PID_MSG, pid_hint)
     scan = scan_id_blocks(norm)
     if not scan["blocks"]:
         if legacy_hits or scan["legacy"]:
-            return _err("legacy_card", "这张卡是旧版本（4×4 标识），请重新打印答题卡。", pid_hint)
+            return _err("legacy_card_need_pid", LEGACY_NEED_PID_MSG, pid_hint)
         return _err("no_question_ids",
                     "标定成功，但没扫到任何题目标识。请确认拍到的是答题卡作答区。", pid_hint)
 
@@ -1031,20 +1035,57 @@ def _warp_photo(image_path):
     return norm, photo_meta, None, "", diag
 
 
-def _looks_legacy(gray, page) -> bool:
-    """第一题的标识位置：5×5 解不出、旧 4×4 解得出来 → 是老卡。"""
-    items = page.get("items") or []
-    if not items:
-        return False
-    b = items[0].get("id_box") or {}
-    if not b:
-        return False
-    x, y = int(b.get("x", 0)), int(b.get("y", 0))
-    kind, bits = _classify_block(gray, x, y, card.ID_GRID, card.ID_CELL)
-    if kind == "bits" and card.decode_id_bits(bits):
-        return False
-    k4, b4 = _classify_block(gray, x, y, 4, 24)
-    return bool(k4 == "bits" and card.legacy_idx_bits(b4) is not None)
+def _read_id_from_photo(gray, box: dict, grid: int):
+    """按 manifest 里那一题的 id_box 坐标，到照片上采样并解码 → idx / no / None。"""
+    try:
+        x, y = int(box.get("x", 0)), int(box.get("y", 0))
+        cell = int(box.get("cell") or card.ID_CELL)
+    except Exception:
+        return None
+    kind, bits = _classify_block(gray, x, y, grid, cell)
+    if kind != "bits" or not bits:
+        return None
+    if grid == card.LEGACY_ID_GRID:
+        return card.legacy_idx_bits(bits)      # 旧卡：卷内题序
+    return card.decode_id_bits(bits)           # 新卡：题号
+
+
+def _check_manifest_ids(gray, page):
+    """抽查前几题的标识，确认拍的就是这份卷子。
+
+    → None(通过) | "legacy"(未知版本) | "mismatch"(不是这张卷)
+    * manifest 是自描述的：判据是 **id_box.bits 的长度**，不是全局常量；
+    * 16 位 = 旧卡（4×4，编码卷内题序 idx）；25 位 = 新卡（5×5，编码题号 no）；
+    * 读不出的跳过，不阻断判分（后面 OMR 自然会给 unsure）。
+    """
+    checked = 0
+    for it in (page.get("items") or [])[:4]:
+        box = it.get("id_box") or {}
+        bits = box.get("bits") or []
+        n = len(bits)
+        if n == 16:
+            got = _read_id_from_photo(gray, box, card.LEGACY_ID_GRID)
+            expect = it.get("idx")
+            same = (got is not None and expect is not None and int(got) == int(expect))
+        elif n == 25:
+            got = _read_id_from_photo(gray, box, card.ID_GRID)
+            expect = it.get("no")
+            same = (got is not None and expect is not None
+                    and str(got).zfill(5) == str(expect).zfill(5))
+        else:
+            return "legacy"
+        if got is None:
+            continue
+        checked += 1
+        if not same:
+            return "mismatch"
+    if checked == 0:
+        # 一个都没读出来：看看是不是「库里是新卡、手上拍的是旧卡」
+        for it in (page.get("items") or [])[:4]:
+            box = it.get("id_box") or {}
+            if _read_id_from_photo(gray, box, card.LEGACY_ID_GRID) is not None:
+                return "legacy"
+    return None
 
 
 def _grade_image(conn, pid, image_path, ocr, out_root):
@@ -1081,10 +1122,15 @@ def _grade_image(conn, pid, image_path, ocr, out_root):
                 page = p
                 break
 
-    # ---- 老卡识别（4×4 idx 版）：明确报 legacy_card，别拿新坐标去套旧卡
-    if _looks_legacy(norm, page):
+    # ---- 版本/串卷校验：看 manifest 每题 id_box.bits 的长度（自描述，不靠全局常量）
+    id_check = _check_manifest_ids(norm, page)
+    if id_check == "legacy":
         return _err("legacy_card",
-                    "这张卡是旧版本（4×4 题目标识），请用当前版本重新打印答题卡。", pid)
+                    "这张卡的题目标识是未知版本（既不是 4×4 也不是 5×5），"
+                    "请用当前版本重新打印答题卡。", pid)
+    if id_check == "mismatch":
+        return _err("pid_mismatch",
+                    "卷号是 %s，但题目标识对不上（拍的不是这份卷子？）" % pid, pid)
 
     sid = _new_sid()
     crop_dir = os.path.join(out_root, str(pid), "sub_%s" % sid)

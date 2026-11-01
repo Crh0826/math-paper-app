@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 <#
 .SYNOPSIS
     打包「数学题库工作台」便携版（PyInstaller onedir + qbank 题库 + 一键 zip）。
@@ -42,7 +42,8 @@ $Root = Split-Path -Parent $App                      # E:\OCR
 $Dist = Join-Path $Root "dist"
 $Work = Join-Path $Root "build"
 $Target = Join-Path $Dist $Name
-$QbankSrc = $Root                                  # E:\OCR\*.docx（只读复制）
+# 题库来源：优先 E:\OCR\qbank（2026-11-01 起的规范布局），老布局才回退到 E:\OCR 根目录
+$QbankSrc = if (Test-Path (Join-Path $Root "qbank")) { Join-Path $Root "qbank" } else { $Root }
 $QbankDst = Join-Path $Target "qbank"
 $ZipPath = Join-Path $Dist ("$Name-$Version.zip")
 
@@ -68,7 +69,7 @@ if (-not $gridMatch.Success) { throw "card.py 里找不到 ID_GRID 常量，无�
 $idGrid = [int]$gridMatch.Groups[1].Value
 if ($idGrid -ne 5) { throw "答题卡标识是 $idGrid×$idGrid，不是 5×5（t46 新版）；打包中止，免得用户装了被判 legacy_card" }
 if ($cardSrc -notmatch 'ID_GRID \* ID_GRID') { throw "card.py 里没有 5×5=25 位的用法（ID_GRID*ID_GRID），疑似旧版；打包中止" }
-Ok "答题卡标识 = 5×5（ID_GRID=5；25 位 = 20 位题号 + 5 位 CRC）"
+Ok "PASS: ID_GRID=5 —— 答题卡标识 = 5×5（25 位 = 20 位题号 + 5 位 CRC），不是 legacy 4×4"
 Step "1) 清理旧产物"
 if (-not $NoClean) {
     foreach ($p in @($Target, (Join-Path $Work $Name))) {

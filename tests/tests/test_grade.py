@@ -1368,8 +1368,8 @@ class TestLegacyCard(unittest.TestCase):
             img.save(fx.filled_png)
             res = grade.grade_by_ids(fx.conn, fx.photo(seed=24),
                                      out_dir=os.path.join(tmp, "out"))
-            self.assertEqual("legacy_card", res.get("error"), res.get("detail"))
-            self.assertIn("旧版本", res.get("detail") or "")
+            self.assertEqual("legacy_card_need_pid", res.get("error"), res.get("detail"))
+            self.assertIn("旧版答题卡", res.get("detail") or "")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1469,6 +1469,107 @@ class TestPhotoDiagnostics(unittest.TestCase):
         diag = grade.diagnose(photo)["diag"]
         self.assertIn("missing_corner", [diag["suggest"]])
         self.assertIn("四角", diag["suggest_text"])
+
+
+class TestLegacyCardSupport(unittest.TestCase):
+    """回归：旧版 4×4 答题卡在「卷号在库」时必须照常判分（v1.2 硬伤修复）。
+
+    判据看 manifest 每题 id_box.bits 的长度：16=旧卡（卷内题序）、25=新卡（题号）。
+    """
+
+    APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    DB = os.path.join(APP, "data", "app.db")
+    REAL_PHOTO = os.path.join(APP, "out", "P20261031-007",
+                              "sub_S20261031-205422-c1227f", "source.jpg")
+    LEGACY_PID = "P20261031-007"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="legacy_ok_")
+        if not (os.path.exists(self.DB) and os.path.exists(self.REAL_PHOTO)):
+            self.skipTest("没有真实老卡样张/产品库")
+        self.db_path = os.path.join(self.tmp, "db.sqlite")
+        src = sqlite3.connect(self.DB)
+        dst = sqlite3.connect(self.db_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        self.conn = db.connect(self.db_path)
+
+    def tearDown(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _manifest(self, pid=LEGACY_PID):
+        row = self.conn.execute("SELECT manifest FROM papers WHERE pid=?", (pid,)).fetchone()
+        return json.loads(row["manifest"]) if row else None
+
+    def _save_manifest(self, manifest, pid=LEGACY_PID):
+        self.conn.execute("UPDATE papers SET manifest=? WHERE pid=?",
+                          (json.dumps(manifest, ensure_ascii=False), pid))
+        self.conn.commit()
+
+    def test_real_legacy_photo_grades(self):
+        """真实老照片必须判出来，且复现历史分数 1/2。"""
+        res = grade.grade_image(self.conn, self.LEGACY_PID, self.REAL_PHOTO,
+                                out_dir=os.path.join(self.tmp, "out"))
+        self.assertIsNone(res.get("error"), res.get("detail"))
+        self.assertEqual(1, res.get("score"), "历史记录是 1/2，必须复现")
+        self.assertEqual(2, res.get("full"))
+        kinds = [u["kind"] for u in res["items"]]
+        self.assertIn("omr", kinds)
+
+    def test_legacy_manifest_bits_are_16(self):
+        m = self._manifest()
+        self.assertEqual(1, m["card"].get("version"))
+        for it in m["card"]["pages"][0]["items"]:
+            self.assertEqual(16, len(it["id_box"]["bits"]), "旧卡标识是 16 位")
+
+    def test_legacy_without_manifest_needs_pid(self):
+        """卷号不在库 + 旧卡 → legacy_card_need_pid（而不是 legacy_card）。"""
+        res = grade.grade_image(self.conn, "P-NOT-IN-DB", self.REAL_PHOTO,
+                                out_dir=os.path.join(self.tmp, "out"))
+        self.assertEqual("legacy_card_need_pid", res.get("error"), res.get("detail"))
+        self.assertIn("卷号", res.get("detail") or "")
+
+    def test_grade_by_ids_on_legacy_needs_pid(self):
+        res = grade.grade_by_ids(self.conn, self.REAL_PHOTO,
+                                 out_dir=os.path.join(self.tmp, "out"))
+        self.assertEqual("legacy_card_need_pid", res.get("error"))
+        self.assertIn("旧版答题卡", res.get("detail") or "")
+
+    def test_new_card_still_grades(self):
+        """新卡（25 位）不受影响。"""
+        fx = Fixture(os.path.join(self.tmp, "fx"))
+        try:
+            res = grade.grade_image(fx.conn, T_PID, fx.photo(seed=71),
+                                    out_dir=os.path.join(self.tmp, "o_new"))
+            self.assertIsNone(res.get("error"), res.get("detail"))
+            self.assertEqual(3, res.get("score"))
+        finally:
+            fx.close()
+
+    def test_legacy_idx_mismatch_is_pid_mismatch(self):
+        """16 位标识解出的题序与 manifest 不符 → pid_mismatch（拍的确实是别的卷）。"""
+        m = self._manifest()
+        m["card"]["pages"][0]["items"][0]["idx"] = 99
+        self._save_manifest(m)
+        res = grade.grade_image(self.conn, self.LEGACY_PID, self.REAL_PHOTO,
+                                out_dir=os.path.join(self.tmp, "out"))
+        self.assertEqual("pid_mismatch", res.get("error"), res.get("detail"))
+
+    def test_unknown_bit_length_is_legacy_card(self):
+        """既不是 16 也不是 25（这里造 12 位）→ legacy_card。"""
+        m = self._manifest()
+        m["card"]["pages"][0]["items"][0]["id_box"]["bits"] = [0, 1, 0, 1] * 3
+        self._save_manifest(m)
+        res = grade.grade_image(self.conn, self.LEGACY_PID, self.REAL_PHOTO,
+                                out_dir=os.path.join(self.tmp, "out"))
+        self.assertEqual("legacy_card", res.get("error"), res.get("detail"))
 
 
 if __name__ == "__main__":
