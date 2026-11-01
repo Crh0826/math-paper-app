@@ -79,18 +79,18 @@
       <div class="grid grid-2">
         <label class="field">
           <span class="field-label">PaddleOCR-VL Token</span>
-          <input type="password" name="token" autocomplete="off"
+          <input type="password" name="pv_token" autocomplete="off"
                  placeholder="{% if info.paddle_vl.token_present %}已配置 · 尾号 {{ info.paddle_vl.token_tail }}（留空=不改）{% else %}粘贴 token{% endif %}">
           <span class="field-hint">留空 = 不修改；点下面的「清除」才会删掉。</span>
         </label>
         <label class="field">
           <span class="field-label">模型</span>
-          <input type="text" name="model" value="{{ info.paddle_vl.model or 'PaddleOCR-VL-1.6' }}" autocomplete="off">
+          <input type="text" name="pv_model" value="{{ info.paddle_vl.model or 'PaddleOCR-VL-1.6' }}" autocomplete="off">
         </label>
       </div>
       <label class="field">
         <span class="field-label">任务地址（job_url）</span>
-        <input type="text" name="job_url" value="{{ info.paddle_vl.job_url or 'https://paddleocr.aistudio-app.com/api/v2/ocr/jobs' }}" autocomplete="off">
+        <input type="text" name="pv_job_url" value="{{ info.paddle_vl.job_url or 'https://paddleocr.aistudio-app.com/api/v2/ocr/jobs' }}" autocomplete="off">
       </label>
       <button class="btn" type="submit" name="clear" value="paddle_vl">清除 PaddleOCR-VL Token</button>
     </div>
@@ -99,18 +99,18 @@
       <div class="grid grid-2">
         <label class="field">
           <span class="field-label">Base URL（OpenAI 兼容）</span>
-          <input type="text" name="base_url" value="{{ info.vlm.base_url or '' }}" placeholder="https://api.example.com" autocomplete="off">
+          <input type="text" name="vlm_base_url" value="{{ info.vlm.base_url or '' }}" placeholder="https://api.example.com" autocomplete="off">
         </label>
         <label class="field">
           <span class="field-label">API Key</span>
-          <input type="password" name="key" autocomplete="off"
+          <input type="password" name="vlm_key" autocomplete="off"
                  placeholder="{% if info.vlm.key_present %}已配置 · 尾号 {{ info.vlm.key_tail }}（留空=不改）{% else %}粘贴 key{% endif %}">
         </label>
       </div>
       <div class="grid grid-2">
         <label class="field">
           <span class="field-label">模型名</span>
-          <input type="text" name="model" value="{{ info.vlm.model or '' }}" placeholder="如 gpt-4o-mini / qwen-vl-max" autocomplete="off">
+          <input type="text" name="vlm_model" value="{{ info.vlm.model or '' }}" placeholder="如 deepseek-flash / qwen-vl-max / gpt-4o-mini" autocomplete="off">
         </label>
       </div>
       <button class="btn" type="submit" name="clear" value="vlm">清除视觉模型 Key</button>

@@ -2160,20 +2160,31 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
         ocr_cfg["backend"] = backend
         clear = str(form.get("clear") or "").strip()
 
-        def _text(key: str) -> str:
-            return str(form.get(key) or "").strip()
+        def _text(key: str, legacy: str = "") -> str:
+            """取表单值；新名字优先，老名字兜底（模板已改成 pv_*/vlm_* 前缀）。
+
+            以前两个后端各有一个 `name="model"` 输入框，同名字段会让"保存"取到另一个
+            后端的值 —— 视觉模型的 deepseek-flash 被写进 PaddleOCR-VL 的 model，
+            云端从此一直返回"没有可用的块"。改成前缀命名，物理上不可能串。
+            """
+            val = str(form.get(key) or "").strip()
+            if not val and legacy:
+                val = str(form.get(legacy) or "").strip()
+            return val
 
         if backend == "paddle_vl":
             pv = ocr_cfg.get("paddle_vl") if isinstance(ocr_cfg.get("paddle_vl"), dict) else {}
             # 模型名护栏：PaddleOCR-VL 的 job 只认 PaddleOCR-VL-*。填成别的（例如把
             # 视觉模型的 deepseek-flash 填进来）云端会一直返回"没有可用的块"，
             # 用户看到的就是"识别服务暂时无响应、整批待确认"——当场拒绝，别让它发生。
-            model_in = _text("model")
+            model_in = _text("pv_model", "model")
             if model_in and "paddle" not in model_in.lower():
                 ctx = _settings_ctx(status_code=400, notice={
                     "kind": "bad",
-                    "text": ("模型名不对：PaddleOCR-VL 云端只接受 PaddleOCR-VL-* 系列"
+                    "text": ("PaddleOCR-VL 的模型名不对：只接受 PaddleOCR-VL-* 系列"
                              "（例如 PaddleOCR-VL-1.6）。填 %r 云端会返回空结果，没保存。"
+                             "用 DeepSeek 的视觉模型请把上面的「识别后端」切到"
+                             "「视觉模型（OpenAI 兼容）」再填到那一栏。"
                              % model_in),
                 })
                 ctx.pop("status_code", None)
@@ -2181,21 +2192,23 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
                               nav_active="settings", **ctx)
             if clear == "paddle_vl":
                 pv["token"] = ""
-            elif _text("token"):
-                pv["token"] = _text("token")
-            for key in ("model", "job_url"):
-                if _text(key):
-                    pv[key] = _text(key)
+            elif _text("pv_token", "token"):
+                pv["token"] = _text("pv_token", "token")
+            for new, old in (("pv_model", "model"), ("pv_job_url", "job_url")):
+                val = _text(new, old)
+                if val:
+                    pv[old] = val
             ocr_cfg["paddle_vl"] = pv
         elif backend == "vlm":
             vlm = ocr_cfg.get("vlm") if isinstance(ocr_cfg.get("vlm"), dict) else {}
             if clear == "vlm":
                 vlm["key"] = ""
-            elif _text("key"):
-                vlm["key"] = _text("key")
-            for key in ("base_url", "model"):
-                if _text(key):
-                    vlm[key] = _text(key)
+            elif _text("vlm_key", "key"):
+                vlm["key"] = _text("vlm_key", "key")
+            for new, old in (("vlm_base_url", "base_url"), ("vlm_model", "model")):
+                val = _text(new, old)
+                if val:
+                    vlm[old] = val
             ocr_cfg["vlm"] = vlm
         cfg["ocr"] = ocr_cfg
         _write_cfg_json(cfg)
