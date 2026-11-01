@@ -155,7 +155,13 @@ FONT_SIZE_HEADER = 10
 FONT_SIZE_FOOTER = 8
 LINE_SPACE_PT = 24         # 书写留白每段的高度（≈0.85cm，够手写一行）
 TABLE_STYLE = "Table Grid"
-SRC_ROOT = r"E:\OCR"
+#: 题目 docx 所在目录：走 paths 解析（MATH_APP_QBDIR / config.paths.qbank / 老路径 / 程序目录），
+#: 不再写死 E:\OCR —— 2026-11-01 题库搬进 E:\OCR\qbank 后，写死就会报「题目 docx 不存在」。
+try:
+    import paths as _paths
+    SRC_ROOT = _paths.resolve_qbank(legacy=_paths.LEGACY_QBANK)
+except Exception:                      # noqa: BLE001 - 极端情况下退回老路径，别让 import 挂
+    SRC_ROOT = r"E:\OCR"
 
 #: 题型默认留白段数：卷面只印题、作答在答题卡上（用户已定），所以默认全 0。
 #: 老师想要"卷面草稿区"时用 params.space 单独调大（CONTRACT §2）。
