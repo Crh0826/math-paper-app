@@ -185,11 +185,19 @@ def _open_ro(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def read_kps(conn: sqlite3.Connection) -> list[dict]:
-    """章节/知识点选择器的数据源（契约指定的那条 SQL）。"""
-    rows = conn.execute(
-        "SELECT chapter, kp_id, kp, n_questions FROM kps ORDER BY chapter, kp_id"
-    ).fetchall()
+def read_kps(conn: sqlite3.Connection, subject_pk: str = "") -> list[dict]:
+    """章节/知识点选择器的数据源（契约指定的那条 SQL）。
+
+    t11：给 subject_pk 就只列这一学科的章节 —— 15 万题是 7 科混在一个库里的，
+    不按学科过滤会出现「数学卷里勾到语文知识点」。空 = 不限（老行为）。
+    """
+    sql = "SELECT chapter, kp_id, kp, n_questions FROM kps"
+    args = []
+    if subject_pk:
+        sql += " WHERE subject_pk=?"
+        args.append(str(subject_pk))
+    sql += " ORDER BY chapter, kp_id"
+    rows = conn.execute(sql, args).fetchall()
     out = []
     for r in rows:
         out.append({
@@ -199,6 +207,43 @@ def read_kps(conn: sqlite3.Connection) -> list[dict]:
             "n_questions": int(r["n_questions"] or 0),
         })
     return out
+
+
+def read_subjects(conn: sqlite3.Connection) -> list[dict]:
+    """学科下拉的数据源：questions 里真实存在的学科 + subjects 表里的名字/年级/版本 + 题量。
+
+    以 questions 为准（有题的学科才列出来）；subjects 表缺行时名字留空，前端退回 subject_pk。
+    排序：题多的在前 —— 下拉默认选第一个，也就是「题库里最主要的那一科」。
+    """
+    sql = """
+        SELECT q.subject_pk AS subject_pk,
+               COUNT(*) AS n,
+               COALESCE(s.name, '') AS name,
+               COALESCE(s.grade, '') AS grade,
+               COALESCE(s.version, '') AS version
+        FROM questions q
+        LEFT JOIN subjects s ON s.subject_pk = q.subject_pk
+        GROUP BY q.subject_pk
+        ORDER BY n DESC, q.subject_pk
+    """
+    try:
+        rows = conn.execute(sql).fetchall()
+    except sqlite3.Error:
+        return []
+    return [{"subject_pk": r["subject_pk"], "name": r["name"],
+             "grade": r["grade"], "version": r["version"],
+             "n_questions": int(r["n"] or 0)} for r in rows]
+
+
+def subject_label(s: dict) -> str:
+    """下拉里的显示文本：「数学 · 七年级上 · 沪科版（22,898 题）」。"""
+    parts = [s.get("name") or s.get("subject_pk") or ""]
+    for key in ("grade", "version"):
+        if s.get(key):
+            parts.append(str(s[key]))
+    label = " · ".join(p for p in parts if p)
+    n = int(s.get("n_questions") or 0)
+    return "%s（%s 题）" % (label, f"{n:,}") if n else label
 
 
 def group_chapters(kps: list[dict]) -> list[dict]:
@@ -419,7 +464,17 @@ def load_ocr_config(config_path: str | None = None) -> dict:
                   "key_tail": _tail(vlm_key),
                   "base_url": (ocr.get("vlm") or {}).get("base_url"),
                   "model": (ocr.get("vlm") or {}).get("model")}
+    # GLM-OCR（智谱版面解析）：没单独配 key 就沿用视觉模型那个 key
+    glm_cfg = ocr.get("glm_ocr") or {}
+    glm_key = os.environ.get("OCR_GLM_KEY") or glm_cfg.get("key") or vlm_key
+    out["glm_ocr"] = {"key_present": bool(str(glm_key or "").strip()),
+                      "key_tail": _tail(glm_key),
+                      "key_shared": not bool(str(glm_cfg.get("key") or "").strip()),
+                      "url": glm_cfg.get("url") or "https://open.bigmodel.cn/api/paas/v4/layout_parsing",
+                      "model": glm_cfg.get("model") or "glm-ocr",
+                      "fallback": bool(glm_cfg.get("fallback", True))}
     out["backend_label"] = {
+        "glm_ocr": "智谱 GLM-OCR（版面解析）",
         "paddle_vl": "PaddleOCR-VL 云端",
         "vlm": "视觉模型（OpenAI 兼容）",
         "local": "本机离线 OCR",
@@ -821,8 +876,21 @@ def collect_health(db_path: str, config_path: str | None = None,
         checks.append(_check("ocr", "OCR 后端（填空/解答识别）", "ok",
                              "manual：填空/解答裁切图留人工确认（选择题走 OMR，不受影响）"))
     else:
+        # 模型名按后端取：glm_ocr 用 glm-ocr、vlm 用视觉模型名、paddle 用 PaddleOCR-VL
+        _bk = str(ocr["backend"])
+        if _bk == "glm_ocr":
+            _model = (ocr.get("glm_ocr") or {}).get("model") or "glm-ocr"
+            _tail_txt = ("（key 尾号 %s）" % ocr["glm_ocr"]["key_tail"]
+                         if (ocr.get("glm_ocr") or {}).get("key_tail") else "")
+        elif _bk == "vlm":
+            _model = (ocr.get("vlm") or {}).get("model") or "-"
+            _tail_txt = ("（key 尾号 %s）" % ocr["vlm"]["key_tail"]
+                         if (ocr.get("vlm") or {}).get("key_tail") else "")
+        else:
+            _model = ocr.get("model") or "-"
+            _tail_txt = ""
         checks.append(_check("ocr", "OCR 后端（填空/解答识别）", "ok",
-                             f"{ocr['backend']} · 模型 {ocr.get('model') or '-'} · token 已配置"))
+                             f"{ocr.get('backend_label') or _bk} · 模型 {_model} · 已配置{_tail_txt}"))
 
     for key, label, info in (("data_dir", "数据目录", data_dir), ("out_dir", "产物目录", out_dir)):
         if info["writable"]:
@@ -957,6 +1025,8 @@ def _values_from_pairs(pairs, *, need_answer_default: bool = True) -> dict:
         "chapters": many("chapters"),
         "kps": many("kps"),
         "kp_mode": kp_mode if kp_mode in ("any", "all") else "any",
+        "subject_pk": one("subject_pk").strip(),
+        "subjects": [s for s in many("subjects")],
         "need_answer": need_answer,
         "exclude_empty": True,
         "layout": layout,
@@ -979,12 +1049,24 @@ def _space_from_values(values: dict) -> dict:
 
 def _params_from_values(values: dict) -> dict:
     """表单值 → 契约 §2 的组卷参数（picker.build / count_available 直接吃）。"""
+    scope = {"chapters": list(values["chapters"]),
+             "kps": list(values["kps"]),
+             "kp_mode": values["kp_mode"]}
+    #: t11 · 学科过滤：组卷页下拉传 subject_pk（单选）；接口也可传 subjects（多选）。
+    if values.get("subject_pk"):
+        scope["subject_pk"] = values["subject_pk"]
+        if values["subject_pk"] not in scope.get("subjects", []):
+            scope["subjects"] = [values["subject_pk"]] + list(scope.get("subjects") or [])
+    if values.get("subjects"):
+        merged = list(scope.get("subjects") or [])
+        for s in values["subjects"]:
+            if s not in merged:
+                merged.append(s)
+        scope["subjects"] = merged
     return {
         "title": values["title"],
         "mix": {qtype: int(values[field]) for qtype, field in MIX_FIELDS},
-        "scope": {"chapters": list(values["chapters"]),
-                  "kps": list(values["kps"]),
-                  "kp_mode": values["kp_mode"]},
+        "scope": scope,
         "requirements": {"need_answer": bool(values["need_answer"]),
                          "exclude_empty": True},
         "seed": int(values["seed"]) if values.get("seed") is not None
@@ -1282,16 +1364,22 @@ def _defaults(stats: list[dict]) -> dict:
         "mix": mix,
         "total": sum(mix.values()),
         "kp_mode": "any",
+        "subject_pk": "",
+        "subjects": [],
     }
 
 
 def _index_context(dbp: str, values: dict | None = None) -> dict:
     """打开只读库，取选择器数据 + 各题型「可出多少题」；失败时抛给调用方翻成 banner。"""
-    values = values or _values_from_pairs([])
+    values = dict(values or _values_from_pairs([]))
     conn = _open_ro(dbp)
     warnings: list[dict] = []
     try:
-        kps = read_kps(conn)
+        subject_rows = [{**s, "label": subject_label(s)} for s in read_subjects(conn)]
+        # t11：学科下拉默认必选一个 —— 15 万题是 7 科混库，不选学科就会跨学科混卷
+        if not values.get("subject_pk") and not values.get("subjects") and subject_rows:
+            values["subject_pk"] = subject_rows[0]["subject_pk"]
+        kps = read_kps(conn, values.get("subject_pk") or "")
         stats = read_qtype_stats(conn)
         n_questions = int(conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0])
         n_families = 0
@@ -1305,19 +1393,34 @@ def _index_context(dbp: str, values: dict | None = None) -> dict:
         except Exception as exc:  # noqa: BLE001 - 可出题量算不出来不该挡住组卷页
             if exc.__class__.__name__ == "ScopeError":
                 warnings.append(_banner(
-                    "选的知识点已经不在库里",
-                    "题库重建过，页面上带的旧知识点失效了；已按全库重新计算可出题量。",
-                    ["刷新页面重新勾选", "都不勾 = 全库不限制"], code="scope_stale"))
+                    "选的学科/知识点已经不在库里",
+                    "题库重建过，页面上带的旧学科或旧知识点失效了；已按当前学科重算可出题量。",
+                    ["刷新页面重新勾选", "都不勾 = 该学科下不限制", str(exc)],
+                    code="scope_stale"))
                 values = dict(values, kps=[], chapters=[])
                 try:
                     available = _count_available(conn, values)
                 except Exception:
-                    available = None
+                    # 连学科本身都没了：退到「不限学科」，别让页面一直红着
+                    values = dict(values, subject_pk="", subjects=[])
+                    try:
+                        available = _count_available(conn, values)
+                    except Exception:
+                        available = None
             else:
                 warnings.append(_banner(
                     "算不出可出题量",
                     f"{exc.__class__.__name__}: {exc}",
                     ["先看自检页 /health：数据库是否正常、表是否齐"], code="count_failed"))
+        if not subject_rows:
+            items_n = int(conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0])
+            if items_n:
+                warnings.append(_banner(
+                    "题库里没有学科信息",
+                    "questions.subject_pk 全为空，组卷页装不出学科下拉（会退回全库范围）。",
+                    ["跑一次 build_db.py 补 subject_pk", "或重新导入题库（importers 会写 subject_pk）"],
+                    code="subjects_empty"))
+            kps = read_kps(conn)                 # 没有学科时分不清，退回全库
     finally:
         conn.close()
     chapters = group_chapters(kps)
@@ -1334,6 +1437,7 @@ def _index_context(dbp: str, values: dict | None = None) -> dict:
         "stats": stats,
         "defaults": _defaults(stats),
         "values": values,
+        "subjects": subject_rows,
         "available": available,
         "db_summary": {"questions": n_questions,
                        "kps": len(kps), "families": n_families},
@@ -1414,6 +1518,9 @@ def _preview_ctx(out_root: str, pid: str, row, kp_map: dict) -> dict:
         "n_choice": int(mix.get("选择") or 0),
         "n_fill": int(mix.get("填空") or 0),
         "n_solution": int(mix.get("解答") or 0),
+        # t11：换一套题也留在同一学科（否则「同参数」会变成跨学科换题）
+        "subject_pk": scope.get("subject_pk") or "",
+        "subjects": list(scope.get("subjects") or []),
         "chapters": list(scope.get("chapters") or []),
         "kps": list(scope.get("kps") or []),
         "kp_mode": scope.get("kp_mode") or "any",
@@ -1457,6 +1564,8 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
     out_root = os.path.abspath(out_dir or os.environ.get("MATH_APP_OUT") or OUT_DIR)
 
     app = FastAPI(title=APP_TITLE, version=APP_VERSION, docs_url=None, redoc_url=None)
+    # 记住进程启动时刻：/healthz 用它和代码 mtime 比较，提醒"改了代码没重启"
+    app.state.proc_started_ts = time.time()
     app.state.db_path = dbp
     app.state.config_path = cfp
     app.state.out_dir = out_root
@@ -2076,6 +2185,8 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
 
     # ---------------------------------------------------------------- 设置（OCR / AI Key）
     OCR_BACKENDS = (
+        ("glm_ocr", "智谱 GLM-OCR（版面解析）",
+         "公式/手写最准：把作答格贴成一页纸发给 GLM-OCR，读不出时自动用下面的视觉模型兜底"),
         ("paddle_vl", "PaddleOCR-VL 云端", "把作答格拼图发给 PaddleOCR-VL，识别质量最好"),
         ("vlm", "视觉模型（OpenAI 兼容）", "自己填 base_url + key + 模型名，走兼容 OpenAI 的视觉接口"),
         ("local", "本机离线（Windows OCR）", "不联网，识别质量一般，胜在隐私与零配置"),
@@ -2172,7 +2283,19 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
                 val = str(form.get(legacy) or "").strip()
             return val
 
-        if backend == "paddle_vl":
+        if backend == "glm_ocr":
+            glm = ocr_cfg.get("glm_ocr") if isinstance(ocr_cfg.get("glm_ocr"), dict) else {}
+            if clear == "glm_ocr":
+                glm["key"] = ""
+            elif _text("glm_key"):
+                glm["key"] = _text("glm_key")
+            for new, old in (("glm_model", "model"), ("glm_url", "url")):
+                val = _text(new, old)
+                if val:
+                    glm[old] = val
+            glm.setdefault("fallback", True)
+            ocr_cfg["glm_ocr"] = glm
+        elif backend == "paddle_vl":
             pv = ocr_cfg.get("paddle_vl") if isinstance(ocr_cfg.get("paddle_vl"), dict) else {}
             # 模型名护栏：PaddleOCR-VL 的 job 只认 PaddleOCR-VL-*。填成别的（例如把
             # 视觉模型的 deepseek-flash 填进来）云端会一直返回"没有可用的块"，
@@ -2312,7 +2435,38 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
             lan.pop("pin", None)
         payload["lan"] = lan
         payload["lan_url"] = app.state.lan_url      # 兼容只读这个字段的老脚本
+        payload["code"] = _code_freshness()        # 代码是否比进程新（改了代码没重启）
         return payload
+
+    def _code_freshness() -> dict:
+        """比较"进程启动时间"和"代码最后修改时间"：改完没重启时页面要提醒。
+
+        2026-11-01 踩过：ocr.py 改了 vlm 的 URL 拼接，但服务是 15 分钟前起的，
+        于是判卷一直 vlm->manual，用户以为是识别服务坏了。
+        """
+        newest, newest_file = 0.0, ""
+        for name in os.listdir(BASE_DIR):
+            p = os.path.join(BASE_DIR, name)
+            if not os.path.isfile(p):
+                continue
+            if not name.endswith((".py", ".ps1", ".html", ".json")):
+                continue
+            try:
+                m = os.path.getmtime(p)
+            except OSError:
+                continue
+            if m > newest:
+                newest, newest_file = m, name
+        started = getattr(app.state, "proc_started_ts", None) or time.time()
+        stale = newest > started + 1
+        return {
+            "process_started": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)),
+            "code_modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(newest)) if newest else "",
+            "newest_file": newest_file,
+            "stale": bool(stale),
+            "hint": ("代码在服务启动后被改过：%s —— 改的是程序逻辑时必须重启服务才生效"
+                     % newest_file) if stale else "",
+        }
 
     @app.get("/healthz")
     def healthz(request: Request):  # noqa: ANN202

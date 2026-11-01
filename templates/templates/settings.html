@@ -75,6 +75,29 @@
       </label>
     </div>
 
+    <div class="backend-fields" id="fields-glm_ocr" hidden>
+      <div class="grid grid-2">
+        <label class="field">
+          <span class="field-label">GLM-OCR API Key（智谱）</span>
+          <input type="password" name="glm_key" autocomplete="off"
+                 placeholder="{% if info.glm_ocr.key_present %}已配置 · 尾号 {{ info.glm_ocr.key_tail }}{% if info.glm_ocr.key_shared %}（沿用视觉模型的 key）{% endif %}（留空=不改）{% else %}粘贴智谱 API Key{% endif %}">
+          <span class="field-hint">留空 = 不改；可以和上面的视觉模型共用同一把 key。</span>
+        </label>
+        <label class="field">
+          <span class="field-label">模型</span>
+          <input type="text" name="glm_model" value="{{ info.glm_ocr.model or 'glm-ocr' }}" autocomplete="off">
+        </label>
+      </div>
+      <label class="field">
+        <span class="field-label">接口地址</span>
+        <input type="text" name="glm_url" value="{{ info.glm_ocr.url or 'https://open.bigmodel.cn/api/paas/v4/layout_parsing' }}" autocomplete="off">
+      </label>
+      <p class="field-hint">
+        GLM-OCR 是版面解析模型：作答格会先贴成「一页纸」再发过去（单行小图它读不出来）；
+        读不出时自动用上面的视觉模型兜底，不会整批变待确认。
+      </p>
+    </div>
+
     <div class="backend-fields" id="fields-paddle_vl" hidden>
       <div class="grid grid-2">
         <label class="field">

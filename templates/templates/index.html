@@ -55,6 +55,8 @@
   字段 → 契约 §2 参数映射（server._params_from_values 负责真正的转换）：
     title                              → params.title
     n_choice / n_fill / n_solution     → params.mix {"选择","填空","解答"}
+    subject_pk（单选，默认必选一个）   → params.scope.subject_pk（t11：7 科混库，防跨学科混卷）
+    subjects（多选，接口用）           → params.scope.subjects
     chapters（多选，空=不限）          → params.scope.chapters
     kps（多选，空=不限）               → params.scope.kps（勾章会自动联带勾上该章知识点）
     kp_mode                            → params.scope.kp_mode（any/all）
@@ -62,6 +64,27 @@
     seed                               → params.seed
 #}
 <form class="form" id="paper-form" method="post" action="/papers" novalidate>
+
+  <section class="card" id="subject">
+    <h2>学科</h2>
+    {% if subjects %}
+    <label class="field">
+      <span class="field-label">学科（必选）</span>
+      <select name="subject_pk" required>
+        {% for s in subjects %}
+        <option value="{{ s.subject_pk }}"{% if s.subject_pk == values.subject_pk %} selected{% endif %}>{{ s.label }}</option>
+        {% endfor %}
+      </select>
+      <span class="field-hint">
+        章节、知识点、「可出 N 题」都按这个学科算；<strong>不同学科的题不会混进同一份卷子</strong>。
+      </span>
+    </label>
+    {% else %}
+    {# 没有学科信息的老库：保持老行为（全库范围），但把参数显式带上，别让表单字段消失 #}
+    <input type="hidden" name="subject_pk" value="">
+    <p class="muted">题库里还没有学科信息（questions.subject_pk 为空），本次按全库范围组卷。</p>
+    {% endif %}
+  </section>
 
   <section class="card">
     <h2>卷面</h2>
@@ -107,7 +130,7 @@
     <h2>范围</h2>
     {% if chapters %}
     <p class="field-hint">
-      勾选章节 = 勾上该章全部知识点（两者会一起提交，章节非空时以章节为准）；都不勾 = 全库不限制。
+      勾选章节 = 勾上该章全部知识点（两者会一起提交，章节非空时以章节为准）；都不勾 = 该学科下不限制。
       标「仅 N 题」的知识点题量很少（少于 20），填的数量别超过这个数，否则会抽不满。
     </p>
     <div class="chapter-list">

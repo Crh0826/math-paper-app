@@ -67,7 +67,7 @@ import urllib.error  # noqa: E402
 import urllib.request  # noqa: E402
 
 # ---------------------------------------------------------------- 常量
-BACKENDS = ("manual", "vlm", "paddle_vl", "local")
+BACKENDS = ("manual", "vlm", "glm_ocr", "paddle_vl", "local")
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 EXAMPLE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.example.json")
@@ -345,6 +345,73 @@ def as_page_image(raw: bytes) -> tuple:
         return raw, "crop.png"
 
 
+def page_data_uri(path: str) -> str:
+    """把作答格贴到"一页纸"画布上，返回 data URI（GLM-OCR / 版面模型都吃这一套）。
+
+    实测：GLM-OCR 对 578×106 的单行小图直接返回空；贴到 1000×1400 白底后能读。
+    """
+    from PIL import Image          # 局部 import：没装 pillow 时上层会走兜底
+    import io
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        cw, ch = 1000, 1400
+        scale = min(1.0, (cw * 0.9) / max(1, im.width))
+        if scale < 1.0:
+            im = im.resize((max(1, int(im.width * scale)), max(1, int(im.height * scale))),
+                           Image.LANCZOS)
+        canvas = Image.new("RGB", (cw, ch), "white")
+        canvas.paste(im, ((cw - im.width) // 2, int(ch * 0.12)))
+        buf = io.BytesIO()
+        canvas.save(buf, "PNG")
+    import base64
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+#: LaTeX / Markdown 片段 → 纯文本
+_LATEX_TOKENS = (
+    (r"\frac", ""), (r"\dfrac", ""), (r"\tfrac", ""), (r"\pi", "π"), (r"\times", "×"),
+    (r"\cdot", "×"), (r"\div", "÷"), (r"\left", ""), (r"\right", ""), (r"\sqrt", "sqrt"),
+    (r"\leq", "≤"), (r"\geq", "≥"), (r"\neq", "≠"), (r"\,", " "), (r"\;", " "), (r"\!", ""),
+)
+
+
+def latex_to_plain(md: str) -> str:
+    """GLM-OCR 输出的是 Markdown + LaTeX，压成"一行人能读的答案"。
+
+    `## $ \\frac{2011}{2012} $`            → `2011/2012`
+    `$$ x = \\frac {3}{2} $$`              → `x = 3/2`
+    `- $ \\pi $; -100; $ -2\\frac{5}{7} $` → `-π; -100; -2 5/7`   ← 带分数不能被并成 -25/7
+    """
+    t = md or ""
+    t = re.sub(r"<[^>]+>", "", t)                  # div 之类
+    t = t.replace("&nbsp;", " ").replace("$$", "$")
+    # 带分数 A\frac{B}{C} → A B/C（必须先于普通分数处理）
+    for _ in range(3):
+        t2 = re.sub(r"(-?\d+)\s*\\(?:d|t)?frac\s*\{\s*([^{}]*?)\s*\}\s*\{\s*([^{}]*?)\s*\}",
+                    r"\1 \2/\3", t)
+        if t2 == t:
+            break
+        t = t2
+    # 普通分数 \frac{a}{b} → a/b（可嵌套一层）
+    for _ in range(3):
+        t2 = re.sub(r"\\(?:d|t)?frac\s*\{\s*([^{}]*?)\s*\}\s*\{\s*([^{}]*?)\s*\}", r"\1/\2", t)
+        if t2 == t:
+            break
+        t = t2
+    for k, v in _LATEX_TOKENS:
+        t = t.replace(k, v)
+    t = t.replace("$", "").replace("\\", "")
+    # GLM-OCR 有时把数字逐位拆开写（`2 0 1 1`）→ 合回去；
+    # 但只合并"连续 ≥3 个单数字"的串，否则会把带分数 `-2 5/7` 并成 `-25/7`
+    t = re.sub(r"(?<![\d.])(\d(?:\s+\d){2,})(?![\d.])",
+               lambda m: m.group(1).replace(" ", ""), t)
+    t = re.sub(r"(?<=\d)\.\s+(?=\d)", ".", t)
+    t = re.sub(r"^\s*#+\s*", "", t, flags=re.M)     # markdown 标题
+    lines = [ln.strip(" \t-*#") for ln in t.splitlines()]
+    lines = [ln for ln in lines if ln and ln not in ("---", "***")]
+    return ", ".join(lines) if len(lines) > 1 else (lines[0] if lines else "")
+
+
 def _multipart(fields: dict, files: list):
 
     """files=[(name, filename, data, content_type)] → (body, content_type)。"""
@@ -427,6 +494,15 @@ class Recognizer:
         self.vlm_retries = int(ov.get("vlm_retries") if ov.get("vlm_retries") is not None
                                else ocr_cfg.get("vlm_retries", 1))
 
+        # ---- glm_ocr（智谱 GLM-OCR 版面解析：POST /layout_parsing，file 传 data URI）
+        go = (ocr_cfg.get("glm_ocr") or {})
+        self.glm_key = str(pick("glm_key", ("OCR_GLM_KEY",), go.get("key"), "")
+                           or self.key)          # 没单独填就沿用 vlm 的 key
+        self.glm_url = str(pick("glm_url", ("OCR_GLM_URL",), go.get("url"),
+                                "https://open.bigmodel.cn/api/paas/v4/layout_parsing"))
+        self.glm_model = str(pick("glm_model", ("OCR_GLM_MODEL",), go.get("model"), "glm-ocr"))
+        self.glm_fallback = bool(go.get("fallback", True))   # 读不出时用 vlm 兜底
+
     # ------------------------------------------------------------ read
     def read(self, image_path: str, kind: str = None) -> dict:
         """识别单个作答格 → {"text","confidence","backend"}；永不抛异常。"""
@@ -435,6 +511,8 @@ class Recognizer:
                 return _manual()
             if self.backend == "vlm":
                 return self._vlm_guarded(image_path, kind)
+            if self.backend == "glm_ocr":
+                return self._glm_guarded(image_path, kind)
             if self.backend == "paddle_vl":
                 key = "%s-1" % (kind or "x")
                 out = self.read_batch([(key, image_path)])
@@ -463,12 +541,62 @@ class Recognizer:
                 return self._paddle_batch(pairs)
             if self.backend == "vlm":
                 return {k: self._vlm_guarded(p, "fill") for k, p in pairs}
+            if self.backend == "glm_ocr":
+                return {k: self._glm_guarded(p, "fill") for k, p in pairs}
             if self.backend == "local":
                 return {k: self._local_guarded(p) for k, p in pairs}
             return {k: _manual() for k, _ in pairs}
         except Exception as e:
             self.last_error = "%s: %s" % (type(e).__name__, e)
             return {k: _degraded(self.backend) for k, _ in pairs}
+
+    # ------------------------------------------------------------ glm_ocr（智谱版面解析）
+    def _glm_guarded(self, image_path: str, kind: str = None) -> dict:
+        """GLM-OCR 优先；读不出（版面解析对单行小图常返回空）就用视觉模型兜底。"""
+        try:
+            r = self._glm_read(image_path)
+            if (r.get("text") or "").strip():
+                return r
+            if self.glm_fallback and self.key and self.base_url:
+                fb = self._vlm_guarded(image_path, kind)
+                if (fb.get("text") or "").strip():
+                    fb = dict(fb)
+                    fb["backend"] = "glm_ocr->vlm"
+                    return fb
+            return r
+        except Exception as e:  # noqa: BLE001
+            self.last_error = "%s: %s" % (type(e).__name__, e)
+            if self.glm_fallback and self.key and self.base_url:
+                fb = self._vlm_guarded(image_path, kind)
+                if (fb.get("text") or "").strip():
+                    fb = dict(fb)
+                    fb["backend"] = "glm_ocr->vlm"
+                    return fb
+            return _degraded("glm_ocr")
+
+    def _glm_read(self, image_path: str) -> dict:
+        """POST /layout_parsing，file 传 data URI（裸 base64 会被拒：只支持 PDF/JPG/PNG）。"""
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(image_path)
+        if not self.glm_key:
+            raise RuntimeError("没填 GLM-OCR 的 API Key（设置页 / config.json 的 ocr.glm_ocr.key）")
+        data = page_data_uri(image_path)
+        payload = json.dumps({"model": self.glm_model, "file": data},
+                             ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(self.glm_url, data=payload, headers={
+            "Content-Type": "application/json", "Authorization": self.glm_key})
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=max(30.0, self.vlm_timeout_s * 2)) as resp:
+            obj = json.loads(resp.read().decode("utf-8", "replace"))
+        parts = []
+        for page in (obj.get("layout_details") or []):
+            for blk in (page or []):
+                content = blk.get("content")
+                if isinstance(content, str) and content.strip():
+                    parts.append(content)
+        text = latex_to_plain("\n".join(parts))
+        return {"text": text, "confidence": 0.9 if text else 0.0,
+                "backend": "glm_ocr", "elapsed_s": round(time.time() - t0, 2)}
 
     # ------------------------------------------------------------ vlm
     def _vlm_guarded(self, image_path: str, kind: str = None) -> dict:
