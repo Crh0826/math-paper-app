@@ -131,9 +131,8 @@ class TestIdCodec(unittest.TestCase):
         with self.assertRaises(ValueError):
             cardmod.encode_id_bits(1 << 20)
 
-    def test_zero_and_too_large_rejected_on_decode(self):
-        self.assertIsNone(cardmod.decode_id_bits(cardmod.encode_id_bits(0) ), "00000 不是题号")
-        self.assertIsNone(cardmod.decode_id_bits(cardmod.encode_id_bits(100000)))
+    def test_zero_rejected_on_decode(self):
+        self.assertIsNone(cardmod.decode_id_bits(cardmod.encode_id_bits(0)), "00000 不是题号")
 
     def test_checksum_rejects_corruption(self):
         bits = cardmod.encode_id_bits("03370")
@@ -146,6 +145,56 @@ class TestIdCodec(unittest.TestCase):
 
     def test_rejects_bad_length(self):
         self.assertIsNone(cardmod.decode_id_bits([1, 0, 1]))
+
+
+class TestIdCodecSixDigit(unittest.TestCase):
+    """t11 · 15 万题的题号是 6 位（100000..1048575）：标识仍是 25 格，编码口径不变。
+
+    老题号（00001..99999）必须逐字节不变 —— 已打印的旧答题卡还得能判。
+    """
+
+    SIX = ("100000", "100001", "123456", "999999", "1048575")
+
+    def test_roundtrip_six_digit(self):
+        for s in self.SIX:
+            bits = cardmod.encode_id_bits(s)
+            self.assertEqual(25, len(bits), "6 位题号也必须是 5x5=25 格")
+            self.assertEqual(s, cardmod.decode_id_bits(bits),
+                             "6 位题号 %s 编解码不自洽" % s)
+
+    def test_max_no_is_2_pow_20_minus_1(self):
+        self.assertEqual((1 << 20) - 1, cardmod.MAX_NO)
+        self.assertEqual("1048575", cardmod.decode_id_bits(cardmod.encode_id_bits(cardmod.MAX_NO)))
+        with self.assertRaises(ValueError):
+            cardmod.encode_id_bits(cardmod.MAX_NO + 1)
+
+    def test_five_digit_stays_zero_padded(self):
+        """老题号口径不变：解出来还是 5 位补零字符串。"""
+        self.assertEqual("00001", cardmod.decode_id_bits(cardmod.encode_id_bits(1)))
+        self.assertEqual("99999", cardmod.decode_id_bits(cardmod.encode_id_bits(99999)))
+
+    def test_encode_accepts_int_and_str(self):
+        self.assertEqual(cardmod.encode_id_bits("100000"), cardmod.encode_id_bits(100000))
+
+    def test_crc_still_catches_six_digit_corruption(self):
+        """6 位题号每一位翻错都必须被 CRC 抓住（不能靠范围检查兜底）。"""
+        bits = cardmod.encode_id_bits("100001")
+        for k in range(25):
+            bad = list(bits)
+            bad[k] ^= 1
+            self.assertIsNone(cardmod.decode_id_bits(bad),
+                              "6 位题号第 %d 位翻错还能解出题号，校验位失效" % k)
+
+    def test_decode_idx_returns_int(self):
+        self.assertEqual(100001, cardmod.decode_idx_bits(cardmod.encode_id_bits("100001")))
+
+    def test_plan_item_uses_six_digit_no(self):
+        """出卡几何里的 id_bits 也必须encode 出 6 位题号（判卷侧按它反查题目）。"""
+        geom, _h = cardmod.plan_item(
+            {"idx": 1, "no": "100002", "qtype": "选择", "options": ["A", "B", "C", "D"]},
+            cardmod.KIND_OMR, 1000)
+        self.assertEqual(25, len(geom["id_bits"]))
+        self.assertEqual("100002", cardmod.decode_id_bits(geom["id_bits"]))
 
 
 class TestSinglePage(_Base):

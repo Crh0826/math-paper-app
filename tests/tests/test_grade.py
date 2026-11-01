@@ -53,7 +53,7 @@ CHOICES = {1: "A", 2: "B", 3: "C"}          # 全对
 TEXTS = {"4-1": "4", "4-2": "1/2", "5-1": "9", "5-2": "3"}
 
 
-def make_manifest(pid=PID):
+def make_manifest(pid=PID, items=None):
     return {
         "pid": pid,
         "created_at": "2026-10-31T15:00:00+08:00",
@@ -61,7 +61,7 @@ def make_manifest(pid=PID):
         "params": {},
         "page": {"w_pt": 595.3, "h_pt": 841.9, "dpi": 300,
                  "w_px": card.PAGE_W, "h_px": card.PAGE_H},
-        "items": [dict(it) for it in ITEMS],
+        "items": [dict(it) for it in (items if items is not None else ITEMS)],
     }
 
 
@@ -75,10 +75,11 @@ def _font(size=56):
 class Fixture:
     """一套卡片 + 合成照片的公共装置。"""
 
-    def __init__(self, tmp, choices=None, texts=None, pid=PID):
+    def __init__(self, tmp, choices=None, texts=None, pid=PID, items=None):
         self.tmp = tmp
         self.card_dir = os.path.join(tmp, "card")
-        self.manifest = make_manifest(pid)
+        self.items = items if items is not None else ITEMS
+        self.manifest = make_manifest(pid, self.items)
         card.build_card(self.manifest, self.card_dir)
         self.card_png = os.path.join(self.card_dir, "card_1.png")
         self.choices = choices if choices is not None else dict(CHOICES)
@@ -1626,6 +1627,105 @@ class TestRealPhotoByIds(unittest.TestCase):
         t0 = _t.perf_counter()
         grade.scan_ids(self.PHOTO)
         self.assertLess(_t.perf_counter() - t0, 3.0, "扫描不该超过 3 秒")
+
+
+class TestSixDigitChain(unittest.TestCase):
+    """t11 验收链路：6 位题号（15 万题口径）走通 组卷 → 出卡 → 判卷。
+
+    题号 100001.. 是 15 万题的新题号段（>99999）；旧卡 5 位题号链路另有测试覆盖。
+    """
+
+    SIX_NOS = ["100001", "100002", "100003", "100004", "100005"]
+    SIX_PID = "P20261101-901"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="six_")
+        cls.items = [dict(it, no=cls.SIX_NOS[i]) for i, it in enumerate(ITEMS)]
+        cls.fx = Fixture(cls.tmp, pid=cls.SIX_PID, items=cls.items)
+        cls._insert_questions()
+
+    @classmethod
+    def _insert_questions(cls):
+        """把 5 道 6 位题号的题写进夹具库（判卷要按题号查答案）。"""
+        import picker
+
+        rows = []
+        for it in cls.items:
+            rows.append((
+                it["no"], it["qtype"], len(it.get("options") or []),
+                "　".join(k.get("value", "") for k in it.get("answer_key") or []),
+                "题干" + it["no"], "plain"))
+        cls.fx.conn.executemany(
+            "INSERT OR REPLACE INTO questions(no, qtype, option_count, answer_raw, is_empty,"
+            " text_plain, fmt, kp_id, chapter, subject_pk)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            [(no, qt, n, ans, 0, txt, fmt, "1.1", "第1章 有理数", "math7a")
+             for (no, qt, n, ans, txt, fmt) in rows])
+        cls.fx.conn.commit()
+        assert picker.QTYPES      # 组卷引擎与判卷共用题号口径
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fx.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    # ---- 组卷
+    def test_picker_builds_six_digit_paper(self):
+        import picker
+
+        m = picker.build({"mix": {"选择": 3, "填空": 1, "解答": 1}, "seed": 7},
+                         self.fx.conn, now="2026-11-01T10:00:00+08:00",
+                         pid="P20261101-902")
+        nos = [it["no"] for it in m["items"]]
+        self.assertEqual(sorted(self.SIX_NOS), sorted(nos))
+        for no in nos:
+            self.assertEqual(6, len(no), "15 万题口径的题号是 6 位：%r" % no)
+
+    # ---- 出卡
+    def test_card_id_bits_encode_six_digit(self):
+        pages = self.fx.manifest["card"]["pages"]
+        self.assertTrue(pages)
+        got = []
+        for page in pages:
+            for it in page["items"]:
+                self.assertEqual(25, len(it["id_bits"]))
+                got.append(card.decode_id_bits(it["id_bits"]))
+        self.assertEqual(sorted(self.SIX_NOS), sorted(got), "答题卡标识里的题号不对")
+
+    # ---- 判卷
+    def test_grade_photo_of_six_digit_card(self):
+        res = grade.grade_image(self.fx.conn, self.SIX_PID, self.fx.photo(seed=301),
+                                out_dir=os.path.join(self.tmp, "out"))
+        self.assertIsNone(res.get("error"), res.get("detail"))
+        self.assertTrue(res.get("warp_ok"))
+        omr = [it for it in res["items"] if it["kind"] == card.KIND_OMR]
+        self.assertEqual(3, len(omr), "选择题应有 3 个作答单元")
+        self.assertEqual([], [it for it in omr if it["verdict"] != "correct"],
+                         "6 位题号的答题卡判卷必须全对：%s" % [(it["no"], it["verdict"]) for it in omr])
+        for it in omr:
+            self.assertIn(it["no"], self.SIX_NOS, "判卷回来的题号不是 6 位题号：%r" % it["no"])
+
+    def test_scan_ids_decodes_six_digit(self):
+        """卡面 PNG 直接扫标识：5 个 6 位题号必须全解出来。"""
+        gray = cv2.imread(self.fx.filled_png, cv2.IMREAD_GRAYSCALE)
+        scan = grade.scan_id_blocks(gray)
+        self.assertEqual(set(self.SIX_NOS), {b["no"] for b in scan["blocks"]},
+                         "卡面标识里的 6 位题号没扫全")
+        self.assertEqual([], scan["unreadable"])
+
+    def test_photo_scan_never_invents_wrong_no(self):
+        """手机照片（0.72 缩放 + 3% 透视 + JPEG70）下解出来的号必须都是本卷的号。
+
+        已知限制（记在 docs/app_scale_change.md）：6 位题号比特更密，低分辨率照片上
+        轮廓法可能漏检个别密集标识格；**不会解出错号**，且正规链路（papers 有记录 →
+        manifest 判卷，见 test_grade_photo_of_six_digit_card）不受影响。
+        """
+        scan = grade.scan_ids(self.fx.photo(seed=302))
+        got = {b["no"] for b in scan["blocks"] if b.get("no")}
+        self.assertTrue(got <= set(self.SIX_NOS),
+                        "照片上解出了不属于本卷的题号：%s" % sorted(got - set(self.SIX_NOS)))
+        self.assertGreaterEqual(len(got), 3, "密集标识格在照片上的召回不该低于 3/5：%s" % sorted(got))
 
 
 if __name__ == "__main__":

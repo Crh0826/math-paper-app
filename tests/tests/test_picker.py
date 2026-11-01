@@ -55,7 +55,7 @@ QCOLS = ("no qtype option_count sub_count is_empty media_count text_len text_pla
 
 # ---------------------------------------------------------------- 夹具库
 def _insert_q(conn, no, qtype, chapter, kp_id, answer="", family=None, is_empty=0,
-              option_count=0, tokens=None, text=None, fmt="plain"):
+              option_count=0, tokens=None, text=None, fmt="plain", subject=None):
     vals = {
         "no": no, "qtype": qtype, "option_count": option_count, "sub_count": 0,
         "is_empty": is_empty, "media_count": 0, "text_len": 10,
@@ -68,6 +68,8 @@ def _insert_q(conn, no, qtype, chapter, kp_id, answer="", family=None, is_empty=
     conn.execute("INSERT INTO questions(%s) VALUES(%s)"
                  % (",".join(QCOLS), ",".join("?" * len(QCOLS))),
                  [vals[c] for c in QCOLS])
+    if subject:                     # t11 · 多学科：不传就走表默认值 math7a
+        conn.execute("UPDATE questions SET subject_pk=? WHERE no=?", (subject, no))
 
 
 def make_pool_db(path):
@@ -115,7 +117,7 @@ def make_pool_db(path):
     return conn
 
 
-def params(mix=None, scope=None, req=None, seed=42, space=None, title="测试卷"):
+def params(mix=None, scope=None, req=None, seed=42, space=None, title="测试卷", nos=None):
     p = {"title": title, "mix": mix if mix is not None else {"选择": 5, "填空": 4, "解答": 3},
          "seed": seed}
     if scope is not None:
@@ -124,6 +126,8 @@ def params(mix=None, scope=None, req=None, seed=42, space=None, title="测试卷
         p["requirements"] = req
     if space is not None:
         p["space"] = space
+    if nos is not None:
+        p["nos"] = nos
     return p
 
 
@@ -1103,6 +1107,116 @@ class RealDbTest(unittest.TestCase):
         self.assertIn("%s 需要 %d" % (qt, avail + 1), msg)
         self.assertIn("可用 %d" % avail, msg)
         self.assertIn("差 1", msg)
+
+
+class SubjectScopeTest(unittest.TestCase):
+    """t11 · 学科过滤：两学科各 2 题，按 scope.subject_pk / scope.subjects 过滤只出本科题。
+
+    15 万题是 7 个学科混在一个库里的，跨学科混卷（数学卷里冒出英语题）是不可接受的。
+    """
+
+    CN_CH = "第一单元 春"
+    CN_KP = "CN1.1"        # kps.kp_id 是主键（跨学科也不能重复）→ 语文用带前缀的 kp_id
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="subject_")
+        cls.db_path = os.path.join(cls.tmp, "app.db")
+        conn = dbmod.connect(cls.db_path)
+        try:
+            # 数学（math7a）：2 道选择
+            for no, ans in (("100001", "A"), ("100002", "B")):
+                _insert_q(conn, no, "选择", CH1, "1.1", ans, option_count=4,
+                          tokens=[{"kind": "text", "text": "数学 " + no}], subject="math7a")
+            # 语文（chinese7a）：2 道选择
+            for no, ans in (("200001", "C"), ("200002", "D")):
+                _insert_q(conn, no, "选择", cls.CN_CH, cls.CN_KP, ans, option_count=4,
+                          tokens=[{"kind": "text", "text": "语文 " + no}], subject="chinese7a")
+            conn.executemany(
+                "INSERT INTO kps(kp_id, subject_pk, chapter, kp, n_questions) VALUES(?,?,?,?,?)",
+                [("1.1", "math7a", CH1, "有理数", 2),
+                 (cls.CN_KP, "chinese7a", cls.CN_CH, "春", 2)])
+            conn.commit()
+        finally:
+            conn.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        self.conn = dbmod.connect(self.db_path)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _nos(self, scope, mix=None):
+        m = sel.build(params(mix or {"选择": 2}, scope=scope), self.conn,
+                      now=FIXED_NOW, pid=FIXED_PID)
+        return {it["no"] for it in m["items"]}
+
+    def test_subject_pk_filters(self):
+        self.assertEqual({"200001", "200002"},
+                         self._nos({"subject_pk": "chinese7a"}), "只该抽语文题")
+
+    def test_subject_pk_math(self):
+        self.assertEqual({"100001", "100002"}, self._nos({"subject_pk": "math7a"}))
+
+    def test_subjects_list_filters(self):
+        self.assertEqual({"100001", "100002"}, self._nos({"subjects": ["math7a"]}))
+
+    def test_subjects_list_multiple_is_union(self):
+        """列多个学科 = 并集（老师可能想混一份跨学科练习卷，但必须是显式选的）。"""
+        m = sel.build(params({"选择": 4}, scope={"subjects": ["math7a", "chinese7a"]}),
+                      self.conn, now=FIXED_NOW, pid=FIXED_PID)
+        self.assertEqual({"100001", "100002", "200001", "200002"},
+                         {it["no"] for it in m["items"]})
+
+    def test_subject_pk_and_subjects_merge(self):
+        self.assertEqual({"100001", "100002"},
+                         self._nos({"subject_pk": "math7a", "subjects": ["math7a"]}))
+
+    def test_no_subject_means_unlimited(self):
+        """不传学科 = 不限（老接口/老链接兼容：只有单学科库的机器行为不变）。"""
+        self.assertEqual({"100001", "100002", "200001", "200002"},
+                         self._nos({}, mix={"选择": 4}))
+
+    def test_unknown_subject_raises(self):
+        with self.assertRaises(sel.ScopeError) as ctx:
+            self._nos({"subject_pk": "physics9x"})
+        self.assertIn("学科", str(ctx.exception))
+        self.assertIn("physics9x", str(ctx.exception))
+
+    def test_subject_and_chapter_combined(self):
+        """选了语文后，数学的章节名不该再被认作合法范围（跨学科混选要报错）。"""
+        with self.assertRaises(sel.ScopeError):
+            self._nos({"subject_pk": "chinese7a", "chapters": [CH1]})
+
+    def test_count_available_respects_subject(self):
+        self.assertEqual(2, sel.count_available(
+            self.conn, params({"选择": 1}, scope={"subject_pk": "chinese7a"}))["选择"])
+        self.assertEqual(2, sel.count_available(
+            self.conn, params({"选择": 1}, scope={"subject_pk": "math7a"}))["选择"])
+
+    def test_subject_shortfall_is_reported(self):
+        """某学科题量不够时要明确报不足（而不是偷偷从别的学科补）。"""
+        with self.assertRaises(sel.InsufficientQuestions) as ctx:
+            sel.build(params({"选择": 3}, scope={"subject_pk": "chinese7a"}), self.conn,
+                      now=FIXED_NOW, pid=FIXED_PID)
+        self.assertEqual({"need": 3, "available": 2, "short": 1},
+                         ctx.exception.details["选择"])
+
+    def test_nos_outside_subject_raises(self):
+        """nos 精确题集给别的学科的题也要报错（卷子口径不能被绕过）。"""
+        with self.assertRaises(sel.SelectError):
+            sel.build(params({"选择": 1}, scope={"subject_pk": "chinese7a"},
+                             nos=["100001"]), self.conn,
+                      now=FIXED_NOW, pid=FIXED_PID)
+
+    def test_scope_normalized_shape(self):
+        p = sel.normalize_params(params({"选择": 1}, scope={"subject_pk": " math7a "}))
+        self.assertEqual("math7a", p["scope"]["subject_pk"])
+        self.assertEqual(["math7a"], p["scope"]["subjects"])
 
 
 if __name__ == "__main__":

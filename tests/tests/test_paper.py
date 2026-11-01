@@ -1167,5 +1167,168 @@ class RenderPaperTest(unittest.TestCase):
             self.assertIsNone(z.testzip())
 
 
+class TestTokensJsonFallback(unittest.TestCase):
+    """t11 · 15 万题绝大部分没有原始 docx：source_tokens 要回退查 questions.tokens_json。
+
+    口径（队长 2026-11-01 定）：
+      * 有 <no>.docx → 仍走 docx（保真，带媒体二进制），tokens_json 不参与；
+      * 没有 docx 但有 tokens_json 且**无图** → 用 tokens_json 排版（text / math / 无图表格）；
+      * 有图（embed / 带媒体表格）→ 报 PaperError（图在 docx 里，JSON 里没有二进制，印出来会缺图）；
+      * docx 和 tokens_json 都没有（或 tokens_json 是空/坏 JSON）→ 仍报 PaperError。
+    """
+
+    OMML = ('<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">'
+            '<m:r><m:t>x</m:t></m:r></m:oMath>')
+
+    @classmethod
+    def setUpClass(cls):
+        import db as dbmod
+
+        cls.tmp = tempfile.mkdtemp(prefix="paper_json_")
+        cls.src = os.path.join(cls.tmp, "qbank")
+        os.makedirs(cls.src, exist_ok=True)
+        cls.out = os.path.join(cls.tmp, "out")
+        cls.db_path = os.path.join(cls.tmp, "data", "app.db")
+
+        cls._old_src = paper.SRC_ROOT
+        cls._old_dbp = paper.tokens_db_path()
+        cls._real_src = cls._old_src
+
+        conn = dbmod.connect(cls.db_path)
+        try:
+            rows = [
+                # 无图选择：text + OMML 公式，能从 JSON 排出来
+                ("100001", "选择", 4,
+                 [{"kind": "text", "text": "1．化简：2x+3x 的结果是（　）"},
+                  {"kind": "math", "xml": cls.OMML},
+                  {"kind": "text", "text": "A．4x　B．5x　C．6x　D．8x"}],
+                 "B"),
+                # 含图：tokens_json 里只有 n_media 计数，没有二进制 → 不能回退
+                ("100003", "选择", 4,
+                 [{"kind": "text", "text": "3．如图所示，下列判断正确的是（　）"},
+                  {"kind": "embed", "name": "word/media/image1.wmf", "n_media": 1}],
+                 "A"),
+                ("100004", "填空", 0, [], "3"),
+                # 坏 JSON
+                ("100005", "填空", 0, "{这不是 JSON", "4"),
+            ]
+            for no, qtype, n_opt, tokens, answer in rows:
+                raw = tokens if isinstance(tokens, str) else json.dumps(tokens, ensure_ascii=False)
+                conn.execute(
+                    "INSERT INTO questions(no, qtype, option_count, is_empty, text_plain,"
+                    " tokens_json, fmt, answer_raw, kp_id, chapter, subject_pk)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (no, qtype, n_opt, 0, "题干" + no, raw,
+                     "plain" if qtype != "选择" or n_opt == 0 else "plain",
+                     answer, "1.1", "第1章 有理数", "math7a"))
+            # 「有 docx 时 docx 优先」用的题：库里 tokens_json 塞一段拍脑袋文本
+            conn.execute(
+                "INSERT INTO questions(no, qtype, option_count, is_empty, text_plain,"
+                " tokens_json, fmt, answer_raw, kp_id, chapter, subject_pk)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("999998", "选择", 4, 0, "库里版本",
+                 json.dumps([{"kind": "text", "text": "库里版本：不该被用到"}], ensure_ascii=False),
+                 "ole", "A", "9.2", "综合", "math7a"))
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 真库里的 00688.docx（OMML 题）复制成 999998.docx：验证「有 docx 就不看 JSON」
+        real = os.path.join(cls._real_src, "00688.docx")
+        if not os.path.isfile(real):
+            raise unittest.SkipTest("真库缺 00688.docx，跳过「docx 优先」用例")
+        shutil.copyfile(real, os.path.join(cls.src, "999998.docx"))
+
+        paper.SRC_ROOT = cls.src
+        paper.set_tokens_db_path(cls.db_path)
+        paper.clear_tokens_cache()
+
+    @classmethod
+    def tearDownClass(cls):
+        paper.SRC_ROOT = cls._old_src
+        paper.set_tokens_db_path(cls._old_dbp)
+        paper.clear_tokens_cache()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        paper.clear_tokens_cache()
+
+    # ---- 1. 有 docx：docx 优先
+    def test_docx_wins_when_present(self):
+        toks = paper.source_tokens("999998")
+        text = "".join(t.text or "" for t in toks if t.kind == "text")
+        self.assertNotIn("库里版本", text, "有 docx 时不该用 tokens_json")
+        self.assertTrue(any(t.kind == "math" for t in toks), "00688 的 OMML 公式没抽出来")
+
+    # ---- 2. 无 docx 有 tokens_json：能排版
+    def test_no_docx_falls_back_to_tokens_json(self):
+        self.assertFalse(os.path.exists(os.path.join(self.src, "100001.docx")))
+        toks = paper.source_tokens("100001")
+        self.assertEqual(["text", "math", "text"], [t.kind for t in toks])
+
+    def test_build_docx_from_tokens_json(self):
+        """整条排版链路：prepared_tokens → build_docx → 卷面有题干、公式计数对得上。"""
+        m = manifest([{"no": "100001", "qtype": "选择", "kp_id": "1.1",
+                       "chapter": "第1章 有理数",
+                       "answer_key": [{"blank": 1, "value": "B", "norm": "B"}]}])
+        res = paper.build_docx(m, self.out, name="json_paper")
+        text = all_text(res["docx"])
+        self.assertIn("2x+3x", text, "tokens_json 里的题干没印到卷面")
+        self.assertEqual(1, res["expected"]["n_items"])
+        self.assertEqual(1, res["expected"]["formula_tokens"], "OMML 公式 token 丢了")
+        self.assertIsNone(zipfile.ZipFile(res["docx"]).testzip())
+
+    def test_five_digit_no_also_falls_back(self):
+        """老库 5 位题号在 docx 缺失时走同一条回退（13 万条归档题靠它）。"""
+        import db as dbmod
+
+        conn = dbmod.connect(self.db_path)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO questions(no, qtype, option_count, is_empty, text_plain,"
+                " tokens_json, fmt, answer_raw, kp_id, chapter, subject_pk)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("30001", "填空", 0, 0, "填空 30001",
+                 json.dumps([{"kind": "text", "text": "若 a+b=3，则 2a+2b=（　）"}],
+                            ensure_ascii=False),
+                 "plain", "6", "1.2", "第1章 有理数", "math7a"))
+            conn.commit()
+        finally:
+            conn.close()
+        toks = paper.source_tokens("30001")
+        self.assertEqual(["text"], [t.kind for t in toks])
+        self.assertIn("2a+2b", toks[0].text)
+
+    # ---- 3. 有图 / 空 / 坏 / 都没有：一律报 PaperError
+    def test_figure_question_is_rejected(self):
+        with self.assertRaises(paper.PaperError) as ctx:
+            paper.source_tokens("100003")
+        self.assertIn("图", str(ctx.exception), "错误信息要说清「有图，回退不了」")
+
+    def test_empty_tokens_json_is_rejected(self):
+        with self.assertRaises(paper.PaperError):
+            paper.source_tokens("100004")
+
+    def test_broken_json_is_rejected(self):
+        with self.assertRaises(paper.PaperError):
+            paper.source_tokens("100005")
+
+    def test_missing_everywhere_is_rejected(self):
+        with self.assertRaises(paper.PaperError) as ctx:
+            paper.source_tokens("100009")
+        msg = str(ctx.exception)
+        self.assertIn("100009", msg)
+        self.assertIn("tokens_json", msg, "报错要告诉运维「缺 docx 也缺 tokens_json」")
+
+    def test_no_db_at_all_is_rejected(self):
+        """数据库文件都不在（别人的机器）：仍是 PaperError，不能抛 sqlite3 的原始异常。"""
+        paper.set_tokens_db_path(os.path.join(self.tmp, "no_such", "app.db"))
+        try:
+            with self.assertRaises(paper.PaperError):
+                paper.source_tokens("100001")
+        finally:
+            paper.set_tokens_db_path(self.db_path)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

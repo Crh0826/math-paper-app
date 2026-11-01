@@ -81,8 +81,14 @@ LABEL_FONT_SIZE = 28
 
 VLM_PROMPT = (
     "你是数学答题卡的识别助手。图片是答题卡上的一个作答框，里面是学生手写的最终答案。"
-    "只输出最终答案本身，不要解题过程、不要多余文字、不要写“答案是”。"
-    "有多个小问时按小问顺序用逗号分隔。看不清就输出空字符串。"
+    "只输出最终答案本身，不要解题过程、不要多余文字、不要写“答案是”。\n"
+    "输出约定（很重要，判卷要靠它）：\n"
+    "1) 分数写成 a/b（分子/分母），不要写成两个分开的数，也不要写成“a 分之 b”；"
+    "带分数写成 整数 分子/分母（例如 21 1/4）。\n"
+    "2) 保留变量前缀（x=3、y=4/5），不要省略等号。\n"
+    "3) 一个框里有多空/多问时，按顺序用英文逗号分隔（例如 -100,-2 5/7,3）。\n"
+    "4) 圆周率写 π，根号写 sqrt(...)，不要臆造看不清的内容。\n"
+    "5) 看不清就输出空字符串。"
 )
 VLM_USER_TEXT = "请识别框内的最终答案。"
 
@@ -527,7 +533,8 @@ class Recognizer:
         base = str(self.base_url or "").rstrip("/")
         if base.endswith("/chat/completions"):
             url = base
-        elif base.endswith("/v1"):
+        elif re.search(r"/v\d+(?:\.\d+)?$", base):
+            # 已经带版本段（DeepSeek 的 /v1、智谱的 /api/paas/v4）→ 只补资源路径
             url = base + "/chat/completions"
         else:
             url = base + "/v1/chat/completions"

@@ -78,6 +78,9 @@ _RE_MIXED_PAREN = re.compile(r"(?<![\d.a-zA-Z*^])(-?)(\d+)\((\d+)\)/\((\d+)\)(?!
 #: 简单分数 a/b（分子分母都是整数，允许括号与空白）—— 用于"分数被 OCR 拆成两个数"的兜底比对
 _FRAC_RE = re.compile(r"^\(?\s*(-?\d+)\s*\)?\s*/\s*\(?\s*(-?\d+)\s*\)?$")
 
+#: 答案前的变量前缀（`x=` / `y =` / `a：`）—— 判最终答案时等价于没写
+_RE_LEAD_VAR = re.compile(r"^\s*([a-zA-Z])\s*[=＝:：]\s*")
+
 _RE_SQRT = re.compile(r"(?:√|根号下?)\s*(\([^()]*\)|\d+(?:\.\d+)?|[a-zA-Z])")
 _RE_CBRT = re.compile(r"(?:∛|三次根号下?)\s*(\([^()]*\)|\d+(?:\.\d+)?|[a-zA-Z])")
 _RE_ABS = re.compile(r"\|([^|]*)\|")
@@ -736,6 +739,114 @@ def _cmp_parts(pa, pb):
     return True, "多小问逐段等价（%d 段）" % len(ma)
 
 
+def _expected_token_groups(val):
+    """把"期望的一个答案"展开成它对应的整数序列（1/2/3 个 token）与种类。"""
+    s = val.strip()
+    m = _FRAC_RE.match(s)
+    if m:
+        return [m.group(1), m.group(2)], "分数"
+    m = _RE_MIXED_PAREN.match(s)          # 21(1)/(4)：(-?)(整数)\(分子\)/\(分母\)
+    if m:
+        return [m.group(1) + m.group(2), m.group(3), m.group(4)], "带分数"
+    m = _RE_MIXED_SPACE.match(s)          # 21 1/4
+    if m:
+        return [m.group(1), m.group(2), m.group(3)], "带分数"
+    return [s], "普通"
+
+
+def _tokens(s):
+    return [t for t in re.split(r"[\s,，;；]+", str(s).strip()) if t]
+
+
+def _cmp_pair_maybe_split(x, y, ca, cb):
+    """单对比较；顺带认「一个分数被 OCR 拆成 2~3 个数」这种写法。"""
+    ok, why = _cmp_chunk(x, y, ca, cb)
+    if ok:
+        return True, why
+    for expect, got in ((y, x), (x, y)):
+        groups, kind = _expected_token_groups(expect)
+        if kind == "普通":
+            continue
+        toks = _tokens(got)
+        if toks == groups:
+            return True, "%s被识别成多个数（%s），分子分母对齐" % (kind, " ".join(groups))
+    return False, why
+
+
+def _align_split_values(split_vals, whole_vals, ca, cb):
+    """一侧被 OCR 拆成了多个数（`2011 2012` / `-2 5 7`），按分子分母对齐后再比。
+
+    只有"拆出来的数正好等于对面分数/带分数的分子分母"才认；任何一项对不上就返回 None，
+    由调用方继续走别的兜底（真·多值答案不会被硬并成分数）。
+    """
+    used_split_frac = False
+    i = 0
+    for whole in whole_vals:
+        groups, kind = _expected_token_groups(whole)
+        if kind != "普通":
+            used_split_frac = True
+            n = len(groups)
+            got = [t.strip() for t in split_vals[i:i + n]]
+            if len(got) != n or got != groups:
+                return None
+            i += n
+            continue
+        if i >= len(split_vals):
+            return None
+        ok, _why = _cmp_chunk(split_vals[i], whole, ca, cb)
+        if not ok:
+            return None
+        i += 1
+    if i != len(split_vals) or not used_split_frac:
+        return None
+    return True, "分数/带分数被识别成多个数，已按分子分母对齐（%d 项）" % len(whole_vals)
+
+
+def _strip_answer_parens(s):
+    """去掉整串外面包的括号：`(-100,-2 5 7)` → `-100,-2 5 7`（学生习惯性加括号）。
+
+    只在"剥掉后括号仍平衡"时才剥，避免把 `(3+4)` 这种真括号语义改掉。
+    注意与上面 `_strip_outer_parens` 的区别：这个是给"整串答案"用的。
+    """
+    t = str(s).strip()
+    for _ in range(3):
+        if len(t) < 2 or t[0] not in "(（" or t[-1] not in ")）":
+            break
+        inner = t[1:-1]
+        depth = 0
+        ok = True
+        for ch in inner:
+            if ch in "(（":
+                depth += 1
+            elif ch in ")）":
+                depth -= 1
+                if depth < 0:
+                    ok = False
+                    break
+        if not ok or depth != 0:
+            break
+        t = inner.strip()
+    return t
+
+
+def _try_split_fraction_match(sa, sb):
+    """原始串层面先救一次：分数/带分数被 OCR 拆成多个数（`3 2` = 3/2，`-2 5 7` = -2 又 5/7）。
+
+    必须在 `_pre()` 归一化之前做 —— 归一化会把空格变成乘号（`-2 5 7` → `-2*5*7` = -70），
+    那时候再想还原就晚了。
+    """
+    ta, tb = _tokens(sa), _tokens(sb)
+    if len(ta) < 2 and len(tb) < 2:
+        return None
+    r = _align_split_values(ta, tb, False, False)
+    if r is not None and r[0]:
+        return r
+    r = _align_split_values(tb, ta, False, False)
+    if r is not None and r[0]:
+        return r
+    return None
+
+
 def _cmp_body(pa, pb):
     a, b = pa.text, pb.text
     if a == b:
@@ -747,7 +858,7 @@ def _cmp_body(pa, pb):
     if len(ca) > 1 or len(cb) > 1:
         if len(ca) == len(cb):
             for i, (x, y) in enumerate(zip(ca, cb), 1):
-                ok, reason = _cmp_chunk(x, y, pa.circled, pb.circled)
+                ok, reason = _cmp_pair_maybe_split(x, y, pa.circled, pb.circled)
                 if not ok:
                     return False, "第 %d 项不等价：%s" % (i, reason)
             return True, "多项逐项等价（%d 项）" % len(ca)
@@ -763,21 +874,18 @@ def _cmp_body(pa, pb):
             r = _cmp_chunk("*".join(ca), "*".join(cb), pa.circled, pb.circled)
             if r is not None and r[0]:
                 return True, "隐含乘号等价（%s）" % r[1]
-        # 分数被 OCR 拆成两个整数（"2026 4053" 其实是 2026/4053）：只在"两个数正好
-        # 等于对面分数的分子分母"时才认，避免把真·多值答案并成一个分数。
-        def _frac_parts(s: str):
-            m = _FRAC_RE.match(s.strip())
-            if not m:
-                return None
-            return m.group(1), m.group(2)
-
-        for x, y in ((a, b), (b, a)):
-            fx = _frac_parts(x)
-            cy = [t for t in re.split(r"[\s,，]+", y.strip()) if t]
-            if fx and len(cy) == 2 and fx[0] == cy[0].strip() and fx[1] == cy[1].strip():
-                return True, "分数被识别成两个数（%s/%s），数值等价" % (fx[0], fx[1])
+        # 分数被 OCR 拆成两个整数（"2026 4053" 其实是 2026/4053），带分数被拆成三个
+        # （"-2 5 7" 其实是 -2 又 5/7）：只有"拆出来的数正好等于对面分数的分子分母/整数部分"
+        # 时才认，避免把真·多值答案并成一个分数。
+        r = _align_split_values(ca, cb, pa.circled, pb.circled)
+        if r is not None and r[0]:
+            return r
+        r = _align_split_values(cb, ca, pb.circled, pa.circled)
+        if r is not None and r[0]:
+            return r
         return False, "项数不同：%d vs %d" % (len(ca), len(cb))
-    return _cmp_chunk(a, b, pa.circled, pb.circled)
+    # 单块也可能被 OCR 拆成多个数（"-2 5 7" 其实是 -2 又 5/7），所以走带兜底的比较
+    return _cmp_pair_maybe_split(a, b, pa.circled, pb.circled)
 
 
 # ---------------------------------------------------------------- 选择题 / 判断题
@@ -869,8 +977,31 @@ def is_equivalent(student, expected, qtype="填空"):
     if sa.strip() == sb.strip():
         return True, "原文完全一致"
 
+    # 学生习惯把多个答案套在一对括号里：`(-100,-2 5 7)` 等价于 `-100,-2 5 7`
+    sa, sb = _strip_answer_parens(sa), _strip_answer_parens(sb)
+    if sa and sb and sa.strip() == sb.strip():
+        return True, "去掉外层括号后完全一致"
+
+    # 变量前缀 `x=` / `y=`：两边都有且不同 → 肯定不算等价；有一边没有 → 去掉再比
+    # （判卷只判最终答案，"x=3" 和 "3" 是同一个答案）
+    ma, mb_ = _RE_LEAD_VAR.match(sa), _RE_LEAD_VAR.match(sb)
+    if ma and mb_:
+        if ma.group(1).lower() != mb_.group(1).lower():
+            return False, "变量不同：%s vs %s" % (ma.group(1), mb_.group(1))
+        sa, sb = sa[ma.end():], sb[mb_.end():]
+    elif ma:
+        sa = sa[ma.end():]
+    elif mb_:
+        sb = sb[mb_.end():]
+
     # 多空格 = 多个答案的分隔（题库里写作 `61     12`）；先换成逗号，避免被当成「数字乘数字」
     sa, sb = re.sub(r"\s{2,}", ";", sa), re.sub(r"\s{2,}", ";", sb)
+
+    # 原始串层面先救一次：分数/带分数被 OCR 拆成多个数（"3 2"=3/2、"-2 5 7"=-2又5/7）。
+    # 这一步必须在 _pre() 之前，否则空格已被当成乘号（-2*5*7=-70）就还原不回来了。
+    r_split = _try_split_fraction_match(sa, sb)
+    if r_split is not None and r_split[0]:
+        return r_split
 
     q = (qtype or "").strip()
     r = None

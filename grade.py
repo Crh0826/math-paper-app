@@ -370,10 +370,15 @@ def _multi_value_verdict(text, expected, qtype):
         return None
     matched, unmatched = _match_distinct(got_vals, exp_vals, qtype)
     if len(got_vals) < len(exp_vals):
-        if unmatched:
-            return "wrong", "多值答案有值对不上：%d/%d 个值能对应" % (matched, len(exp_vals))
-        missing = len(exp_vals) - matched
-        return "unsure", "只识别到部分答案（缺 %d 个值）" % missing
+        if not unmatched:
+            # 认出来的都对，只是个数不够 → 老口径：只识别到部分答案
+            return "unsure", "只识别到部分答案（缺 %d 个值）" % (len(exp_vals) - matched)
+        if matched > 0:
+            # 学生写了多个值、只对上其中一部分：更可能是 OCR 漏了（例如 π 这种符号），
+            # 不能直接判错 —— 交人工确认。
+            return "unsure", "只识别到 %d/%d 个值（可能漏识别），需人工确认" % (
+                matched, len(exp_vals))
+        return "wrong", "多值答案有值对不上：%d/%d 个值能对应" % (matched, len(exp_vals))
     if len(got_vals) == len(exp_vals):
         if unmatched:
             return "wrong", "多值答案有值对不上：%d/%d 个值能对应" % (matched, len(exp_vals))
@@ -788,6 +793,23 @@ def grade_by_ids(conn, image_path, out_dir: str = None) -> dict:
         return _err("internal_error", "%s: %s" % (type(e).__name__, e), None)
 
 
+def _id_unreadable_unit(seq: int, norm, box: dict, crop_dir: str, reason: str) -> dict:
+    """「这道题的标识不可读」→ unsure 单元（进人工确认，绝不猜答案）。
+
+    t11：6 位题号放宽后，被涂黑/采样跑偏的标识格也可能解出一个「像题号」的号，
+    所以除了 CRC 读不出，**解出的号在题库里查不到**也归到这一类（reason 里带原题号）。
+    """
+    return {
+        "idx": seq, "no": None, "qtype": "", "kind": "id", "blank": 1,
+        "picked": None, "expected": "", "verdict": "unsure",
+        "confidence": 0.0, "reason": reason, "unsure_reason": "题目标识不可读",
+        "ratios": {},
+        "crop_path": _save_crop(norm, {"x": box["x"], "y": box["y"],
+                                       "w": card.ID_SIZE, "h": card.ID_SIZE},
+                                crop_dir, "id_%d" % seq),
+    }
+
+
 def _grade_by_ids(conn, image_path, out_root):
     norm, photo_meta, code, why, diag = _warp_photo(image_path)
     if norm is None:
@@ -816,19 +838,15 @@ def _grade_by_ids(conn, image_path, out_root):
     for kind_ev, b in events:
         seq += 1
         if kind_ev == "bad":
-            unreadable_units.append({
-                "idx": seq, "no": None, "qtype": "", "kind": "id", "blank": 1,
-                "picked": None, "expected": "", "verdict": "unsure",
-                "confidence": 0.0, "reason": "题目标识不可读",
-                "unsure_reason": "题目标识不可读", "ratios": {},
-                "crop_path": _save_crop(norm, {"x": b["x"], "y": b["y"],
-                                               "w": card.ID_SIZE, "h": card.ID_SIZE},
-                                        crop_dir, "id_%d" % seq),
-            })
+            unreadable_units.append(
+                _id_unreadable_unit(seq, norm, b, crop_dir, "题目标识不可读"))
             continue
         row = _question_row(conn, b["no"])
         if row is None:
             unknown.append(b["no"])
+            unreadable_units.append(_id_unreadable_unit(
+                seq, norm, b, crop_dir,
+                "题目标识不可读：解出的题号 %s 在题库里查不到" % b["no"]))
             continue
         qtype = row["qtype"] or ""
         key = _answer_key_of(row)
@@ -1150,12 +1168,28 @@ def _read_id_from_photo(gray, box: dict, grid: int):
     return card.decode_id_bits(bits)           # 新卡：题号
 
 
+def _same_no(a, b) -> bool:
+    """两个题号是不是同一道题（t11：5 位老题号与 6 位新题号都要认）。
+
+    先按字符串比（库里就是 "03370" 这种补零写法），再退化成整数比 ——
+    "03370" vs "3370"、"100001" vs "100001" 都算同一道题。
+    """
+    sa, sb = str(a).strip(), str(b).strip()
+    if sa == sb:
+        return True
+    try:
+        return int(sa) == int(sb)
+    except (TypeError, ValueError):
+        return False
+
+
 def _check_manifest_ids(gray, page):
     """抽查前几题的标识，确认拍的就是这份卷子。
 
     → None(通过) | "legacy"(未知版本) | "mismatch"(不是这张卷)
     * manifest 是自描述的：判据是 **id_box.bits 的长度**，不是全局常量；
     * 16 位 = 旧卡（4×4，编码卷内题序 idx）；25 位 = 新卡（5×5，编码题号 no）；
+    * **题号位数不是判据**：5 位（00001）与 6 位（100001）都走同一条 25 位链路；
     * 读不出的跳过，不阻断判分（后面 OMR 自然会给 unsure）。
     """
     checked = 0
@@ -1170,8 +1204,7 @@ def _check_manifest_ids(gray, page):
         elif n == 25:
             got = _read_id_from_photo(gray, box, card.ID_GRID)
             expect = it.get("no")
-            same = (got is not None and expect is not None
-                    and str(got).zfill(5) == str(expect).zfill(5))
+            same = (got is not None and expect is not None and _same_no(got, expect))
         else:
             return "legacy"
         if got is None:
