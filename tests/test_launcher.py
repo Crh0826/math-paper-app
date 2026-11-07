@@ -235,6 +235,30 @@ class ServeTest(unittest.TestCase):
         self.assertLess(time.time() - t0, 2.0)
 
 
+class FrozenBridgeTest(unittest.TestCase):
+    """打包版特有坑：ocr.pin_stdlib_select() 会把 _internal 移出 sys.path 再 import select，
+    冻结包里 select.pyd 就在 _internal → ModuleNotFoundError，进而 grade_routes 挂不上、判卷页 404。
+    launcher 在导入业务模块前先把 select 钉住。"""
+
+    def test_bridge_keeps_select_importable_after_path_removal(self):
+        import importlib
+        self.assertTrue(launcher._install_frozen_stdlib_bridge(force=True))
+        saved = sys.path[:]
+        try:
+            sys.path[:] = [p for p in sys.path if "site-packages" not in p.lower()]
+            sys.modules.pop("select", None)
+            real = importlib.import_module("select")
+            self.assertTrue(hasattr(real, "select"), "拿回来的不是真的 stdlib select")
+            importlib.reload(real)          # ocr 里还会 reload selectors，不能炸
+        finally:
+            sys.path[:] = saved
+
+    def test_bridge_is_noop_outside_frozen(self):
+        before = len(sys.meta_path)
+        self.assertFalse(launcher._install_frozen_stdlib_bridge())
+        self.assertEqual(len(sys.meta_path), before)
+
+
 class CheckModeTest(unittest.TestCase):
     def test_check_runs_and_reports(self):
         out = io.StringIO()
@@ -242,10 +266,66 @@ class CheckModeTest(unittest.TestCase):
             code = launcher.main(["--check"])
         text = out.getvalue()
         self.assertEqual(code, 0, text)
-        for key in ("环境自检", "题库", "数据库", "配置", "Word", "可用端口", "结论"):
+        for key in ("环境自检", "题库", "数据库", "配置", "PDF 后端", "可用端口", "结论"):
             self.assertIn(key, text)
         self.assertIn("打包运行", text)
+        self.assertRegex(text, r"PDF 后端\s+(word|libreoffice|都没有)")
 
+    def test_check_does_not_copy_database_into_package(self):
+        """构建脚本在 dist 里跑 --check 自检，绝不能顺手把 120MB 数据库复制进包里。"""
+        tmp = tempfile.mkdtemp(prefix="launcher_check_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        base = os.path.join(tmp, "程序目录")
+        bundle = os.path.join(tmp, "_internal")
+        os.makedirs(os.path.join(bundle, "data"), exist_ok=True)
+        with open(os.path.join(bundle, "config.json"), "w", encoding="utf-8") as fh:
+            json.dump({"server": {"port": 8710}}, fh)
+        with open(os.path.join(bundle, "data", "app.db"), "wb") as fh:
+            fh.write(b"SQLite format 3\x00tiny")
+        old_cwd = os.getcwd()
+        self.addCleanup(os.chdir, old_cwd)
+        out = io.StringIO()
+        with mock.patch.object(launcher, "base_dir", return_value=base), \
+                mock.patch.object(launcher, "bundle_dir", return_value=bundle), \
+                mock.patch.object(launcher, "resolve_qb_root", return_value=None):
+            with contextlib.redirect_stdout(out):
+                launcher.main(["--check"])
+        self.assertFalse(os.path.exists(os.path.join(base, "config.json")),
+                         "--check 不许把 config.json 复制到 exe 旁边")
+        self.assertFalse(os.path.exists(os.path.join(base, "data", "app.db")),
+                         "--check 不许把 app.db 复制到包里（会让 zip 多 120MB）")
+        self.assertIn("PDF 后端", out.getvalue())
+
+class PackagingGuardTest(unittest.TestCase):
+    """打包前的红线：答题卡必须是 5×5（t46），否则用户装了会被判 legacy_card。"""
+
+    def test_card_module_is_5x5(self):
+        import card
+        self.assertEqual(getattr(card, "ID_GRID", None), 5,
+                         "card.py 的 ID_GRID 不是 5：旧 4×4 卡不能打包")
+        self.assertEqual(getattr(card, "ID_GRID") ** 2 - getattr(card, "NO_BITS", 20), 5,
+                         "5×5=25 位里应留 5 位 CRC（NO_BITS=20）")
+
+    def test_build_script_checks_card_before_packing(self):
+        path = os.path.join(launcher.HERE, "build_portable.ps1")
+        with open(path, encoding="utf-8-sig") as fh:
+            src = fh.read()
+        self.assertIn("ID_GRID", src, "构建脚本要读 card.py 的 ID_GRID 判断版本")
+        self.assertIn("legacy_card", src, "要写明为什么要拦（用户被判 legacy_card）")
+
+
+class VersionTest(unittest.TestCase):
+    def test_read_version_prefers_version_file(self):
+        tmp = tempfile.mkdtemp(prefix="launcher_ver_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with open(os.path.join(tmp, "VERSION.txt"), "w", encoding="utf-8") as fh:
+            fh.write("v1.9\n")
+        self.assertEqual(launcher.read_version(base=tmp, bundle=tmp), "1.9")
+
+    def test_read_version_falls_back_to_source_default(self):
+        tmp = tempfile.mkdtemp(prefix="launcher_ver_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.assertEqual(launcher.read_version(base=tmp, bundle=tmp), launcher.VERSION)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

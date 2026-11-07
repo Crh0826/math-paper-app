@@ -51,7 +51,10 @@ python import_qbank.py --from json|excel|csv|docx --file <路径> [--db <app.db>
 - **幂等**：按 `no` upsert；重复导入只更新不重复插入。
 - 坏行（缺 `no`/`answer`、`qtype` 非法）只进报告，不落库；报告写 `data/import_report.json`。
 - 多学科：`subjects(subject_pk, name, grade, version)` + `questions.subject_pk` + `kps.subject_pk`；
-  老库自动迁移并把存量归到 `math7a`；`picker` 用 `importers.subject_scope()` 过滤学科。
+  老库自动迁移并把存量归到 `math7a`；组卷侧按 `scope.subject_pk/subjects` 过滤（见 §2，t11）；
+  注意 `kps.kp_id` 仍是全局主键 —— **导入多学科时 kp_id 必须带学科前缀**（如语文 `CN1.1`），否则会撞主键。
+- 无原始 docx 的题（15 万题口径）：`paper.source_tokens` 回退读 `questions.tokens_json`，
+  只支持**无图题**（text/math/无图表格）；含 `embed` 或带媒体表格的题会报 `PaperError`（避免缺图卷面）。
 - 导入的题**不自动生成** `quality_flags`，需另跑 `python quality.py`。
 
 
@@ -79,7 +82,8 @@ python import_qbank.py --from json|excel|csv|docx --file <路径> [--db <app.db>
 {
   "title": "七年级数学 · 训练卷 A",
   "mix":   {"选择": 10, "填空": 8, "解答": 6},
-  "scope": {"chapters": ["第1章 有理数"], "kps": ["1.2", "3.2"], "kp_mode": "any"},
+  "scope": {"subject_pk": "math7a", "subjects": ["math7a"],
+            "chapters": ["第1章 有理数"], "kps": ["1.2", "3.2"], "kp_mode": "any"},
   "requirements": {"need_answer": true, "exclude_empty": true, "exclude_no_family": false,
                    "exclude_fig_missing": true, "exclude_mismatch": true, "strict": false},
   "seed": 42,
@@ -119,6 +123,10 @@ python import_qbank.py --from json|excel|csv|docx --file <路径> [--db <app.db>
   不要把解答题框撑成大空白；作答区只在答题卡上。
 - `space` 仅在特殊场合（老师想要"卷面草稿区"）才调大，UI 默认不暴露。
 - `scope.chapters` 与 `scope.kps` 任一为空表示不限制；`kps` 支持 `x.0`（章级）
+- **学科过滤（t11）**：`scope.subject_pk`（单选，组卷页下拉默认必选一个）与 `scope.subjects`（多选/接口）
+  取并集，SQL 上是 `AND subject_pk IN (...)`，与 chapters/kps 是 **AND** 关系；两个都空 = 不限（老接口兼容）。
+  未知学科、或章节/知识点不属于所选学科 → `ScopeError`；`nos` 精确题集里混进别的学科 → `SelectError`。
+  组卷页的「可出 N 题」与章节选择器都按同一个学科算（避免 7 科混库时跨学科混卷）。
 - `need_answer=true` 时只从 `answer_raw<>''` 的题里选（判卷需要）
 - `seed` 固定 → 同一参数同一份卷（可复现）；换 seed 换题
 - 返回：`pid` 与完整 manifest（见 §3）

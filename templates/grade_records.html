@@ -42,6 +42,15 @@
   .records-table th { font-size: 12.5px; color: var(--muted); font-weight: 600; }
   .records-table tr:last-child td { border-bottom: none; }
   .rec-title { display: block; font-size: 14px; }
+  /* t60 学生信息：学号+姓名放在标题下面一行；窄屏也在同一行，不另起卡片 */
+  .rec-student { display: block; font-size: 12.5px; margin-top: 2px; overflow-wrap: anywhere; }
+  .rec-student-name { margin-left: 6px; color: var(--ink-2); }
+  .filter-chip {
+    margin: -6px 0 12px; font-size: 12.5px; color: var(--ink-2);
+    background: var(--warn-soft, #fff8e6); border: 1px solid #f0dca8;
+    border-radius: 8px; padding: 6px 10px; overflow-wrap: anywhere;
+  }
+  .filters .f-student { flex: 0 1 190px; min-width: 0; }
   .rec-pid, .rec-sid { display: block; font-size: 11.5px; }
   .rec-num { font-size: 20px; color: var(--accent); }
   .rec-pct { display: block; font-size: 11.5px; color: var(--muted); }
@@ -102,16 +111,8 @@
         <small>沪科版七年级上 · 判卷记录</small>
       </span>
     </a>
-    <nav class="nav" aria-label="主导航">
-      <a class="nav-item" href="/">组卷</a>
-      <a class="nav-item" href="/papers">我的卷子</a>
-      <a class="nav-item" href="/submissions">判卷</a>
-      <a class="nav-item is-active" href="/records" aria-current="page">判卷记录</a>
-      <a class="nav-item" href="/train">训练</a>
-      <a class="nav-item" href="/guide">使用指南</a>
-      <a class="nav-item" href="/health">自检</a>
-    </nav>
-    <a class="ghost-link mono" href="/healthz" target="_blank" rel="noopener">healthz</a>
+    {% set nav_active = "records" %}
+      {% include "_nav.html" %}
   </div>
 </header>
 
@@ -121,7 +122,7 @@
     <h1>判卷记录</h1>
     <p class="lede rec-head">
       <span>判过的卷子都在这里：点「查看结果」看逐题判定，点「导出证据包」拿批注图与 evidence.json。</span>
-      <span class="rec-count">共 {{ total }} 次判卷{% if items | length != total %} · 当前显示 {{ items | length }} 条{% endif %}{% if n_pending %} · 其中待确认 {{ n_pending }} 条{% endif %}</span>
+      <span class="rec-count">共 {{ total }} 次判卷{% if items | length != total %} · 当前显示 {{ items | length }} 条{% endif %}{% if n_pending %} · 其中待确认 {{ n_pending }} 条{% endif %}{% if n_students %} · 涉及学生 {{ n_students }} 人{% endif %}</span>
     </p>
   </div>
 
@@ -135,13 +136,23 @@
       <option value="{{ p.pid }}"{% if p.pid == f_pid %} selected{% endif %}>{{ p.title | truncate(16, True, '…') if p.title else p.pid }}（判 {{ p.n }} 次）</option>
       {% endfor %}
     </select>
+    <input class="f-student" type="search" name="student" value="{{ f_student }}"
+           placeholder="按学号前缀（如 202503）" inputmode="numeric" autocomplete="off"
+           aria-label="按学号筛选">
     <label class="check-inline">
       <input type="checkbox" name="only" value="pending"{% if f_only == 'pending' %} checked{% endif %}>
       只看待确认
     </label>
     <button class="btn btn-primary" type="submit">筛选</button>
-    {% if f_pid or f_q or f_only %}<a class="btn" href="/records">清除筛选</a>{% endif %}
+    {% if f_pid or f_q or f_only or f_student %}<a class="btn" href="/records">清除筛选</a>{% endif %}
   </form>
+
+  {% if f_student or f_pid or f_q or f_only %}
+  <p class="filter-chip">
+    当前筛选：{% if f_student %}学号前缀 <b class="mono">{{ f_student }}</b>{% endif %}{% if f_pid %}{% if f_student %} · {% endif %}卷号 <b class="mono">{{ f_pid }}</b>{% endif %}{% if f_q %}{% if f_student or f_pid %} · {% endif %}关键词 <b>{{ f_q }}</b>{% endif %}{% if f_only %}{% if f_student or f_pid or f_q %} · {% endif %}只看待确认{% endif %}
+    <a href="/records">清除</a>
+  </p>
+  {% endif %}
 
   {% if items %}
   <section class="card" style="padding: 6px 10px;">
@@ -149,7 +160,7 @@
       <table class="records-table">
         <thead>
           <tr>
-            <th>时间</th><th>卷子</th><th>得分</th><th>待确认</th><th>状态</th><th>操作</th>
+            <th>时间</th><th>卷子 / 学生</th><th>得分</th><th>待确认</th><th>状态</th><th>操作</th>
           </tr>
         </thead>
         <tbody>
@@ -160,6 +171,11 @@
               <strong class="rec-title">{{ it.title or '（卷子记录已不在，仍可看结果）' }}</strong>
               <span class="mono muted rec-pid">卷号 {{ it.pid }}</span>
               <span class="mono muted rec-sid">{{ it.sid }}</span>
+              <span class="rec-student">
+                {% if it.student_no %}学号 <b class="mono">{{ it.student_no }}</b>
+                {% else %}<span class="muted">学号未识别</span>{% endif %}
+                {% if it.student_name %}<span class="rec-student-name">{{ it.student_name }}</span>{% endif %}
+              </span>
             </td>
             <td class="rec-score" data-label="得分">
               <strong class="rec-num">{{ it.score }} / {{ it.full }}</strong>
@@ -202,9 +218,14 @@
 
   <div class="form-actions">
     <a class="btn btn-primary" href="/submissions">判新的一份</a>
+    <a class="btn" href="/records.csv" title="全部判卷记录汇总，Excel 直接打开">导出全部 CSV</a>
     <a class="btn" href="/papers">我的卷子</a>
     <a class="btn" href="/guide#photo">拍照要求</a>
   </div>
+  <p class="muted" style="font-size:12.5px;margin:8px 0 0;">
+    学情报告口径：按知识点聚合的正确率（/papers/&lt;卷号&gt;/report.csv）在同一份卷被判过多次时只取
+    <strong>最近一次</strong>提交，避免同一张卷被重复计数。
+  </p>
 </main>
 
 <footer class="footer">

@@ -20,6 +20,12 @@
     .ghost-link { display: none; }
   }
 
+  .by-ids-note {
+    margin: 0 0 12px; padding: 10px 14px; border-radius: 10px; font-size: 13.5px;
+    background: var(--warn-soft, #fff8e6); border: 1px solid #f0dca8; color: #6b4e00;
+  }
+  .by-ids-note strong { color: #8a5a00; }
+
   .footer {
     max-width: 1080px; margin: 0 auto; padding: 18px 20px 42px;
     color: var(--muted); font-size: 12.5px;
@@ -103,6 +109,87 @@
     .grade-table .cell-fix { min-width: 0; }
     .crop { max-width: 100%; }
   }
+
+  /* ---- t56 改卷页面重构：两列布局 + 改卷记录时间线（只在本模板内生效，不碰 app.css） ---- */
+  html, body { max-width: 100%; }
+  .regrade-grid {
+    /* 左列固定上限 340px：右列的逐题表要够宽（表里有输入框/下拉/裁切图），
+       否则表格 min-content 会把页面撑出横向滚动条 */
+    display: grid; grid-template-columns: minmax(0, 340px) minmax(0, 1fr);
+    gap: 16px; align-items: start;
+  }
+  .regrade-side { position: sticky; top: 12px; min-width: 0; }
+  .regrade-main { min-width: 0; overflow-x: auto; }
+  .regrade-main .grade-table { min-width: 0; }
+  .regrade-main .cell-fix input.ans,
+  .regrade-main .cell-fix select { width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; }
+  .regrade-main .crop { max-width: 100%; }
+  .regrade-main .cell-fix .quick { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .regrade-main .cell-fix .quick .btn { flex: 0 0 auto; white-space: nowrap; }
+  .regrade-main .cell-fix .quick select { flex: 1 1 110px; width: auto; }
+  .annotated-card { padding: 14px; }
+  .annotated-link { display: block; }
+  .annotated-thumb {
+    display: block; width: 100%; height: auto;
+    border: 1px solid var(--line); border-radius: 10px;
+  }
+  .annotated-tip { font-size: 12.5px; margin: 8px 0 0; overflow-wrap: anywhere; }
+  /* t60 学生信息：学号/姓名 + 补录表单（收在 <details> 里，不占版面） */
+  .student-cell { overflow-wrap: anywhere; }
+  .student-no { font-weight: 600; }
+  .student-name { margin-left: 8px; }
+  .student-none { margin-right: 6px; }
+  .student-fix { display: inline-block; margin-left: 8px; font-size: 12.5px; }
+  .student-fix summary { cursor: pointer; color: var(--accent); }
+  .student-form {
+    display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 8px;
+    max-width: 100%;
+  }
+  .student-form input {
+    flex: 1 1 150px; min-width: 0; padding: 6px 8px; font: inherit; font-size: 13px;
+    border: 1px solid var(--line); border-radius: 8px; box-sizing: border-box;
+  }
+  .student-form .btn { flex: 0 0 auto; }
+
+  .edits-card { margin-top: 16px; overflow-wrap: anywhere; }
+  .edits-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; flex-wrap: wrap;
+  }
+  .edits-head h2 { margin: 0; }
+  .edits-lede { font-size: 12.5px; margin: 6px 0 12px; }
+  .edits-empty { margin: 8px 0 0; }
+  .timeline { list-style: none; margin: 0; padding: 0 0 0 18px; position: relative; }
+  .timeline::before {
+    content: ""; position: absolute; left: 5px; top: 6px; bottom: 6px;
+    width: 2px; background: var(--line-soft);
+  }
+  .tl-item { position: relative; padding: 0 0 14px 6px; overflow-wrap: anywhere; }
+  .tl-dot {
+    position: absolute; left: -17px; top: 5px; width: 10px; height: 10px;
+    border-radius: 50%; background: #2f9e58; box-shadow: 0 0 0 3px #e8f6ee;
+  }
+  .tl-undo .tl-dot { background: #d08a00; box-shadow: 0 0 0 3px #fff3d6; }
+  .tl-meta {
+    margin: 0 0 4px; display: flex; gap: 8px; align-items: center;
+    flex-wrap: wrap; font-size: 12.5px;
+  }
+  .tl-changes { margin: 0 0 6px; padding-left: 18px; font-size: 13px; }
+  .tl-changes li { margin: 2px 0; }
+  .tl-before { color: var(--muted); text-decoration: line-through; }
+  .tl-arrow { color: var(--muted); margin: 0 4px; }
+  .tl-after { font-weight: 600; }
+  .tl-undo-form { margin: 0; }
+
+  @media (max-width: 900px) {
+    .regrade-grid { grid-template-columns: minmax(0, 1fr); }
+    .regrade-side { position: static; }
+    .annotated-thumb { max-height: 46vh; object-fit: contain; }
+  }
+  @media (max-width: 420px) {
+    .edits-head { flex-direction: column; align-items: flex-start; }
+    .tl-meta { font-size: 12px; }
+  }
 </style>
 </head>
 <body>
@@ -115,16 +202,8 @@
         <small>沪科版七年级上 · 拍照判卷</small>
       </span>
     </a>
-    <nav class="nav" aria-label="主导航">
-      <a class="nav-item" href="/">组卷</a>
-      <a class="nav-item" href="/papers">我的卷子</a>
-      <a class="nav-item is-active" href="/submissions" aria-current="page">判卷</a>
-      <a class="nav-item" href="/records">判卷记录</a>
-      <a class="nav-item" href="/train">训练</a>
-      <a class="nav-item" href="/guide">使用指南</a>
-      <a class="nav-item" href="/health">自检</a>
-    </nav>
-    <a class="ghost-link mono" href="/healthz" target="_blank" rel="noopener" title="自检数据（JSON）">healthz</a>
+    {% set nav_active = "grade" %}
+      {% include "_nav.html" %}
   </div>
 </header>
 
@@ -147,6 +226,12 @@
 
   {% if notice %}{{ banner(notice, notice.tone) }}{% endif %}
 
+  {% if by_ids_note %}
+  <p class="by-ids-note" id="by-ids-note">
+    <strong>按每题标识识别</strong> · {{ by_ids_note }}
+  </p>
+  {% endif %}
+
   <section class="card score-card" data-sid="{{ sid }}" data-score="{{ score }}" data-full="{{ full }}">
     <div class="score-main">
       <span class="score-num" id="score-num">{{ score }}</span><span class="score-sep">/</span><span class="score-full" id="score-full">{{ full }}</span>
@@ -155,6 +240,23 @@
     <dl class="kv score-kv">
       <dt>卷号</dt><dd class="mono">{{ pid }}</dd>
       <dt>提交号</dt><dd class="mono">{{ sid }}</dd>
+      <dt>学生</dt>
+      <dd class="student-cell" id="student-cell">
+        {% if student_no %}<span class="mono student-no">{{ student_no }}</span>
+        {% else %}<span class="muted student-none">学号未识别</span>{% endif %}
+        {% if student_name %}<span class="student-name">{{ student_name }}</span>{% endif %}
+        <details class="student-fix">
+          <summary>{{ '改学生信息' if student_no else '补录学生信息' }}</summary>
+          <form class="student-form" method="post" action="student">
+            <input type="text" name="student_no" value="{{ student_no }}"
+                   placeholder="学号（答题卡上涂的那串数字）" inputmode="numeric"
+                   maxlength="32" autocomplete="off">
+            <input type="text" name="student_name" value="{{ student_name }}"
+                   placeholder="姓名（可空，手写框读不出）" maxlength="32" autocomplete="off">
+            <button class="btn btn-xs btn-primary" type="submit">保存</button>
+          </form>
+        </details>
+      </dd>
       <dt>判分单元</dt><dd>{{ n_units }} 个（无标准答案的题不计入分母）</dd>
       <dt>卷号二维码</dt>
       <dd>{% if qr_ok %}读到{% if qr and qr.pid %}（{{ qr.pid }}）{% endif %}{% else %}没读到 —— 按你选的卷号判，结果一样准{% endif %}</dd>
@@ -194,6 +296,8 @@
        title="把判卷过程画回原图：每个框为什么判对／判错都标在图上">查看批注图</a>
     <a class="btn" href="export.zip"
        title="打包批注图 + 每题裁切图 + evidence.json（本次判卷的全部证据）">导出证据包</a>
+    <a class="btn" href="/submissions/{{ sid }}/export.csv"
+       title="每题一行：题号/题型/空号/知识点/标准答案/识别值/判定/是否人工确认，Excel 直接打开">导出 CSV（本题明细）</a>
     <a class="btn" href="/submissions">换一张照片</a>
     <a class="btn" href="/submissions?pid={{ pid }}">重拍这份卷</a>
     <a class="btn" href="/guide#photo">拍照要求</a>
@@ -204,6 +308,24 @@
     框内小字是识别文本与期望答案。每行的「为什么」能看这道题的原始证据（识别值／期望／墨迹占比）。
   </p>
 
+  {# t56 两列：左=批注图，右=逐题判定（窄屏单列）。样式写在本文件 <style> 里，不碰 app.css #}
+  <div class="regrade-grid">
+    <aside class="regrade-side">
+      <section class="card annotated-card">
+        <h2>批注图</h2>
+        <a class="annotated-link" href="annotated.png" target="_blank" rel="noopener"
+           title="点开看大图：每个作答框为什么判对／判错都标在图上">
+          <img class="annotated-thumb" src="annotated.png" loading="lazy"
+               alt="批注图：绿=判对、红=判错、橙虚线=待确认、蓝=待识别">
+        </a>
+        <p class="muted annotated-tip">
+          <b class="lg-ok">绿=判对</b>、<b class="lg-fail">红=判错</b>、<b class="lg-warn">橙虚线=待确认</b>、<b class="lg-pending">蓝=待识别</b>；
+          框内小字是识别文本与期望答案。
+        </p>
+      </section>
+    </aside>
+
+    <div class="regrade-main">
   <form method="post" action="confirm" class="grade-form">
     <section class="card">
       <h2>逐题判定</h2>
@@ -282,11 +404,63 @@
         </tbody>
       </table>
       <div class="sticky-save">
-        <button class="btn btn-primary" type="submit">保存改判</button>
+        <button class="btn btn-primary" type="submit" id="save-btn">保存改判</button>
         <span class="muted">只提交改动过的行；重复提交是幂等的，不会重复计分。判对／判错会喂给错题训练。</span>
       </div>
     </section>
   </form>
+    </div>
+  </div>
+
+  {# t56 改卷记录时间线：谁、什么时候、把哪一空从什么改成什么；整批可撤销 #}
+  <section class="card edits-card no-print" id="edits">
+    <div class="edits-head">
+      <h2>改卷记录</h2>
+      <a class="btn btn-xs" href="/submissions/{{ sid }}/edits.csv"
+         title="导成 CSV（时间/题号/空号/改前/改后/操作者/批次），Excel 直接打开">导出改卷记录 CSV</a>
+    </div>
+    {% if edit_batches %}
+    <p class="muted edits-lede">共 {{ edit_batches | length }} 批改动，最近的在最上面。撤销是整批的，撤销本身也会留一条记录。</p>
+    <ol class="timeline" id="edits-timeline">
+      {% for b in edit_batches %}
+      <li class="tl-item{% if b.source == 'undo' %} tl-undo{% endif %}" id="batch-{{ b.short }}">
+        <span class="tl-dot" aria-hidden="true"></span>
+        <div class="tl-body">
+          <p class="tl-meta">
+            <span class="mono tl-when">{{ b.when }}</span>
+            <span class="tl-who">{{ b.operator }}</span>
+            <span class="pill {% if b.source == 'undo' %}pill-warn{% else %}pill-ok{% endif %}">{{ '撤销' if b.source == 'undo' else '改判' }}</span>
+            <span class="mono muted">批次 {{ b.short }}</span>
+          </p>
+          <ul class="tl-changes">
+            {% for it in b.changes %}
+            <li>
+              <span class="mono">{{ it.idx }}-{{ it.blank }}</span>
+              {% if it.qtype %}<span class="muted">{{ it.qtype }}</span>{% endif %}
+              <span class="tl-before">{{ it.before }}</span>
+              <span class="tl-arrow">→</span>
+              <span class="tl-after">{{ it.after }}</span>
+              {% if it.note %}<span class="muted">（{{ it.note }}）</span>{% endif %}
+            </li>
+            {% endfor %}
+          </ul>
+          {% if b.source != 'undo' %}
+          <form class="tl-undo-form" method="post"
+                action="/submissions/{{ sid }}/edits/{{ b.batch_id }}/undo"
+                onsubmit="return confirm('撤销批次 {{ b.short }} 的 {{ b.changes | length }} 处改判？分数会按撤销后的判定重算。');">
+            <button class="btn btn-xs" type="submit">撤销这批</button>
+          </form>
+          {% endif %}
+        </div>
+      </li>
+      {% endfor %}
+    </ol>
+    {% else %}
+    <p class="muted edits-empty" id="edits-empty">
+      这次判卷还没有人工改判。上面改完点「保存改判」，改动会记在这里，可以整批撤销。
+    </p>
+    {% endif %}
+  </section>
 
   {# 「为什么这么判」抽屉：JS 拦截 .why-link 点击，把 item/{idx}/why?format=html&embed=1 片段塞进来 #}
   <div class="why-backdrop" id="why-backdrop" hidden></div>
@@ -516,6 +690,24 @@
   });
   document.addEventListener('keydown', function (ev) {
     if (ev.key === 'Escape') { closeWhy(); }
+  });
+
+  // t56：保存改判时禁用按钮 + 显示「保存中…」，双击不会重复提交
+  document.querySelectorAll('form.grade-form').forEach(function (form) {
+    form.addEventListener('submit', function () {
+      var btn = form.querySelector('button[type="submit"]');
+      if (!btn || btn.disabled) { return; }
+      btn.dataset.label = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '保存中…';
+      // 兜底：浏览器拦下提交（必填校验没过）时 8 秒后恢复按钮
+      setTimeout(function () {
+        if (btn.disabled) {
+          btn.disabled = false;
+          btn.textContent = btn.dataset.label || '保存改判';
+        }
+      }, 8000);
+    });
   });
 })();
 </script>

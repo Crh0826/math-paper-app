@@ -80,15 +80,17 @@ def rects_of_page(page):
     out = []
     for a in page["marks"]["aruco"]:
         out.append(("aruco%d" % a["id"], a["x"], a["y"], a["size"], a["size"]))
-    q = page["qr"]
-    out.append(("qr", q["x"], q["y"], q["size"], q["size"]))
+    q = page.get("qr")
+    if q:
+        out.append(("qr", q["x"], q["y"], q["size"], q["size"]))
     for hd in page.get("headers", []):
         out.append(("header:%s" % hd.get("text", "")[:8], hd["x"], hd["y"], hd["w"], hd["h"]))
     for it in page["items"]:
         tag = "%s#%d" % (it["kind"], it["idx"])
         if "id_box" in it:
             b = it["id_box"]
-            out.append((tag + ".id", b["x"], b["y"], b["cell"] * 4, b["cell"] * 4))
+            grid = 4 if len(b.get("bits") or []) == 16 else 5
+            out.append((tag + ".id", b["x"], b["y"], b["cell"] * grid, b["cell"] * grid))
         for c in it.get("cells", []):
             out.append((tag + ".cell" + str(c["opt"]), c["x"], c["y"], c["w"], c["h"]))
         for b in it.get("boxes", []):
@@ -131,9 +133,8 @@ class TestIdCodec(unittest.TestCase):
         with self.assertRaises(ValueError):
             cardmod.encode_id_bits(1 << 20)
 
-    def test_zero_and_too_large_rejected_on_decode(self):
-        self.assertIsNone(cardmod.decode_id_bits(cardmod.encode_id_bits(0) ), "00000 不是题号")
-        self.assertIsNone(cardmod.decode_id_bits(cardmod.encode_id_bits(100000)))
+    def test_zero_rejected_on_decode(self):
+        self.assertIsNone(cardmod.decode_id_bits(cardmod.encode_id_bits(0)), "00000 不是题号")
 
     def test_checksum_rejects_corruption(self):
         bits = cardmod.encode_id_bits("03370")
@@ -146,6 +147,56 @@ class TestIdCodec(unittest.TestCase):
 
     def test_rejects_bad_length(self):
         self.assertIsNone(cardmod.decode_id_bits([1, 0, 1]))
+
+
+class TestIdCodecSixDigit(unittest.TestCase):
+    """t11 · 15 万题的题号是 6 位（100000..1048575）：标识仍是 25 格，编码口径不变。
+
+    老题号（00001..99999）必须逐字节不变 —— 已打印的旧答题卡还得能判。
+    """
+
+    SIX = ("100000", "100001", "123456", "999999", "1048575")
+
+    def test_roundtrip_six_digit(self):
+        for s in self.SIX:
+            bits = cardmod.encode_id_bits(s)
+            self.assertEqual(25, len(bits), "6 位题号也必须是 5x5=25 格")
+            self.assertEqual(s, cardmod.decode_id_bits(bits),
+                             "6 位题号 %s 编解码不自洽" % s)
+
+    def test_max_no_is_2_pow_20_minus_1(self):
+        self.assertEqual((1 << 20) - 1, cardmod.MAX_NO)
+        self.assertEqual("1048575", cardmod.decode_id_bits(cardmod.encode_id_bits(cardmod.MAX_NO)))
+        with self.assertRaises(ValueError):
+            cardmod.encode_id_bits(cardmod.MAX_NO + 1)
+
+    def test_five_digit_stays_zero_padded(self):
+        """老题号口径不变：解出来还是 5 位补零字符串。"""
+        self.assertEqual("00001", cardmod.decode_id_bits(cardmod.encode_id_bits(1)))
+        self.assertEqual("99999", cardmod.decode_id_bits(cardmod.encode_id_bits(99999)))
+
+    def test_encode_accepts_int_and_str(self):
+        self.assertEqual(cardmod.encode_id_bits("100000"), cardmod.encode_id_bits(100000))
+
+    def test_crc_still_catches_six_digit_corruption(self):
+        """6 位题号每一位翻错都必须被 CRC 抓住（不能靠范围检查兜底）。"""
+        bits = cardmod.encode_id_bits("100001")
+        for k in range(25):
+            bad = list(bits)
+            bad[k] ^= 1
+            self.assertIsNone(cardmod.decode_id_bits(bad),
+                              "6 位题号第 %d 位翻错还能解出题号，校验位失效" % k)
+
+    def test_decode_idx_returns_int(self):
+        self.assertEqual(100001, cardmod.decode_idx_bits(cardmod.encode_id_bits("100001")))
+
+    def test_plan_item_uses_six_digit_no(self):
+        """出卡几何里的 id_bits 也必须encode 出 6 位题号（判卷侧按它反查题目）。"""
+        geom, _h = cardmod.plan_item(
+            {"idx": 1, "no": "100002", "qtype": "选择", "options": ["A", "B", "C", "D"]},
+            cardmod.KIND_OMR, 1000)
+        self.assertEqual(25, len(geom["id_bits"]))
+        self.assertEqual("100002", cardmod.decode_id_bits(geom["id_bits"]))
 
 
 class TestSinglePage(_Base):
@@ -180,7 +231,7 @@ class TestSinglePage(_Base):
             self.assertAlmostEqual(ARUCO_SIZE, a["size"], delta=2)
             self.assertEqual((a["x"], a["y"]), ARUCO_POS[a["id"]])
         qr = page["qr"]
-        self.assertEqual({"pid": PID, "p": 1}, qr["payload"])
+        self.assertEqual({"pid": PID, "p": 1, "v": cardmod.CARD_VERSION}, qr["payload"])
         self.assertAlmostEqual(QR_SIZE, qr["size"], delta=2)
 
     def test_kinds_match_qtype(self):
@@ -283,8 +334,8 @@ class TestSinglePage(_Base):
             data, _, _ = det.detectAndDecode(crop)
             self.assertTrue(data, "QR 解不出来（解到空串）")
             self.assertEqual(
-                {"pid": PID, "p": page["page"]}, json.loads(data), "QR payload 与卡面不一致"
-            )
+                {"pid": PID, "p": page["page"], "v": cardmod.CARD_VERSION},
+                json.loads(data), "QR payload 与卡面不一致")
 
     def test_id_box_decodable_from_png(self):
         """按坐标采样渲染图上的 5×5 标识 → 必须解回题号（判卷侧取数路径）。"""
@@ -325,12 +376,16 @@ class TestMultipage(_Base):
         self.assertEqual(len(pages), len(self.res["png"]))
         self.assertEqual(list(range(1, len(pages) + 1)), [p["page"] for p in pages])
 
-    def test_each_page_has_marks_and_qr(self):
+    def test_each_page_has_grouped_marks_and_qr_only_first(self):
         for p in self.res["card"]["pages"]:
             self.assertEqual(4, len(p["marks"]["aruco"]))
-            self.assertEqual({0, 1, 2, 3}, {a["id"] for a in p["marks"]["aruco"]})
-            self.assertIn("payload", p["qr"])
-            self.assertEqual(p["page"], p["qr"]["payload"]["p"], "QR 的 p 必须是本卡页序")
+            want = sorted(cardmod.page_marker_ids(p["page"]).values())
+            self.assertEqual(want, sorted(a["id"] for a in p["marks"]["aruco"]),
+                             "第 %d 页四角 id = 4(p-1)..4(p-1)+3" % p["page"])
+            if p["page"] == 1:
+                self.assertEqual(1, p["qr"]["payload"]["p"])
+            else:
+                self.assertIsNone(p["qr"], "v4 只有第 1 页印 QR")
 
     def test_no_item_lost_or_duplicated(self):
         seen = []
@@ -358,14 +413,16 @@ class TestMultipage(_Base):
         for p in self.res["card"]["pages"][:-1]:
             self.assertGreaterEqual(len(p["items"]), 2, "第 %d 页利用不足" % p["page"])
 
-    def test_qr_decodes_on_every_page(self):
-        """每一页的 QR 都必须能被判卷侧的取数函数解出来（含 p=1 这种刁钻 payload）。"""
+    def test_qr_decodes_on_first_page_only(self):
+        """v4：QR 只在第 1 页；其余页 read_qr(None) 必须安全返回 None（不抛）。"""
         self.assertIsNotNone(cardmod.read_qr, "card.read_qr 必须存在，grade.py 直接复用")
         for png, page in zip(self.res["png"], self.res["card"]["pages"]):
-            got = cardmod.read_qr(png, page["qr"])
-            self.assertIsNotNone(got, "第 %d 页 QR 解不出来" % page["page"])
-            self.assertEqual(page["qr"]["payload"], got)
-            self.assertEqual(page["page"], got["p"])
+            got = cardmod.read_qr(png, page.get("qr"))
+            if page["page"] == 1:
+                self.assertIsNotNone(got, "第 1 页 QR 解不出来")
+                self.assertEqual(page["qr"]["payload"], got)
+            else:
+                self.assertIsNone(got, "第 %d 页没有 QR，read_qr 应返回 None" % page["page"])
 
 
 class TestNumberingContinues(_Base):
@@ -521,6 +578,272 @@ class TestDeterministic(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestCardVersion(unittest.TestCase):
+    """t50 回归：新卡版本号要跟着标识格式升到 2（旧卡文件里的 1 不动）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="ver_")
+        m = make_manifest([_item(i, "选择", 1) for i in range(1, 4)], pid="P20261101-001")
+        m["paper"] = {"pages": 1}
+        cls.res = build_card(m, cls.tmp)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_new_card_version_is_4(self):
+        self.assertEqual(4, cardmod.CARD_VERSION)
+        self.assertEqual(1, cardmod.LEGACY_CARD_VERSION)
+        self.assertEqual(4, self.res["card"]["version"])
+        self.assertEqual(4, self.res["manifest"]["card"]["version"], "要合并进 manifest")
+        self.assertTrue(self.res["card"]["aruco_groups"], "v4 要标出「页序在 ArUco id 里」")
+
+    def test_qr_payload_carries_version(self):
+        page = self.res["card"]["pages"][0]
+        payload = page["qr"]["payload"]
+        self.assertEqual(cardmod.CARD_VERSION, payload.get("v"), "QR 里要带卡版本")
+        self.assertEqual(page["page"], payload["p"], "p 仍是本卡页序（判卷按它选页）")
+
+    def test_id_bits_still_25(self):
+        for page in self.res["card"]["pages"]:
+            for it in page["items"]:
+                self.assertEqual(25, len(it["id_box"]["bits"]))
+                self.assertEqual(str(it["no"]), cardmod.decode_id_bits(it["id_box"]["bits"]))
+
+    def test_health_is_return_value_not_manifest(self):
+        self.assertIn("health", self.res, "health 是 build_card 的返回值")
+        self.assertNotIn("health", self.res["manifest"].get("card") or {},
+                         "health 不写进 manifest（docstring 已写明）")
+
+
+class TestStudentArea(unittest.TestCase):
+    """t57：v3 学生信息区（学号涂卡 0-9 × 8 位 + 姓名/班级框）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="stu_")
+        m = make_manifest([_item(i, "选择", 1) for i in range(1, 3)], pid="P20261107-100")
+        m["paper"] = {"pages": 1}
+        cls.res = build_card(m, cls.tmp)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_area_present(self):
+        st = self.res["card"].get("student")
+        self.assertIsNotNone(st, "v3 卡必须带 student")
+        self.assertEqual(8, st["no_digits"])
+        self.assertEqual(8, len(st["columns"]))
+        for col in st["columns"]:
+            self.assertEqual(list(range(10)), [c["digit"] for c in col["cells"]])
+        self.assertGreaterEqual(st["cell_px"], cardmod.STUDENT_MIN_CELL)
+        self.assertIn("name_box", st)
+        self.assertIn("class_box", st)
+
+    def test_geometry_no_overlap(self):
+        st = self.res["card"]["student"]
+        page = self.res["card"]["pages"][0]
+        rects = [("student_area", st["area"]["x"], st["area"]["y"],
+                  st["area"]["w"], st["area"]["h"])]
+        for i, col in enumerate(st["columns"]):
+            for c in col["cells"]:
+                rects.append(("stu_%d_%d" % (i, c["digit"]), c["x"], c["y"], c["w"], c["h"]))
+        rects.append(("name_box", st["name_box"]["x"], st["name_box"]["y"],
+                      st["name_box"]["w"], st["name_box"]["h"]))
+        rects.append(("class_box", st["class_box"]["x"], st["class_box"]["y"],
+                      st["class_box"]["w"], st["class_box"]["h"]))
+        # 与 ArUco / QR / 正文区 不能重叠
+        fixed = [("aruco_%d" % mid, x, y, cardmod.ARUCO_SIZE, cardmod.ARUCO_SIZE)
+                 for mid, (x, y) in cardmod.ARUCO_POS.items()]
+        fixed.append(("qr", page["qr"]["x"], page["qr"]["y"], page["qr"]["size"], page["qr"]["size"]))
+        fixed.append(("body", cardmod.BODY_RECT[0], cardmod.BODY_RECT[1],
+                      cardmod.BODY_RECT[2], cardmod.BODY_RECT[3]))
+        for label, x, y, w, h in rects:
+            self.assertGreaterEqual(x, 0, label)
+            self.assertLessEqual(x + w, cardmod.PAGE_W, "%s 右越界" % label)
+            self.assertLessEqual(y + h, cardmod.PAGE_H, "%s 下越界" % label)
+            for fl, fx, fy, fw, fh in fixed:
+                hit = x < fx + fw and fx < x + w and y < fy + fh and fy < y + h
+                self.assertFalse(hit, "%s 与 %s 重叠" % (label, fl))
+
+    def test_encode_decode_roundtrip(self):
+        for no in ("20250317", "00000001", "99999999", "12345678"):
+            digits = cardmod.encode_student_bits(no)
+            self.assertEqual(8, len(digits))
+            ratios = [[0.0] * 10 for _ in digits]
+            for i, d in enumerate(digits):
+                ratios[i][d] = 0.9
+            self.assertEqual(no, cardmod.decode_student_bits(ratios))
+
+    def test_decode_tolerates_one_blank(self):
+        digits = cardmod.encode_student_bits("20250317")
+        ratios = [[0.0] * 10 for _ in digits]
+        for i, d in enumerate(digits):
+            ratios[i][d] = 0.9
+        ratios[3] = [0.05] * 10               # 第 4 位没涂
+        self.assertEqual("202?0317", cardmod.decode_student_bits(ratios))
+
+    def test_decode_blank_returns_none(self):
+        self.assertIsNone(cardmod.decode_student_bits([[0.0] * 10] * 8))
+        self.assertIsNone(cardmod.decode_student_bits([[0.0] * 10] * 8, max_unknown=0))
+        self.assertIsNone(cardmod.decode_student_bits([]))
+        self.assertIsNone(cardmod.decode_student_bits(None))
+
+    def test_decode_two_blanks_returns_none(self):
+        digits = cardmod.encode_student_bits("20250317")
+        ratios = [[0.0] * 10 for _ in digits]
+        for i, d in enumerate(digits):
+            ratios[i][d] = 0.9
+        ratios[1] = [0.02] * 10
+        ratios[6] = [0.02] * 10
+        self.assertIsNone(cardmod.decode_student_bits(ratios))
+
+    def test_decode_takes_deepest_cell(self):
+        """两个格都有墨迹时取更深的那一格（涂改容错）。"""
+        ratios = [[0.0] * 10 for _ in range(8)]
+        for col in ratios:
+            col[7] = 0.9
+        ratios[2][5] = 0.45          # 同一行涂重了，浅的那个不算
+        self.assertEqual("77777777", cardmod.decode_student_bits(ratios))
+
+    def test_read_student_no_from_render(self):
+        from PIL import ImageDraw
+        st = self.res["card"]["student"]
+        page = self.res["card"]["pages"][0]
+        img = Image.open(self.res["png"][0]).convert("L")
+        d = ImageDraw.Draw(img)
+        want = "20250317"
+        for i, ch in enumerate(want):
+            cell = st["columns"][i]["cells"][int(ch)]
+            d.rectangle([cell["x"] + 3, cell["y"] + 3,
+                         cell["x"] + cell["w"] - 3, cell["y"] + cell["h"] - 3], fill=0)
+        filled = os.path.join(self.tmp, "filled.png")
+        img.save(filled)
+        self.assertEqual(want, cardmod.read_student_no(self.res["card"], filled))
+        # 空白卡 → 空串（不是异常）
+        self.assertEqual("", cardmod.read_student_no(self.res["card"], self.res["png"][0]))
+
+    def test_old_card_without_student_is_safe(self):
+        """v1/v2 卡（没有 student 字段）读学号不报错，返回空串。"""
+        self.assertEqual("", cardmod.read_student_no({"version": 2}, self.res["png"][0]))
+        self.assertEqual("", cardmod.read_student_no({}, None))
+
+    def test_self_check_sample_has_student_area(self):
+        import numpy as np
+        arr = np.array(Image.open(self.res["png"][0]).convert("L"))
+        st = self.res["card"]["student"]
+        area = arr[st["area"]["y"]:st["area"]["y"] + st["area"]["h"],
+                   st["area"]["x"]:st["area"]["x"] + st["area"]["w"]]
+        self.assertLess(int(area.min()), 128, "学生区应有墨迹（网格/文字）")
+        self.assertLess(float((area < 128).mean()), 0.3, "学生区不能糊成一团")
+
+    def test_digits_configurable(self):
+        for n in (6, 8, 10):
+            st = cardmod.student_layout(digits=n)
+            self.assertEqual(n, st["no_digits"])
+            self.assertEqual(n, len(st["columns"]))
+            last = st["columns"][-1]["cells"][0]
+            self.assertLess(last["x"] + st["cell_px"], cardmod.STUDENT_RIGHT)
+
+
+class TestV4SingleQrAndMarkerGroups(unittest.TestCase):
+    """t78：二维码精简到只剩首页 1 个；页序改用 ArUco id 分组。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="v4card_")
+        cls.manifest = make_manifest(
+            [_item(i, "选择", 1) for i in range(1, 13)]
+            + [_item(i, "填空", 1) for i in range(13, 19)]
+            + [_item(i, "解答", 1) for i in range(19, 25)],
+            pid="P20261107-401")
+        cls.manifest["paper"] = {"pages": 1}
+        cls.res = build_card(cls.manifest, cls.tmp)
+        cls.card = cls.res["card"]
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_version_is_4_and_flags_grouped(self):
+        self.assertEqual(4, cardmod.CARD_VERSION)
+        self.assertEqual(4, self.card["version"])
+        self.assertTrue(self.card.get("aruco_groups"), "v4 要在卡信息里标出「页序在 id 组里」")
+        self.assertEqual([1], self.card.get("qr_pages"))
+
+    def test_three_pages(self):
+        self.assertEqual(3, self.card["n_pages"], "24 题（12 选 + 6 填 + 6 解）应是 3 页")
+
+    def test_only_first_page_has_qr(self):
+        qr_pages = [p["page"] for p in self.card["pages"] if p.get("qr")]
+        self.assertEqual([1], qr_pages, "v4 只有第 1 页印 QR，实际 %s" % qr_pages)
+
+    def test_marker_ids_encode_page_number(self):
+        for p in self.card["pages"]:
+            ids = sorted(a["id"] for a in p["marks"]["aruco"])
+            want = sorted(cardmod.page_marker_ids(p["page"]).values())
+            self.assertEqual(want, ids, "第 %d 页四角 id 应为 %s" % (p["page"], want))
+            self.assertEqual(p["page"], cardmod.decode_page_from_ids(ids),
+                             "从四角 id 应能反推页序")
+
+    def test_decode_page_rejects_incomplete(self):
+        self.assertIsNone(cardmod.decode_page_from_ids([0, 1, 2]), "缺一个角不能说它是某页")
+        self.assertIsNone(cardmod.decode_page_from_ids([0, 1, 2, 4]), "不是同一页的四个 id")
+        self.assertIsNone(cardmod.decode_page_from_ids([]))
+        self.assertEqual(12, cardmod.decode_page_from_ids([44, 45, 46, 47]), "第 12 页（上限）")
+
+    def test_marker_ids_cover_12_pages_without_repeat(self):
+        seen = []
+        for page in range(1, cardmod.ARUCO_MAX_PAGES + 1):
+            seen.extend(cardmod.page_marker_ids(page).values())
+        self.assertEqual(len(seen), len(set(seen)), "12 页的 id 不能重复")
+        self.assertLess(max(seen), 50, "DICT_4X4_50 只有 50 个 id")
+
+    def test_qr_shrunk_to_24mm(self):
+        qr = self.card["pages"][0]["qr"]
+        self.assertEqual(cardmod.mm(24), qr["size"], "QR 从 30mm 缩到 24mm")
+        self.assertLess(qr["size"], cardmod.QR_SIZE_V3)
+
+    def test_area_drops_at_least_half(self):
+        """QR+ArUco 墨迹面积：v3（每页 QR30+4×18mm）→ v4（首页 QR24 + 每页 4×14mm）。"""
+
+        def v3_area(n_pages):
+            return n_pages * (4 * cardmod.ARUCO_SIZE_V3 ** 2 + cardmod.QR_SIZE_V3 ** 2)
+
+        def v4_area(card):
+            total = 0
+            for p in card["pages"]:
+                total += sum(a["size"] ** 2 for a in p["marks"]["aruco"])
+                if p.get("qr"):
+                    total += p["qr"]["size"] ** 2
+            return total
+
+        old = v3_area(self.card["n_pages"])
+        new = v4_area(self.card)
+        drop = 1.0 - new / float(old)
+        self.assertGreaterEqual(drop, 0.5,
+                                "面积只降了 %.1f%%（v3 %d → v4 %d）" % (drop * 100, old, new))
+
+    def test_qr_count_and_no_overlap(self):
+        """二维码数量 3 → 1；4 角标记仍不被任何内容压住。"""
+        self.assertEqual(1, sum(1 for p in self.card["pages"] if p.get("qr")))
+        for p in self.card["pages"]:
+            marks = [(a["x"], a["y"], a["size"]) for a in p["marks"]["aruco"]]
+            for (mx, my, msize) in marks:
+                self.assertGreaterEqual(mx, 0)
+                self.assertGreaterEqual(my, 0)
+                self.assertLessEqual(mx + msize, PAGE_W)
+                self.assertLessEqual(my + msize, PAGE_H)
+            for label, x, y, w, h in rects_of_page(p):
+                if label.startswith("aruco"):
+                    continue
+                for (mx, my, msize) in marks:
+                    hit = x < mx + msize and mx < x + w and y < my + msize and my < y + h
+                    self.assertFalse(hit, "第 %d 页 %s 压住了四角标记" % (p["page"], label))
+
+
 class TestPlanFromAnchor(unittest.TestCase):
     """t46：只给标识块位置 → 反推作答格（两列排布也要成立）。"""
 
@@ -653,7 +976,8 @@ class TestCompactLayout(unittest.TestCase):
                 self.assertIn("idx", c)
 
     def test_aruco_and_qr_still_decodable(self):
-        import cv2, json as _json
+        """每页四角 ArUco 可解（v4：id = 4p..4p+3）；只有第 1 页有 QR。"""
+        import cv2
         det = cv2.aruco.ArucoDetector(
             cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50),
             cv2.aruco.DetectorParameters())
@@ -661,10 +985,16 @@ class TestCompactLayout(unittest.TestCase):
             arr = cv2.imread(png)
             _, ids, _ = det.detectMarkers(arr)
             self.assertIsNotNone(ids, "第 %d 页检不到 ArUco" % page["page"])
-            self.assertEqual([0, 1, 2, 3], sorted(int(v) for v in ids.ravel()))
-            payload = cardmod.read_qr(png, page["qr"])      # 用官方多后端解码（Aruco 优先）
-            self.assertIsNotNone(payload, "第 %d 页 QR 解不出来" % page["page"])
-            self.assertEqual(page["page"], payload["p"])
+            want = sorted(cardmod.page_marker_ids(page["page"]).values())
+            self.assertEqual(want, sorted(int(v) for v in ids.ravel()),
+                             "第 %d 页四角 id 应是 %s" % (page["page"], want))
+            payload = cardmod.read_qr(png, page.get("qr"))
+            if page["page"] == 1:
+                self.assertIsNotNone(payload, "第 1 页 QR 解不出来")
+                self.assertEqual(1, payload["p"])
+            else:
+                self.assertIsNone(page.get("qr"), "v4 第 %d 页不该再印 QR" % page["page"])
+                self.assertIsNone(payload)
 
     def test_solution_process_height_360(self):
         hs = [it["process_box"]["h"]

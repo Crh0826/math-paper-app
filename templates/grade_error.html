@@ -16,6 +16,11 @@
   .why-fix h2 + p { margin: 0 0 16px; color: var(--ink-2); }
   .why-fix .err-fix { white-space: pre-line; font-size: 14px; color: var(--ink); line-height: 1.8; }
   .err-code-line { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+  .diag-card h2 { margin: 0 0 8px; font-size: 15px; font-weight: 600; }
+  .diag-img {
+    display: block; width: 100%; max-width: 560px; height: auto;
+    border: 1px solid var(--line); border-radius: 10px; margin-top: 10px;
+  }
 </style>
 </head>
 <body>
@@ -28,15 +33,8 @@
         <small>沪科版七年级上 · 拍照判卷</small>
       </span>
     </a>
-    <nav class="nav" aria-label="主导航">
-      <a class="nav-item" href="/">组卷</a>
-      <a class="nav-item" href="/papers">我的卷子</a>
-      <a class="nav-item is-active" href="/submissions" aria-current="page">判卷</a>
-      <a class="nav-item" href="/train">训练</a>
-      <a class="nav-item" href="/guide">使用指南</a>
-      <a class="nav-item" href="/health">自检</a>
-    </nav>
-    <a class="ghost-link mono" href="/healthz" target="_blank" rel="noopener" title="自检数据（JSON）">healthz</a>
+    {% set nav_active = "grade" %}
+      {% include "_nav.html" %}
   </div>
 </header>
 
@@ -57,6 +55,18 @@
     <p class="err-code-line">错误码 <span class="mono">{{ code }}</span>
       {% if extra_note %}· {{ extra_note }}{% endif %}</p>
   </section>
+
+  {% if diag_uri %}
+  <section class="card diag-card">
+    <h2>这张照片的问题在哪</h2>
+    <p class="muted">
+      {% if diag_suggest %}{{ diag_suggest }}
+      {% else %}绿圈=认出来的角，红箭头=没拍到的角。{% endif %}
+      {% if diag_found is not none and diag_expected %}（只认出 {{ diag_found }}/{{ diag_expected }} 个角）{% endif %}
+    </p>
+    <img class="diag-img" src="{{ diag_uri }}" alt="答题卡诊断图：标出认出的角和没拍到的角">
+  </section>
+  {% endif %}
 
   <div class="empty-state">
     <a class="btn btn-primary" href="{{ retry_href }}">{{ retry_label }}</a>

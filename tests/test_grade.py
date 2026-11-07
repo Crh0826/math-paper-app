@@ -53,7 +53,7 @@ CHOICES = {1: "A", 2: "B", 3: "C"}          # 全对
 TEXTS = {"4-1": "4", "4-2": "1/2", "5-1": "9", "5-2": "3"}
 
 
-def make_manifest(pid=PID):
+def make_manifest(pid=PID, items=None):
     return {
         "pid": pid,
         "created_at": "2026-10-31T15:00:00+08:00",
@@ -61,7 +61,7 @@ def make_manifest(pid=PID):
         "params": {},
         "page": {"w_pt": 595.3, "h_pt": 841.9, "dpi": 300,
                  "w_px": card.PAGE_W, "h_px": card.PAGE_H},
-        "items": [dict(it) for it in ITEMS],
+        "items": [dict(it) for it in (items if items is not None else ITEMS)],
     }
 
 
@@ -75,10 +75,11 @@ def _font(size=56):
 class Fixture:
     """一套卡片 + 合成照片的公共装置。"""
 
-    def __init__(self, tmp, choices=None, texts=None, pid=PID):
+    def __init__(self, tmp, choices=None, texts=None, pid=PID, items=None):
         self.tmp = tmp
         self.card_dir = os.path.join(tmp, "card")
-        self.manifest = make_manifest(pid)
+        self.items = items if items is not None else ITEMS
+        self.manifest = make_manifest(pid, self.items)
         card.build_card(self.manifest, self.card_dir)
         self.card_png = os.path.join(self.card_dir, "card_1.png")
         self.choices = choices if choices is not None else dict(CHOICES)
@@ -1368,8 +1369,586 @@ class TestLegacyCard(unittest.TestCase):
             img.save(fx.filled_png)
             res = grade.grade_by_ids(fx.conn, fx.photo(seed=24),
                                      out_dir=os.path.join(tmp, "out"))
-            self.assertEqual("legacy_card", res.get("error"), res.get("detail"))
-            self.assertIn("旧版本", res.get("detail") or "")
+            self.assertEqual("legacy_card_need_pid", res.get("error"), res.get("detail"))
+            self.assertIn("旧版答题卡", res.get("detail") or "")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestPhotoDiagnostics(unittest.TestCase):
+    """t50：拍不清时要给结构化诊断（缺哪角/太斜/太小/反光）+ 反馈图。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="diag_")
+        self.fx = Fixture(self.tmp)
+
+    def tearDown(self):
+        self.fx.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _photo_from(self, img, seed=51):
+        path = os.path.join(self.tmp, "photo_%d.jpg" % seed)
+        img.convert("L").save(path, quality=88)
+        return path
+
+    def test_missing_one_corner(self):
+        """把右上角 ArUco 涂白 → 必须报 missing=["TR"] + missing_corner。"""
+        img = Image.open(self.fx.filled_png).convert("L")
+        d = ImageDraw.Draw(img)
+        x, y = card.ARUCO_POS[1]          # TR
+        d.rectangle([x - 6, y - 6, x + card.ARUCO_SIZE + 6, y + card.ARUCO_SIZE + 6], fill=255)
+        photo = self._photo_from(img)
+        res = grade.grade_image(self.fx.conn, T_PID, photo,
+                                out_dir=os.path.join(self.tmp, "out"))
+        self.assertEqual("warp_failed", res.get("error"))
+        diag = res.get("diag") or {}
+        self.assertEqual(3, diag.get("found"))
+        self.assertEqual(["TR"], diag.get("missing"))
+        self.assertEqual("missing_corner", diag.get("suggest"))
+        self.assertTrue(diag.get("suggest_text"))
+        self.assertIsNone(diag["corners"]["TR"])
+        self.assertTrue(diag["corners"]["TL"])
+
+    def test_tilted_20deg(self):
+        """整页旋转 20° 放回去 → 角度诊断必须报 tilt（>15°）。"""
+        base = Image.open(self.fx.filled_png).convert("L")
+        base = base.resize((base.width // 2, base.height // 2), Image.BILINEAR)  # 省内存
+        big = Image.new("L", (base.width + 600, base.height + 600), 255)
+        big.paste(base, (300, 300))
+        rot = big.rotate(20, resample=Image.BILINEAR, fillcolor=255, expand=True)
+        photo = self._photo_from(rot, seed=52)
+        out = grade.diagnose(photo)
+        diag = out.get("diag") or {}
+        self.assertEqual(4, diag.get("found"), "四角都拍到，应该标定成功：%s" % (diag,))
+        self.assertGreater(diag.get("rotation_deg") or 0, 15.0, diag)
+        self.assertEqual("tilt", diag.get("suggest"))
+
+    def test_too_small(self):
+        """缩到 30% 再放到 2 倍白底上（占比 ~9%）→ too_small。"""
+        base = Image.open(self.fx.filled_png).convert("L")
+        base = base.resize((base.width // 2, base.height // 2), Image.BILINEAR)  # 省内存
+        small = base.resize((int(base.width * 0.3), int(base.height * 0.3)), Image.BILINEAR)
+        canvas = Image.new("L", (base.width, base.height), 250)
+        canvas.paste(small, ((base.width - small.width) // 2,
+                             (base.height - small.height) // 2))
+        photo = self._photo_from(canvas, seed=53)
+        out = grade.diagnose(photo)
+        diag = out.get("diag") or {}
+        self.assertEqual(4, diag.get("found"), "缩小后四角仍应检到")
+        self.assertLess(diag.get("paper_ratio") or 1, 0.25)
+        self.assertEqual("too_small", diag.get("suggest"))
+
+    def test_ok_card_has_no_suggest(self):
+        out = grade.diagnose(self.fx.photo(seed=54))
+        diag = out.get("diag") or {}
+        self.assertTrue(out.get("warp_ok"))
+        self.assertEqual(4, diag.get("found"))
+        self.assertIsNone(diag.get("suggest"))
+
+    def test_diag_image_written_and_openable(self):
+        img = Image.open(self.fx.filled_png).convert("L")
+        d = ImageDraw.Draw(img)
+        x, y = card.ARUCO_POS[1]
+        d.rectangle([x - 6, y - 6, x + card.ARUCO_SIZE + 6, y + card.ARUCO_SIZE + 6], fill=255)
+        photo = self._photo_from(img, seed=55)
+        out = grade.diagnose(photo)
+        path = os.path.join(self.tmp, "diag.png")
+        got = grade.diag_image(photo, out["diag"], path)
+        self.assertEqual(path, got)
+        self.assertTrue(os.path.exists(path))
+        im = Image.open(path)
+        self.assertGreater(im.size[0], 100)
+        self.assertGreater(os.path.getsize(path), 5000)
+
+    def test_diag_points_at_missing_corner(self):
+        """诊断图里“让 TR 入镜”的文案要出现（红箭头指向没拍到的角）。"""
+        img = Image.open(self.fx.filled_png).convert("L")
+        d = ImageDraw.Draw(img)
+        x, y = card.ARUCO_POS[1]
+        d.rectangle([x - 6, y - 6, x + card.ARUCO_SIZE + 6, y + card.ARUCO_SIZE + 6], fill=255)
+        photo = self._photo_from(img, seed=56)
+        diag = grade.diagnose(photo)["diag"]
+        self.assertIn("missing_corner", [diag["suggest"]])
+        self.assertIn("四角", diag["suggest_text"])
+
+
+class TestLegacyCardSupport(unittest.TestCase):
+    """回归：旧版 4×4 答题卡在「卷号在库」时必须照常判分（v1.2 硬伤修复）。
+
+    判据看 manifest 每题 id_box.bits 的长度：16=旧卡（卷内题序）、25=新卡（题号）。
+    """
+
+    APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    DB = os.path.join(APP, "data", "app.db")
+    REAL_PHOTO = os.path.join(APP, "out", "P20261031-007",
+                              "sub_S20261031-205422-c1227f", "source.jpg")
+    LEGACY_PID = "P20261031-007"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="legacy_ok_")
+        if not (os.path.exists(self.DB) and os.path.exists(self.REAL_PHOTO)):
+            self.skipTest("没有真实老卡样张/产品库")
+        self.db_path = os.path.join(self.tmp, "db.sqlite")
+        src = sqlite3.connect(self.DB)
+        dst = sqlite3.connect(self.db_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        self.conn = db.connect(self.db_path)
+
+    def tearDown(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _manifest(self, pid=LEGACY_PID):
+        row = self.conn.execute("SELECT manifest FROM papers WHERE pid=?", (pid,)).fetchone()
+        return json.loads(row["manifest"]) if row else None
+
+    def _save_manifest(self, manifest, pid=LEGACY_PID):
+        self.conn.execute("UPDATE papers SET manifest=? WHERE pid=?",
+                          (json.dumps(manifest, ensure_ascii=False), pid))
+        self.conn.commit()
+
+    def test_real_legacy_photo_grades(self):
+        """真实老照片必须判出来，且复现历史分数 1/2。"""
+        res = grade.grade_image(self.conn, self.LEGACY_PID, self.REAL_PHOTO,
+                                out_dir=os.path.join(self.tmp, "out"))
+        self.assertIsNone(res.get("error"), res.get("detail"))
+        self.assertEqual(1, res.get("score"), "历史记录是 1/2，必须复现")
+        self.assertEqual(2, res.get("full"))
+        kinds = [u["kind"] for u in res["items"]]
+        self.assertIn("omr", kinds)
+
+    def test_legacy_manifest_bits_are_16(self):
+        m = self._manifest()
+        self.assertEqual(1, m["card"].get("version"))
+        for it in m["card"]["pages"][0]["items"]:
+            self.assertEqual(16, len(it["id_box"]["bits"]), "旧卡标识是 16 位")
+
+    def test_legacy_without_manifest_needs_pid(self):
+        """卷号不在库 + 旧卡 → legacy_card_need_pid（而不是 legacy_card）。"""
+        res = grade.grade_image(self.conn, "P-NOT-IN-DB", self.REAL_PHOTO,
+                                out_dir=os.path.join(self.tmp, "out"))
+        self.assertEqual("legacy_card_need_pid", res.get("error"), res.get("detail"))
+        self.assertIn("卷号", res.get("detail") or "")
+
+    def test_grade_by_ids_on_legacy_needs_pid(self):
+        res = grade.grade_by_ids(self.conn, self.REAL_PHOTO,
+                                 out_dir=os.path.join(self.tmp, "out"))
+        self.assertEqual("legacy_card_need_pid", res.get("error"))
+        self.assertIn("旧版答题卡", res.get("detail") or "")
+
+    def test_new_card_still_grades(self):
+        """新卡（25 位）不受影响。"""
+        fx = Fixture(os.path.join(self.tmp, "fx"))
+        try:
+            res = grade.grade_image(fx.conn, T_PID, fx.photo(seed=71),
+                                    out_dir=os.path.join(self.tmp, "o_new"))
+            self.assertIsNone(res.get("error"), res.get("detail"))
+            self.assertEqual(3, res.get("score"))
+        finally:
+            fx.close()
+
+    def test_legacy_idx_mismatch_is_pid_mismatch(self):
+        """16 位标识解出的题序与 manifest 不符 → pid_mismatch（拍的确实是别的卷）。"""
+        m = self._manifest()
+        m["card"]["pages"][0]["items"][0]["idx"] = 99
+        self._save_manifest(m)
+        res = grade.grade_image(self.conn, self.LEGACY_PID, self.REAL_PHOTO,
+                                out_dir=os.path.join(self.tmp, "out"))
+        self.assertEqual("pid_mismatch", res.get("error"), res.get("detail"))
+
+    def test_unknown_bit_length_is_legacy_card(self):
+        """既不是 16 也不是 25（这里造 12 位）→ legacy_card。"""
+        m = self._manifest()
+        m["card"]["pages"][0]["items"][0]["id_box"]["bits"] = [0, 1, 0, 1] * 3
+        self._save_manifest(m)
+        res = grade.grade_image(self.conn, self.LEGACY_PID, self.REAL_PHOTO,
+                                out_dir=os.path.join(self.tmp, "out"))
+        self.assertEqual("legacy_card", res.get("error"), res.get("detail"))
+
+
+class TestRealPhotoByIds(unittest.TestCase):
+    """t54 回归：用户真实照片（P20261101-002，7×? 列版式）by_ids 要把 4 个标识全解出来。
+
+    这张卡是 5×5 新卡（不是旧卡）：之前 id_*.png 是 108px 只是因为裁切时 inset=6
+    （120-12=108），不是尺度问题；真正的 bug 是扫描按固定坐标、没有本地对齐。
+    """
+
+    APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    PHOTO = os.path.join(APP, "tests", "fixtures", "t54", "p20261101_002_source.jpg")
+    if not os.path.exists(PHOTO):
+        PHOTO = os.path.join(APP, "out", "P20261101-002",
+                             "sub_S20261101-103711-b813ae", "source.jpg")
+    EXPECT = ["10101", "12665", "11198", "05852"]
+
+    def setUp(self):
+        if not os.path.exists(self.PHOTO):
+            self.skipTest("没有 t54 真实照片")
+
+    def test_four_ids_decode(self):
+        scan = grade.scan_ids(self.PHOTO)
+        got = [b.get("no") for b in scan["blocks"] if b.get("no")]
+        self.assertEqual(self.EXPECT, got, "四个标识都要解出题号：%s" % (got,))
+        self.assertEqual(0, len(scan["unreadable"]), "不该再有「题目标识不可读」")
+
+    def test_ids_exist_in_bank(self):
+        conn = db.connect(os.path.join(self.APP, "data", "app.db"))
+        try:
+            scan = grade.scan_ids(self.PHOTO)
+            for b in scan["blocks"]:
+                row = grade._question_row(conn, b["no"])
+                self.assertIsNotNone(row, "题库里查不到 %s" % b["no"])
+        finally:
+            conn.close()
+
+    def test_by_ids_judges_nine_units(self):
+        conn = db.connect(os.path.join(self.APP, "data", "app.db"))
+        try:
+            res = grade.grade_by_ids(conn, self.PHOTO,
+                                     out_dir=os.path.join(self.APP, "out", "_t54_test"))
+            self.assertIsNone(res.get("error"), res.get("detail"))
+            self.assertEqual("question_id", res.get("identified_by"))
+            nos = {u["no"] for u in res["items"]}
+            self.assertEqual(set(self.EXPECT), nos, "9 个作答单元应覆盖这 4 道题")
+            # 没有 OCR（manual）时填空/解答应是 pending，不是「题目标识不可读」
+            self.assertFalse([u for u in res["items"]
+                              if "题目标识不可读" in (u.get("reason") or "")])
+        finally:
+            conn.close()
+
+    def test_scan_is_fast(self):
+        import time as _t
+        t0 = _t.perf_counter()
+        grade.scan_ids(self.PHOTO)
+        self.assertLess(_t.perf_counter() - t0, 3.0, "扫描不该超过 3 秒")
+
+
+class TestSixDigitChain(unittest.TestCase):
+    """t11 验收链路：6 位题号（15 万题口径）走通 组卷 → 出卡 → 判卷。
+
+    题号 100001.. 是 15 万题的新题号段（>99999）；旧卡 5 位题号链路另有测试覆盖。
+    """
+
+    SIX_NOS = ["100001", "100002", "100003", "100004", "100005"]
+    SIX_PID = "P20261101-901"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="six_")
+        cls.items = [dict(it, no=cls.SIX_NOS[i]) for i, it in enumerate(ITEMS)]
+        cls.fx = Fixture(cls.tmp, pid=cls.SIX_PID, items=cls.items)
+        cls._insert_questions()
+
+    @classmethod
+    def _insert_questions(cls):
+        """把 5 道 6 位题号的题写进夹具库（判卷要按题号查答案）。"""
+        import picker
+
+        rows = []
+        for it in cls.items:
+            rows.append((
+                it["no"], it["qtype"], len(it.get("options") or []),
+                "　".join(k.get("value", "") for k in it.get("answer_key") or []),
+                "题干" + it["no"], "plain"))
+        cls.fx.conn.executemany(
+            "INSERT OR REPLACE INTO questions(no, qtype, option_count, answer_raw, is_empty,"
+            " text_plain, fmt, kp_id, chapter, subject_pk)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            [(no, qt, n, ans, 0, txt, fmt, "1.1", "第1章 有理数", "math7a")
+             for (no, qt, n, ans, txt, fmt) in rows])
+        cls.fx.conn.commit()
+        assert picker.QTYPES      # 组卷引擎与判卷共用题号口径
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fx.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    # ---- 组卷
+    def test_picker_builds_six_digit_paper(self):
+        import picker
+
+        m = picker.build({"mix": {"选择": 3, "填空": 1, "解答": 1}, "seed": 7},
+                         self.fx.conn, now="2026-11-01T10:00:00+08:00",
+                         pid="P20261101-902")
+        nos = [it["no"] for it in m["items"]]
+        self.assertEqual(sorted(self.SIX_NOS), sorted(nos))
+        for no in nos:
+            self.assertEqual(6, len(no), "15 万题口径的题号是 6 位：%r" % no)
+
+    # ---- 出卡
+    def test_card_id_bits_encode_six_digit(self):
+        pages = self.fx.manifest["card"]["pages"]
+        self.assertTrue(pages)
+        got = []
+        for page in pages:
+            for it in page["items"]:
+                self.assertEqual(25, len(it["id_bits"]))
+                got.append(card.decode_id_bits(it["id_bits"]))
+        self.assertEqual(sorted(self.SIX_NOS), sorted(got), "答题卡标识里的题号不对")
+
+    # ---- 判卷
+    def test_grade_photo_of_six_digit_card(self):
+        res = grade.grade_image(self.fx.conn, self.SIX_PID, self.fx.photo(seed=301),
+                                out_dir=os.path.join(self.tmp, "out"))
+        self.assertIsNone(res.get("error"), res.get("detail"))
+        self.assertTrue(res.get("warp_ok"))
+        omr = [it for it in res["items"] if it["kind"] == card.KIND_OMR]
+        self.assertEqual(3, len(omr), "选择题应有 3 个作答单元")
+        self.assertEqual([], [it for it in omr if it["verdict"] != "correct"],
+                         "6 位题号的答题卡判卷必须全对：%s" % [(it["no"], it["verdict"]) for it in omr])
+        for it in omr:
+            self.assertIn(it["no"], self.SIX_NOS, "判卷回来的题号不是 6 位题号：%r" % it["no"])
+
+    def test_scan_ids_decodes_six_digit(self):
+        """卡面 PNG 直接扫标识：5 个 6 位题号必须全解出来。"""
+        gray = cv2.imread(self.fx.filled_png, cv2.IMREAD_GRAYSCALE)
+        scan = grade.scan_id_blocks(gray)
+        self.assertEqual(set(self.SIX_NOS), {b["no"] for b in scan["blocks"]},
+                         "卡面标识里的 6 位题号没扫全")
+        self.assertEqual([], scan["unreadable"])
+
+    def test_photo_scan_never_invents_wrong_no(self):
+        """手机照片（0.72 缩放 + 3% 透视 + JPEG70）下解出来的号必须都是本卷的号。
+
+        已知限制（记在 docs/app_scale_change.md）：6 位题号比特更密，低分辨率照片上
+        轮廓法可能漏检个别密集标识格；**不会解出错号**，且正规链路（papers 有记录 →
+        manifest 判卷，见 test_grade_photo_of_six_digit_card）不受影响。
+        """
+        scan = grade.scan_ids(self.fx.photo(seed=302))
+        got = {b["no"] for b in scan["blocks"] if b.get("no")}
+        self.assertTrue(got <= set(self.SIX_NOS),
+                        "照片上解出了不属于本卷的题号：%s" % sorted(got - set(self.SIX_NOS)))
+        self.assertGreaterEqual(len(got), 3, "密集标识格在照片上的召回不该低于 3/5：%s" % sorted(got))
+
+
+class TestV4PageOrderAndLegacy(unittest.TestCase):
+    """t78：v4 只首页印 QR、页序靠 ArUco id 组；旧卡（v3）仍要能判。
+
+    * 乱序输入 3 页 → 每张照片都要被认成它自己的那一页；
+    * 用 out/ 里的**真实 v3 卡图**（已存成 tests/fixtures/v3 稳定样本）判一次：
+      按答案键涂好的选择题必须全部判对（旧卡不能因为改版被骗）；
+      并与同一批题目的 v4 卡逐题比对，判定要一致。
+    """
+
+    APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    #: 旧卡样本：优选用 out/ 里**真实生成的 v3 卡图**；产品库/产物被清掉时退回
+    #: 「按同一份 v3 manifest 现场渲染」（渲染路径与 v3 完全一致：四角 0..3、每页 1 QR 30mm）
+    V3_PID = "P20261107-002"
+
+    # ---------------------------------------------------------------- 工具
+    @staticmethod
+    def _paint_page(png_path, page, choices, out_path):
+        """只涂**这一页**上的选择题（按 cell 坐标），避免把别页的坐标画到这张图上。"""
+        img = Image.open(png_path).convert("L")
+        d = ImageDraw.Draw(img)
+        painted = 0
+        for it in page.get("items") or []:
+            if it["kind"] != card.KIND_OMR:
+                continue
+            want = choices.get(it["idx"])
+            if want is None:
+                continue
+            for c in it["cells"]:
+                if str(c["opt"]) == str(want):
+                    d.rectangle([c["x"] + 8, c["y"] + 8,
+                                 c["x"] + c["w"] - 8, c["y"] + c["h"] - 8], fill=0)
+                    painted += 1
+        img.save(out_path)
+        return out_path, painted
+
+    @staticmethod
+    def _put_paper(conn, manifest):
+        conn.execute(
+            "INSERT OR REPLACE INTO papers(pid, created_at, title, params_json, manifest, n_items)"
+            " VALUES (?,?,?,?,?,?)",
+            (manifest["pid"], manifest.get("created_at") or "2026-11-07T10:00:00+08:00",
+             manifest.get("title") or "t78", "{}",
+             json.dumps(manifest, ensure_ascii=False), len(manifest["items"])))
+        conn.commit()
+
+    @staticmethod
+    def _items_24():
+        out = []
+        for i in range(1, 13):
+            out.append({"idx": i, "no": "%05d" % i, "qtype": "选择",
+                        "options": ["A", "B", "C", "D"],
+                        "answer_key": [{"blank": 1, "value": "A"}]})
+        for i in range(13, 19):
+            out.append({"idx": i, "no": "%05d" % i, "qtype": "填空",
+                        "answer_key": [{"blank": 1, "value": "1"}]})
+        for i in range(19, 25):
+            out.append({"idx": i, "no": "%05d" % i, "qtype": "解答",
+                        "answer_key": [{"blank": 1, "value": "x"}]})
+        return out
+
+    def _detail(self, conn, sid):
+        row = conn.execute("SELECT detail_json FROM submissions WHERE sid=?", (sid,)).fetchone()
+        return json.loads((row["detail_json"] if row else "{}") or "{}")
+
+    # ---------------------------------------------------------------- 新卡：乱序
+    def test_v4_page_order_from_shuffled_photos(self):
+        tmp = tempfile.mkdtemp(prefix="v4order_")
+        try:
+            manifest = make_manifest("P20261107-801", self._items_24())
+            manifest["paper"] = {"pages": 1}
+            res = card.build_card(manifest, os.path.join(tmp, "card"))
+            info = res["card"]
+            self.assertEqual(3, info["n_pages"], "24 题（12/6/6）应是 3 页")
+            self.assertEqual(1, sum(1 for p in info["pages"] if p.get("qr")), "v4 只 1 个 QR")
+
+            choices = {i: "A" for i in range(1, 13)}
+            paths = []
+            for page in info["pages"]:
+                out_png, n = self._paint_page(res["png"][page["page"] - 1], page, choices,
+                                              os.path.join(tmp, "p%d.png" % page["page"]))
+                paths.append(out_png)
+                self.assertGreaterEqual(n, 0)
+
+            conn = db.connect(os.path.join(tmp, "g.db"))
+            try:
+                self._put_paper(conn, manifest)
+                ordered = [grade.grade_image(conn, manifest["pid"], p,
+                                             out_dir=os.path.join(tmp, "o")) for p in paths]
+                self.assertEqual([None, None, None], [r.get("error") for r in ordered])
+                ordered_pages = [self._detail(conn, r["sid"]).get("page") for r in ordered]
+                self.assertEqual([1, 2, 3], ordered_pages, "顺序输入应解析成 1/2/3")
+
+                shuffled = []
+                for idx in (2, 0, 1):      # 乱序：先第 3 页，再第 1 页，再第 2 页
+                    r = grade.grade_image(conn, manifest["pid"], paths[idx],
+                                          out_dir=os.path.join(tmp, "o"))
+                    self.assertIsNone(r.get("error"), r.get("detail"))
+                    det = self._detail(conn, r["sid"])
+                    self.assertEqual("aruco_group", det.get("page_by"),
+                                     "v4 应按 ArUco 组定页，实际 %s" % det.get("page_by"))
+                    self.assertTrue(det.get("aruco_ids"), "要记录四角 id 便于排查")
+                    shuffled.append(r)
+                shuffled_pages = [self._detail(conn, r["sid"]).get("page") for r in shuffled]
+                self.assertEqual([3, 1, 2], shuffled_pages, "乱序输入也要各归各位")
+
+                # 乱序与顺序：同一页的分数/逐题判定必须一致
+                def _by_page(results):
+                    out = {}
+                    for r in results:
+                        det = self._detail(conn, r["sid"])
+                        out[det.get("page")] = (
+                            r["score"], r["full"],
+                            [(u.get("idx"), u.get("blank"), u.get("verdict"), u.get("picked"))
+                             for u in r["items"]])
+                    return out
+
+                a, b = _by_page(ordered), _by_page(shuffled)
+                self.assertEqual(set(a), set(b))
+                for page in a:
+                    self.assertEqual(a[page], b[page],
+                                     "第 %s 页乱序与顺序判分不一致" % page)
+                for r in ordered + shuffled:
+                    self.assertFalse([u for u in r["items"]
+                                      if "题目标识不可读" in (u.get("reason") or "")],
+                                     "v4 判卷不该出现「题目标识不可读」")
+                # 页 1 的 12 道选择题全涂 A、答案键也是 A → 应全对
+                first = ordered[0]
+                self.assertEqual(12, sum(1 for u in first["items"]
+                                         if u["kind"] == "omr" and u["verdict"] == "correct"),
+                                 "第 1 页 12 道选择题应全判对")
+            finally:
+                conn.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---------------------------------------------------------------- 旧卡：真实卡图
+    def _v3_sample(self, tmp):
+        """→ (manifest, 第 1 页 PNG)。优先真实产物，没有就按 manifest 重渲染 v3 版面。"""
+        import sqlite3
+        db_file = os.path.join(self.APP, "data", "app.db")
+        manifest = None
+        if os.path.exists(db_file):
+            conn = sqlite3.connect(db_file)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute("SELECT manifest FROM papers WHERE pid=?",
+                                   (self.V3_PID,)).fetchone()
+                if row and row["manifest"]:
+                    manifest = json.loads(row["manifest"])
+            finally:
+                conn.close()
+        if not manifest or int((manifest.get("card") or {}).get("version") or 0) != 3:
+            self.fail("产品库里找不到 %s 的 v3 卡 manifest（兼容底线，不许 skip）" % self.V3_PID)
+        real_png = os.path.join(self.APP, "out", self.V3_PID, "card_1.png")
+        if os.path.exists(real_png):
+            return manifest, real_png, "out/%s/card_1.png（真实产物）" % self.V3_PID
+        png = os.path.join(tmp, "v3_rerender.png")
+        card.render_page(manifest, manifest["card"]["pages"][0], png,
+                         manifest["card"]["n_pages"])
+        return manifest, png, "按 v3 manifest 重渲染"
+
+    def test_v3_real_card_still_grades(self):
+        """真实 v3 卡（每页 1 QR + 固定 0..3 四角）必须照常判、且判对。"""
+        tmp = tempfile.mkdtemp(prefix="v3real_")
+        try:
+            v3, src_png, src_how = self._v3_sample(tmp)
+            self.assertEqual(3, v3["card"]["version"], "样本必须是 v3 卡")
+            self.assertTrue(all(p.get("qr") for p in v3["card"]["pages"]), "v3 每页都有 QR")
+
+            page1 = v3["card"]["pages"][0]
+            choices = {it["idx"]: (it.get("answer_key") or [{}])[0].get("value")
+                       for it in v3["items"] if it.get("qtype") == "选择"}
+            omr_on_page1 = [it["idx"] for it in page1["items"]
+                            if it["kind"] == card.KIND_OMR and choices.get(it["idx"])]
+            self.assertTrue(omr_on_page1, "第 1 页应有涂卡题")
+
+            png, n = self._paint_page(src_png, page1, choices,
+                                      os.path.join(tmp, "v3.png"))
+            self.assertEqual(len(omr_on_page1), n, "涂的格数应等于该页选择题数")
+            conn = db.connect(os.path.join(tmp, "g.db"))
+            try:
+                self._put_paper(conn, v3)
+                r = grade.grade_image(conn, v3["pid"], png, out_dir=os.path.join(tmp, "o"))
+                det = self._detail(conn, r["sid"])
+            finally:
+                conn.close()
+            self.assertIsNone(r.get("error"), r.get("detail"))
+            self.assertTrue(r["qr_ok"], "v3 卡 QR 必须能解（%s）" % src_how)
+            self.assertEqual(1, det.get("page"), "v3 页序靠 QR，应定到第 1 页")
+            self.assertIn(det.get("page_by"), ("qr", "fallback"))
+
+            got = {u["idx"]: u["verdict"] for u in r["items"] if u["kind"] == "omr"}
+            wrong = [(it["idx"], got.get(it["idx"])) for it in page1["items"]
+                     if it["kind"] == card.KIND_OMR and choices.get(it["idx"])
+                     and got.get(it["idx"]) != "correct"]
+            self.assertEqual([], wrong,
+                             "v3 卡（%s）上按答案键涂的题必须判对：%s" % (src_how, wrong))
+
+            # 同一批题目用 v4 重排：逐题判定必须一致
+            v4_manifest = json.loads(json.dumps(v3))
+            v4_manifest["pid"] = "P20261107-802"
+            v4_manifest["paper"] = {"pages": 1}
+            v4_res = card.build_card(v4_manifest, os.path.join(tmp, "card4"))
+            v4_page1 = v4_res["card"]["pages"][0]
+            png4, _n4 = self._paint_page(v4_res["png"][0], v4_page1, choices,
+                                         os.path.join(tmp, "v4.png"))
+            conn = db.connect(os.path.join(tmp, "g4.db"))
+            try:
+                self._put_paper(conn, v4_manifest)
+                r4 = grade.grade_image(conn, v4_manifest["pid"], png4,
+                                       out_dir=os.path.join(tmp, "o4"))
+            finally:
+                conn.close()
+            self.assertIsNone(r4.get("error"), r4.get("detail"))
+            got4 = {u["idx"]: u["verdict"] for u in r4["items"] if u["kind"] == "omr"}
+            same_items = [it["idx"] for it in v4_page1["items"]
+                          if it["kind"] == card.KIND_OMR and it["idx"] in got]
+            self.assertTrue(same_items, "v4 第 1 页应有同批选择题")
+            for idx in same_items:
+                self.assertEqual(got.get(idx), got4.get(idx),
+                                 "第 %d 题 v3 判 %s、v4 判 %s" % (idx, got.get(idx), got4.get(idx)))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

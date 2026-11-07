@@ -158,6 +158,23 @@ class TestNoDanglingLinks(unittest.TestCase):
                      'href="/train"', 'href="/guide"', 'href="/health"'):
             self.assertIn(href, html, "导航缺 %s" % href)
 
+    def test_nav_is_five_plus_more(self):
+        """t100：一级只留 5 项，其余进「更多 ▾」，healthz 不再占导航。"""
+        html = self.client.get("/").text
+        nav = html[html.find('<nav class="nav"'):html.find("</nav>")]
+        main = [x.strip() for x in re.findall(r'class="nav-item[^"]*"[^>]*>([^<]+)<', nav)]
+        self.assertEqual(["组卷", "我的卷子", "判卷", "训练", "设置"], main,
+                         "一级导航应恰好是这 5 项")
+        self.assertIn("更多 ▾", nav)
+        more = nav[nav.find('class="nav-more-panel"'):]
+        for label in ("导入题库", "顺序管理", "使用指南", "自检"):
+            with self.subTest(label=label):
+                self.assertIn(label, more, "「更多」里缺 %s" % label)
+        self.assertNotIn('href="/healthz"', nav, "healthz 不该再放在导航里")
+        for href in ("/import", "/manage/order", "/guide", "/health"):
+            with self.subTest(href=href):
+                self.assertIn('href="%s"' % href, more, "「更多」里的入口不可点：%s" % href)
+
 
 if __name__ == "__main__":
     unittest.main()

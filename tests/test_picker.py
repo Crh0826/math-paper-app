@@ -55,7 +55,7 @@ QCOLS = ("no qtype option_count sub_count is_empty media_count text_len text_pla
 
 # ---------------------------------------------------------------- 夹具库
 def _insert_q(conn, no, qtype, chapter, kp_id, answer="", family=None, is_empty=0,
-              option_count=0, tokens=None, text=None, fmt="plain"):
+              option_count=0, tokens=None, text=None, fmt="plain", subject=None):
     vals = {
         "no": no, "qtype": qtype, "option_count": option_count, "sub_count": 0,
         "is_empty": is_empty, "media_count": 0, "text_len": 10,
@@ -68,6 +68,8 @@ def _insert_q(conn, no, qtype, chapter, kp_id, answer="", family=None, is_empty=
     conn.execute("INSERT INTO questions(%s) VALUES(%s)"
                  % (",".join(QCOLS), ",".join("?" * len(QCOLS))),
                  [vals[c] for c in QCOLS])
+    if subject:                     # t11 · 多学科：不传就走表默认值 math7a
+        conn.execute("UPDATE questions SET subject_pk=? WHERE no=?", (subject, no))
 
 
 def make_pool_db(path):
@@ -115,7 +117,7 @@ def make_pool_db(path):
     return conn
 
 
-def params(mix=None, scope=None, req=None, seed=42, space=None, title="测试卷"):
+def params(mix=None, scope=None, req=None, seed=42, space=None, title="测试卷", nos=None):
     p = {"title": title, "mix": mix if mix is not None else {"选择": 5, "填空": 4, "解答": 3},
          "seed": seed}
     if scope is not None:
@@ -124,6 +126,8 @@ def params(mix=None, scope=None, req=None, seed=42, space=None, title="测试卷
         p["requirements"] = req
     if space is not None:
         p["space"] = space
+    if nos is not None:
+        p["nos"] = nos
     return p
 
 
@@ -273,7 +277,10 @@ class BuildMixTest(unittest.TestCase):
     def test_options_for_choice(self):
         m = sel.build(params({"选择": 6}), self.conn, now=FIXED_NOW, pid=FIXED_PID)
         for it in m["items"]:
-            self.assertEqual(it["options"], ["A", "B", "C", "D"])
+            # 题库里既有 4 选项题也有 3 选项题（导入件），只要选项是连续字母开头就对
+            opts = it["options"]
+            self.assertIn(len(opts), (2, 3, 4), "选项数异常：%r" % opts)
+            self.assertEqual(opts, list("ABCD"[:len(opts)]), "选项字母应从 A 起连续")
 
     def test_space_paras_from_params(self):
         m = sel.build(params({"选择": 3, "填空": 3, "解答": 3},
@@ -951,6 +958,30 @@ class LayoutParamTest(unittest.TestCase):
         self.assertIn("layout", str(ctx.exception))
 
 
+class CalibrationParamTest(unittest.TestCase):
+    """calibration 进组卷参数：默认 true（附校准页），显式 false 才不附。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="sel_cal_")
+        cls.conn = make_pool_db(os.path.join(cls.tmp, "cal.db"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_calibration_defaults_to_true(self):
+        m = sel.build(params({"选择": 2}), self.conn, now=FIXED_NOW, pid=FIXED_PID)
+        self.assertIs(m["params"]["calibration"], True)
+
+    def test_calibration_can_be_switched_off(self):
+        p = params({"选择": 2})
+        p["calibration"] = False
+        m = sel.build(p, self.conn, now=FIXED_NOW, pid=FIXED_PID)
+        self.assertIs(m["params"]["calibration"], False)
+
+
 class SpaceDefaultTest(unittest.TestCase):
     """卷面留白默认全 0（答案写在答题卡上）；老师显式传 space 仍生效。"""
 
@@ -998,8 +1029,11 @@ class RealDbTest(unittest.TestCase):
         cls.conn.close()
 
     def test_default_paper(self):
-        m = sel.build(params({"选择": 10, "填空": 8, "解答": 6}, seed=42), self.conn,
-                      now=FIXED_NOW, pid=FIXED_PID)
+        # t17 之后真库里有 34 个 subject_pk（语文/英语/物理/化学/政史…），
+        # 不传 scope 会跨学科抽题（组卷页已强制选学科），所以这里显式限定数学七上。
+        p = params({"选择": 10, "填空": 8, "解答": 6}, seed=42)
+        p["scope"] = {"subject_pk": "math7a"}
+        m = sel.build(p, self.conn, now=FIXED_NOW, pid=FIXED_PID)
         items = m["items"]
         self.assertEqual(len(items), 24)
         self.assertEqual([it["idx"] for it in items], list(range(1, 25)))
@@ -1008,9 +1042,12 @@ class RealDbTest(unittest.TestCase):
         nos = {it["no"] for it in items}
         self.assertEqual(len(nos), 24)
         for it in items:
-            self.assertIn(it["chapter"],
+            # 章节名两种写法并存：老库「第2章 整式及其加减」，t17 入库「数学·七上·第2章 整式及其加减」
+            unit = str(it["chapter"]).split("·")[-1]
+            self.assertIn(unit,
                           {"第1章 有理数", "第2章 整式及其加减", "第3章 一次方程与方程组",
-                           "第4章 几何图形初步", "第5章 数据的收集与整理", "综合"})
+                           "第4章 几何图形初步", "第5章 数据的收集与整理", "综合"},
+                          "跨学科/跨册混卷：%r" % (it["chapter"],))
             self.assertTrue(it["answer_key"], "默认卷每题都要有答案")
             self.assertTrue(it["family_key"] is None or isinstance(it["family_key"], str))
 
@@ -1020,7 +1057,10 @@ class RealDbTest(unittest.TestCase):
         for it in m["items"]:
             key = it["answer_key"][0]
             self.assertRegex(key["norm"], r"^[A-F]+$")
-            self.assertEqual(it["options"], ["A", "B", "C", "D"])
+            # 题库里既有 4 选项题也有 3 选项题（导入件），只要选项字母从 A 起连续就对
+            opts = it["options"]
+            self.assertIn(len(opts), (2, 3, 4), "选项数异常：%r" % opts)
+            self.assertEqual(opts, list("ABCD"[:len(opts)]), "选项字母应从 A 起连续")
 
     def test_real_reproducible(self):
         a = sel.build(params({"选择": 10, "填空": 8, "解答": 6}, seed=2024), self.conn,
@@ -1079,6 +1119,239 @@ class RealDbTest(unittest.TestCase):
         self.assertIn("%s 需要 %d" % (qt, avail + 1), msg)
         self.assertIn("可用 %d" % avail, msg)
         self.assertIn("差 1", msg)
+
+
+class SubjectScopeTest(unittest.TestCase):
+    """t11 · 学科过滤：两学科各 2 题，按 scope.subject_pk / scope.subjects 过滤只出本科题。
+
+    15 万题是 7 个学科混在一个库里的，跨学科混卷（数学卷里冒出英语题）是不可接受的。
+    """
+
+    CN_CH = "第一单元 春"
+    CN_KP = "CN1.1"        # kps.kp_id 是主键（跨学科也不能重复）→ 语文用带前缀的 kp_id
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="subject_")
+        cls.db_path = os.path.join(cls.tmp, "app.db")
+        conn = dbmod.connect(cls.db_path)
+        try:
+            # 数学（math7a）：2 道选择
+            for no, ans in (("100001", "A"), ("100002", "B")):
+                _insert_q(conn, no, "选择", CH1, "1.1", ans, option_count=4,
+                          tokens=[{"kind": "text", "text": "数学 " + no}], subject="math7a")
+            # 语文（chinese7a）：2 道选择
+            for no, ans in (("200001", "C"), ("200002", "D")):
+                _insert_q(conn, no, "选择", cls.CN_CH, cls.CN_KP, ans, option_count=4,
+                          tokens=[{"kind": "text", "text": "语文 " + no}], subject="chinese7a")
+            conn.executemany(
+                "INSERT INTO kps(kp_id, subject_pk, chapter, kp, n_questions) VALUES(?,?,?,?,?)",
+                [("1.1", "math7a", CH1, "有理数", 2),
+                 (cls.CN_KP, "chinese7a", cls.CN_CH, "春", 2)])
+            conn.commit()
+        finally:
+            conn.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        self.conn = dbmod.connect(self.db_path)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _nos(self, scope, mix=None):
+        m = sel.build(params(mix or {"选择": 2}, scope=scope), self.conn,
+                      now=FIXED_NOW, pid=FIXED_PID)
+        return {it["no"] for it in m["items"]}
+
+    def test_subject_pk_filters(self):
+        self.assertEqual({"200001", "200002"},
+                         self._nos({"subject_pk": "chinese7a"}), "只该抽语文题")
+
+    def test_subject_pk_math(self):
+        self.assertEqual({"100001", "100002"}, self._nos({"subject_pk": "math7a"}))
+
+    def test_subjects_list_filters(self):
+        self.assertEqual({"100001", "100002"}, self._nos({"subjects": ["math7a"]}))
+
+    def test_subjects_list_multiple_is_union(self):
+        """列多个学科 = 并集（老师可能想混一份跨学科练习卷，但必须是显式选的）。"""
+        m = sel.build(params({"选择": 4}, scope={"subjects": ["math7a", "chinese7a"]}),
+                      self.conn, now=FIXED_NOW, pid=FIXED_PID)
+        self.assertEqual({"100001", "100002", "200001", "200002"},
+                         {it["no"] for it in m["items"]})
+
+    def test_subject_pk_and_subjects_merge(self):
+        self.assertEqual({"100001", "100002"},
+                         self._nos({"subject_pk": "math7a", "subjects": ["math7a"]}))
+
+    def test_no_subject_defaults_to_math7a(self):
+        """t62 · 不传学科 = 数学（math7a）：多学科库里绝不能跨科混卷。"""
+        self.assertEqual({"100001", "100002"}, self._nos({}, mix={"选择": 2}))
+
+    def test_unknown_subject_raises(self):
+        with self.assertRaises(sel.ScopeError) as ctx:
+            self._nos({"subject_pk": "physics9x"})
+        self.assertIn("学科", str(ctx.exception))
+        self.assertIn("physics9x", str(ctx.exception))
+
+    def test_subject_and_chapter_combined(self):
+        """选了语文后，数学的章节名不该再被认作合法范围（跨学科混选要报错）。"""
+        with self.assertRaises(sel.ScopeError):
+            self._nos({"subject_pk": "chinese7a", "chapters": [CH1]})
+
+    def test_count_available_respects_subject(self):
+        self.assertEqual(2, sel.count_available(
+            self.conn, params({"选择": 1}, scope={"subject_pk": "chinese7a"}))["选择"])
+        self.assertEqual(2, sel.count_available(
+            self.conn, params({"选择": 1}, scope={"subject_pk": "math7a"}))["选择"])
+
+    def test_subject_shortfall_is_reported(self):
+        """某学科题量不够时要明确报不足（而不是偷偷从别的学科补）。"""
+        with self.assertRaises(sel.InsufficientQuestions) as ctx:
+            sel.build(params({"选择": 3}, scope={"subject_pk": "chinese7a"}), self.conn,
+                      now=FIXED_NOW, pid=FIXED_PID)
+        self.assertEqual({"need": 3, "available": 2, "short": 1},
+                         ctx.exception.details["选择"])
+
+    def test_nos_outside_subject_raises(self):
+        """nos 精确题集给别的学科的题也要报错（卷子口径不能被绕过）。"""
+        with self.assertRaises(sel.SelectError):
+            sel.build(params({"选择": 1}, scope={"subject_pk": "chinese7a"},
+                             nos=["100001"]), self.conn,
+                      now=FIXED_NOW, pid=FIXED_PID)
+
+    def test_scope_normalized_shape(self):
+        p = sel.normalize_params(params({"选择": 1}, scope={"subject_pk": " math7a "}))
+        self.assertEqual("math7a", p["scope"]["subject_pk"])
+        self.assertEqual(["math7a"], p["scope"]["subjects"])
+
+
+class TestSubjectDefault(unittest.TestCase):
+    """t62 · 不传学科 = math7a；跨科题被挡；pool_report 报出被排除数。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="subj_")
+        self.db = os.path.join(self.tmp, "s.db")
+        conn = dbmod.connect(self.db)
+        for i in range(3):
+            _insert_q(conn, "M%03d" % i, "填空", CH1, "1.1", str(i + 1),
+                      tokens=[{"kind": "text", "text": "数学 %d" % i}])
+        for i in range(2):
+            _insert_q(conn, "C%03d" % i, "填空", "语文·识字", "1.1", "日",
+                      tokens=[{"kind": "text", "text": "语文 %d" % i}], subject="chinese7a")
+        conn.commit()
+        self.conn = conn
+
+    def tearDown(self):
+        self.conn.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _nos(self, params):
+        m = sel.build(dict(params, title="t", seed=7), self.conn)
+        return [it["no"] for it in m["items"]]
+
+    def test_default_subject_is_math7a(self):
+        nos = self._nos({"mix": {"填空": 3}})
+        self.assertEqual(3, len(nos))
+        self.assertTrue(all(n.startswith("M") for n in nos), "默认只该出数学题：%s" % nos)
+
+    def test_chinese_subject_picks_chinese(self):
+        nos = self._nos({"mix": {"填空": 2}, "scope": {"subject_pk": "chinese7a"}})
+        self.assertEqual(2, len(nos))
+        self.assertTrue(all(n.startswith("C") for n in nos), nos)
+
+    def test_pool_report_subject_and_excluded(self):
+        rep = sel.pool_report(self.conn, {"mix": {"填空": 3}})
+        self.assertEqual(["math7a"], rep["subject"])
+        self.assertTrue(rep["subject_default"], "没传学科要标成默认")
+        self.assertEqual(2, rep["excluded_other_subject"], "2 道语文题应被报为已排除")
+        rep2 = sel.pool_report(self.conn, {"mix": {"填空": 2},
+                                           "scope": {"subject_pk": "chinese7a"}})
+        self.assertEqual(3, rep2["excluded_other_subject"], "反过来该排除 3 道数学题")
+
+    def test_null_subject_counts_as_math7a(self):
+        """老库（NULL 学科）仍能选中，等价于 math7a。"""
+        self.conn.execute("UPDATE questions SET subject_pk=NULL WHERE no='M000'")
+        self.conn.commit()
+        nos = self._nos({"mix": {"填空": 3}})
+        self.assertIn("M000", nos, "NULL 学科要当 math7a 处理")
+
+    def test_real_english_paper_only_english(self):
+        """真实库：英语九年级上出 3 题，题号都属于 english9a。"""
+        real = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "data", "app.db")
+        if not os.path.exists(real):
+            self.skipTest("app.db 不存在")
+        conn = sqlite3.connect("file:%s?mode=ro" % real.replace("\\", "/"), uri=True)
+        try:
+            if not conn.execute("SELECT 1 FROM questions WHERE subject_pk='english9a'"
+                                " LIMIT 1").fetchone():
+                self.skipTest("真库当前没有 english9a（题库已改为纯数学多册）")
+            m = sel.build({"title": "英语卷", "mix": {"选择": 3}, "seed": 1,
+                           "scope": {"subject_pk": "english9a"}}, conn)
+            nos = [it["no"] for it in m["items"]]
+            self.assertEqual(3, len(nos))
+            marks = ",".join("?" * len(nos))
+            got = {r[1] for r in conn.execute(
+                "SELECT no, subject_pk FROM questions WHERE no IN (%s)" % marks, nos)}
+            self.assertEqual({"english9a"}, got, "英语卷出现了非英语题：%s" % nos)
+            chapters = [it.get("chapter") or "" for it in m["items"]]
+            self.assertTrue(all(c.startswith("英语") for c in chapters),
+                            "英语卷的章节应都是英语：%s" % chapters)
+        finally:
+            conn.close()
+
+
+class CrossSubjectChapterTest(unittest.TestCase):
+    """t97：章节必须属于当前学科，残留别的学科的章节要报「不属于当前学科」。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="xsub_")
+        self.db = os.path.join(self.tmp, "x.db")
+        conn = dbmod.connect(self.db)
+        for i in range(3):
+            _insert_q(conn, "M%03d" % i, "选择", CH1, "1.1", "A",
+                      tokens=[{"kind": "text", "text": "数学 %d" % i}])
+        # physics：有题但 chapter 为空（线上就是这样导入的）
+        for i in range(3):
+            _insert_q(conn, "P%03d" % i, "选择", "", "", "A",
+                      tokens=[{"kind": "text", "text": "物理 %d" % i}], subject="physics")
+        conn.commit()
+        self.conn = conn
+
+    def tearDown(self):
+        self.conn.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_cross_subject_chapter_raises_scope_error(self):
+        with self.assertRaises(sel.ScopeError) as ctx:
+            sel.count_available(self.conn, {"mix": {"选择": 1},
+                                            "scope": {"subject_pk": "physics",
+                                                      "chapters": [CH1]}})
+        msg = str(ctx.exception)
+        self.assertIn("不属于当前学科", msg)
+        self.assertIn("physics", msg)
+
+    def test_cross_subject_chapter_does_not_look_like_shortage(self):
+        with self.assertRaises(sel.ScopeError):
+            sel.count_available(self.conn, {"mix": {"选择": 10},
+                                            "scope": {"subject_pk": "physics",
+                                                      "chapters": [CH1]}})
+
+    def test_own_chapter_still_passes(self):
+        out = sel.count_available(self.conn, {"mix": {"选择": 1},
+                                              "scope": {"subject_pk": "math7a",
+                                                        "chapters": [CH1]}})
+        self.assertEqual(3, out["选择"])
+
+    def test_clean_physics_counts(self):
+        out = sel.count_available(self.conn, {"mix": {"选择": 1},
+                                              "scope": {"subject_pk": "physics"}})
+        self.assertEqual(3, out["选择"])
 
 
 if __name__ == "__main__":

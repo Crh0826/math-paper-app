@@ -246,13 +246,15 @@ class TestRealLibrary(unittest.TestCase):
         import time
         conn = sqlite3.connect("file:%s?mode=ro" % REAL_DB.replace("\\", "/"), uri=True)
         try:
+            total = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
             t0 = time.time()
             res = quality.scan(conn, write=False)
             elapsed = time.time() - t0
         finally:
             conn.close()
-        self.assertEqual(12280, res["scanned"])
-        self.assertLess(elapsed, 120.0, "全库体检太慢：%.1fs" % elapsed)
+        # t17（75k 入库）后库规模不再写死：全库体检必须覆盖每一行。
+        self.assertEqual(total, res["scanned"], "全库体检要覆盖 questions 每一行")
+        self.assertLess(elapsed, 300.0, "全库体检太慢：%.1fs" % elapsed)
         self.assertEqual(0, res["flags"]["no_answer"], "裁剪后不该还有无答案的题")
         self.assertGreater(res["flags"]["answer_mismatch"], 0)
         self.assertGreater(res["flags"]["dup_text"], 0)

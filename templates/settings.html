@@ -1,0 +1,320 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h1>设置</h1>
+  <p class="lede">
+    填空/解答题的识别用哪个后端、Key 填什么，都在这里改。改完<strong>立刻生效</strong>（写 `config.json`，不用重启）。
+    <span class="muted">Key 只存在本机，页面上只显示尾号。</span>
+  </p>
+</div>
+
+{% if notice %}
+<div class="banner banner-{{ 'warn' if notice.kind == 'bad' else 'ok' }}" role="status">
+  <div class="banner-head"><span class="banner-dot" aria-hidden="true"></span>{{ notice.text }}</div>
+</div>
+{% endif %}
+
+{% if pdf_note %}
+<div class="banner banner-warn" role="status">
+  <div class="banner-head"><span class="banner-dot" aria-hidden="true"></span>PDF 后端提示</div>
+  <p class="banner-text">{{ pdf_note }}</p>
+</div>
+{% endif %}
+
+{% if env_override %}
+<div class="banner banner-warn" role="status">
+  <div class="banner-head"><span class="banner-dot" aria-hidden="true"></span>环境变量正在覆盖这里的配置</div>
+  <p class="banner-text">检测到 <code>OCR_BACKEND</code> / <code>OCR_TOKEN</code> / <code>OCR_KEY</code> 等环境变量，
+    它们的优先级高于 config.json。想用本页设置，先把这些环境变量去掉（或在新的窗口里启动）。</p>
+</div>
+{% endif %}
+
+<div class="card" id="print">
+  <h2>打印</h2>
+  <p class="muted">卷子「合并打印件」默认只含<strong>卷面 + 答题卡</strong>。校准页（A4 上画一个 100mm 方框 +
+    10mm 刻度尺）只有在你<strong>换打印机、调边距、或第一次用</strong>时才需要打一张来量一量：
+    方框量出来不是 100mm，说明打印缩放/边距要调。</p>
+
+  <form method="post" action="/settings/print" class="form-row">
+    <label class="check">
+      <input type="checkbox" name="include_calibration" value="1"
+             {% if print_cfg and print_cfg.include_calibration %}checked{% endif %}>
+      打印时附带校准页（默认关闭，省纸）
+    </label>
+    <button class="btn btn-primary" type="submit">保存打印设置</button>
+    <span class="muted">
+      当前：{% if print_cfg and print_cfg.include_calibration %}
+      <strong>会附带</strong>校准页（合并打印件多 1 页）{% else %}
+      <strong>不附带</strong>校准页（只印卷面 + 答题卡）{% endif %}
+    </span>
+  </form>
+
+  <p class="field-hint">
+    需要校准时不用改这个开关：任何一份卷子的详情页都有
+    <strong>「单独下载校准页」</strong>（<span class="mono">/papers/&lt;卷号&gt;/calibration.pdf</span>），
+    按需生成、单页 A4，不影响已生成的合并打印件。
+  </p>
+  {% if print_cfg and print_cfg.from_config != print_cfg.include_calibration %}
+  <p class="field-hint">配置文件和运行时不一致（改过又没重启？）——本页保存一次即对齐。</p>
+  {% endif %}
+</div>
+
+<div class="card" id="lan">
+  <h2>局域网访问</h2>
+  <p class="muted">一套程序：本机 <code>127.0.0.1</code> 永远能进；手机/别的电脑能不能进，看这个开关（改完立即生效，不用重启）。</p>
+
+  {% if not lan.pin_valid %}
+  <div class="banner banner-warn"><div class="banner-head"><span class="banner-dot" aria-hidden="true"></span>还没设访问码</div>
+    <p class="banner-text">局域网开着时没有访问码，同一 WiFi 下谁都能打开你的卷子。点下面「保存」会自动生成一个 4 位访问码。</p>
+  </div>
+  {% endif %}
+
+  <form method="post" action="/settings/lan" class="form-row">
+    <label class="check">
+      <input type="checkbox" name="enabled" value="1" {% if lan.on %}checked{% endif %}>
+      允许局域网访问（手机扫码判卷）
+    </label>
+    <button class="btn btn-primary" type="submit" name="action" value="save">保存（立即生效）</button>
+  </form>
+
+  <dl class="kv">
+    <dt>当前状态</dt>
+    <dd>{% if lan.on %}<span class="pill pill-ok">已允许局域网</span>{% else %}<span class="pill pill-warn">只允许本机</span>{% endif %}
+      {% if lan.pin_required %}<span class="muted">访问码 <span class="mono">{{ lan.pin_tail }}</span>（4-6 位数字，手机首次访问输一次，记 30 天）</span>
+      {% else %}<span class="muted">还没设访问码</span>{% endif %}</dd>
+    <dt>手机地址</dt>
+    <dd>{% if lan.url %}<span class="mono">{{ lan.url }}</span>{% if lan.pin_required %} · 扫码会自动带上访问码{% endif %}
+        {% else %}<span class="muted">关着（打开后这里显示 http://你的局域网IP:{{ lan.port }}/）</span>{% endif %}</dd>
+    <dt>扫码入口</dt>
+    <dd>{% if lan.qr %}<img src="{{ lan.qr }}" alt="手机扫码进入答题卡上传页" width="132" height="132" style="border:1px solid #ddd;border-radius:6px">
+        <span class="muted">指向判卷上传页 /submissions</span>{% else %}<span class="muted">打开局域网后出现</span>{% endif %}</dd>
+    <dt>本机地址</dt><dd class="mono">http://127.0.0.1:{{ lan.port }}/</dd>
+  </dl>
+
+  <form method="post" action="/settings/lan" class="form-row">
+    <label>访问码（4-6 位数字）
+      <input type="text" name="pin" inputmode="numeric" pattern="\d{4,6}" maxlength="6"
+             placeholder="{% if lan.pin_required %}现在 {{ lan.pin_tail }}，留空=不改{% else %}例如 2025{% endif %}">
+    </label>
+    <input type="hidden" name="enabled" value="{% if lan.on %}1{% endif %}">
+    <button class="btn" type="submit" name="action" value="save">改访问码</button>
+    <button class="btn" type="submit" name="action" value="regen">重新生成</button>
+  </form>
+
+  <p class="muted">手机连不上？在<b>这台电脑</b>上以管理员身份运行一次下面命令放行防火墙：</p>
+  <div class="form-row">
+    <input type="text" class="mono" id="fw-cmd" readonly value="{{ lan.firewall }}" style="flex:1">
+    <button class="btn" type="button" onclick="var e=document.getElementById('fw-cmd');e.select();document.execCommand&&document.execCommand('copy');try{navigator.clipboard&&navigator.clipboard.writeText(e.value)}catch(_){};this.textContent='已复制';setTimeout(()=>this.textContent='复制命令',1500)">复制命令</button>
+  </div>
+  <p class="muted">公用 WiFi / 教室投影别长期开着；不用时把上面的勾去掉即可（立即生效）。</p>
+</div>
+
+<div class="card">
+  <h2>当前状态</h2>
+  <dl class="kv">
+    <dt>后端</dt><dd>{{ info.backend_label or "未设置" }} <span class="mono muted">({{ current }})</span></dd>
+    <dt>PaddleOCR-VL</dt>
+    <dd>{% if info.paddle_vl.token_present %}已配置 · 尾号 <span class="mono">{{ info.paddle_vl.token_tail }}</span>{% else %}<span class="muted">未配置</span>{% endif %}
+      {% if info.paddle_vl.model %} · 模型 <span class="mono">{{ info.paddle_vl.model }}</span>{% endif %}</dd>
+    <dt>视觉模型</dt>
+    <dd>{% if info.vlm.key_present %}已配置 · 尾号 <span class="mono">{{ info.vlm.key_tail }}</span>{% else %}<span class="muted">未配置</span>{% endif %}
+      {% if info.vlm.base_url %} · <span class="mono">{{ info.vlm.base_url }}</span>{% endif %}</dd>
+    <dt>PDF 后端</dt>
+    <dd>
+      {% if pdf_backend.chosen == "word" %}Word <span class="muted">（{{ pdf_backend.detail }}）</span>
+      {% elif pdf_backend.chosen == "libreoffice" %}LibreOffice <span class="muted">（{{ pdf_backend.detail }}）</span>
+        <span class="pill pill-warn">版面可能与 Word 有差异</span>
+      {% else %}<span class="pill pill-warn">都没有</span> <span class="muted">卷面 PDF 出不来，答题卡仍可打印</span>
+      {% endif %}
+    </dd>
+    <dt>本机离线 OCR</dt>
+    <dd>
+      {% if local_ocr.available %}<span class="pill pill-ok">可用</span> <span class="muted">{{ local_ocr.detail }}</span>
+      {% else %}<span class="pill pill-warn">本机不支持</span> <span class="muted">{{ local_ocr.detail }}</span>
+      {% endif %}
+    </dd>
+    <dt>配置文件</dt><dd class="mono">{{ config_path }}</dd>
+    <dt>题库目录</dt><dd class="mono">{{ paths.qbank.path }} <span class="muted">（{{ paths.qbank.source }}）</span></dd>
+    <dt>数据 / 产物</dt><dd class="mono">{{ paths.data.path }} · {{ paths.out.path }}</dd>
+  </dl>
+</div>
+
+<form class="form" method="post" action="/settings" id="settings-form">
+  <section class="card">
+    <h2>识别后端</h2>
+    <div class="grid grid-2">
+      <label class="field">
+        <span class="field-label">用哪个后端识别填空/解答</span>
+        <select name="backend" id="backend-select">
+          {% for b in backends %}
+          <option value="{{ b.key }}" {% if b.key == current %}selected{% endif %}>
+            {{ b.label }}{% if not b.available %} · {{ b.note }}{% endif %}</option>
+          {% endfor %}
+        </select>
+        <span class="field-hint" id="backend-hint"></span>
+      </label>
+    </div>
+
+    <div class="backend-fields" id="fields-local_formula" hidden>
+      <div class="grid grid-2">
+        <label class="field">
+          <span class="field-label">本机 venv 的 python.exe</span>
+          <input type="text" name="lf_python" value="{{ info.local_formula.python or '' }}" autocomplete="off">
+          <span class="field-hint">
+            {% if info.local_formula.python_exists %}<span class="pill pill-ok">已找到</span>{% else %}<span class="pill pill-bad">不存在</span>{% endif %}
+            需要装有 torch + transformers + qwen-vl-utils 的独立环境（见 docs\路线一-本地公式模型实测.md）。
+          </span>
+        </label>
+        <label class="field">
+          <span class="field-label">模型</span>
+          <input type="text" name="lf_model" value="{{ info.local_formula.model or 'Qwen/Qwen2.5-VL-3B-Instruct' }}" autocomplete="off">
+        </label>
+      </div>
+      <p class="field-hint">
+        离线：作答格在本机识别，不上传。实测 9 张真实裁切 <b>9/9 判对</b>，约 <b>9 秒/格</b>（8 张一批约 80 秒）；
+        读不出时可用上面的 GLM-OCR / 视觉模型兜底。判卷走异步，不会卡住页面。
+      </p>
+    </div>
+
+    <div class="backend-fields" id="fields-glm_ocr" hidden>
+      <div class="grid grid-2">
+        <label class="field">
+          <span class="field-label">GLM-OCR API Key（智谱）</span>
+          <input type="password" name="glm_key" autocomplete="off"
+                 placeholder="{% if info.glm_ocr.key_present %}已配置 · 尾号 {{ info.glm_ocr.key_tail }}{% if info.glm_ocr.key_shared %}（沿用视觉模型的 key）{% endif %}（留空=不改）{% else %}粘贴智谱 API Key{% endif %}">
+          <span class="field-hint">留空 = 不改；可以和上面的视觉模型共用同一把 key。</span>
+        </label>
+        <label class="field">
+          <span class="field-label">模型</span>
+          <input type="text" name="glm_model" value="{{ info.glm_ocr.model or 'glm-ocr' }}" autocomplete="off">
+        </label>
+      </div>
+      <label class="field">
+        <span class="field-label">接口地址</span>
+        <input type="text" name="glm_url" value="{{ info.glm_ocr.url or 'https://open.bigmodel.cn/api/paas/v4/layout_parsing' }}" autocomplete="off">
+      </label>
+      <p class="field-hint">
+        GLM-OCR 是版面解析模型：作答格会先贴成「一页纸」再发过去（单行小图它读不出来）；
+        读不出时自动用上面的视觉模型兜底，不会整批变待确认。
+      </p>
+    </div>
+
+    <div class="backend-fields" id="fields-paddle_vl" hidden>
+      <div class="grid grid-2">
+        <label class="field">
+          <span class="field-label">PaddleOCR-VL Token</span>
+          <input type="password" name="pv_token" autocomplete="off"
+                 placeholder="{% if info.paddle_vl.token_present %}已配置 · 尾号 {{ info.paddle_vl.token_tail }}（留空=不改）{% else %}粘贴 token{% endif %}">
+          <span class="field-hint">留空 = 不修改；点下面的「清除」才会删掉。</span>
+        </label>
+        <label class="field">
+          <span class="field-label">模型</span>
+          <input type="text" name="pv_model" value="{{ info.paddle_vl.model or 'PaddleOCR-VL-1.6' }}" autocomplete="off">
+        </label>
+      </div>
+      <label class="field">
+        <span class="field-label">任务地址（job_url）</span>
+        <input type="text" name="pv_job_url" value="{{ info.paddle_vl.job_url or 'https://paddleocr.aistudio-app.com/api/v2/ocr/jobs' }}" autocomplete="off">
+      </label>
+      <button class="btn" type="submit" name="clear" value="paddle_vl">清除 PaddleOCR-VL Token</button>
+    </div>
+
+    <div class="backend-fields" id="fields-vlm" hidden>
+      <div class="grid grid-2">
+        <label class="field">
+          <span class="field-label">Base URL（OpenAI 兼容）</span>
+          <input type="text" name="vlm_base_url" value="{{ info.vlm.base_url or '' }}" placeholder="https://api.example.com" autocomplete="off">
+        </label>
+        <label class="field">
+          <span class="field-label">API Key</span>
+          <input type="password" name="vlm_key" autocomplete="off"
+                 placeholder="{% if info.vlm.key_present %}已配置 · 尾号 {{ info.vlm.key_tail }}（留空=不改）{% else %}粘贴 key{% endif %}">
+        </label>
+      </div>
+      <div class="grid grid-2">
+        <label class="field">
+          <span class="field-label">模型名</span>
+          <input type="text" name="vlm_model" value="{{ info.vlm.model or '' }}" placeholder="如 deepseek-flash / qwen-vl-max / gpt-4o-mini" autocomplete="off">
+        </label>
+      </div>
+      <button class="btn" type="submit" name="clear" value="vlm">清除视觉模型 Key</button>
+    </div>
+
+    <div class="backend-fields" id="fields-local" hidden>
+      {% if local_ocr.available %}
+      <p class="field-hint"><span class="pill pill-ok">可用</span> {{ local_ocr.detail }}。
+        不联网、不要 Key；识别质量一般，适合不想把作答内容发出去的场景。</p>
+      {% else %}
+      <div class="banner banner-warn" role="status">
+        <div class="banner-head"><span class="banner-dot" aria-hidden="true"></span>本机不支持本机离线识别</div>
+        <p class="banner-text">{{ local_ocr.detail }}</p>
+        <p class="banner-text muted">不是 Key 的问题，选它也不会生效（会静默降级成人工确认）。
+          建议选 PaddleOCR-VL / 视觉模型，或先用「全人工确认」。</p>
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="backend-fields" id="fields-manual" hidden>
+      <p class="field-hint">全人工：不做识别，填空/解答全部留在「待人工确认」里，选择题仍走 OMR 自动判。</p>
+    </div>
+  </section>
+
+  <div class="form-actions">
+    <span class="muted">保存会先备份成 <code>config.json.bak</code>，其它配置项不动。</span>
+    <button class="btn btn-primary" type="submit">保存设置</button>
+  </div>
+</form>
+
+<form class="inline-form" method="post" action="/settings/test">
+  <section class="card">
+    <h2>测试连接</h2>
+    <p class="muted">用一张内置测试图（<span class="mono">40 + 2 = 42</span>，900×260 白底）真跑一次识别，最多等 30 秒。</p>
+    <input type="hidden" name="backend" id="test-backend" value="{{ current }}">
+    <button class="btn" type="submit">测一下当前后端</button>
+    {% if test_result %}
+    {% set kind = test_result.kind or ('ok' if test_result.ok else 'error') %}
+    <div class="banner banner-{{ 'ok' if kind == 'ok' else ('warn' if kind in ('connected_no_content', 'network') else 'warn') }}"
+         style="margin-top:14px" role="status">
+      <div class="banner-head">
+        <span class="banner-dot" aria-hidden="true"></span>
+        {% if kind == 'ok' %}识别成功{% elif kind == 'connected_no_content' %}已连通云端（这张测试图没解析出内容）
+        {% elif kind == 'auth_or_quota' %}鉴权 / 额度有问题{% elif kind == 'network' %}没连上云端
+        {% else %}测试没跑完{% endif %}
+        <span class="muted mono">· {{ test_result.backend }} · {{ test_result.elapsed_s }} 秒</span>
+      </div>
+      <p class="banner-text">{{ test_result.message }}</p>
+      {% if test_result.text %}<p class="banner-text">认出：<span class="mono">{{ test_result.text }}</span>
+        {% if test_result.confidence %}· 置信度 {{ test_result.confidence }}{% endif %}</p>{% endif %}
+      {% if test_result.error and kind in ('auth_or_quota', 'network', 'error') %}
+      <p class="banner-text muted">错误：{{ test_result.error }}</p>{% endif %}
+      {% if kind == 'connected_no_content' %}
+      <p class="banner-text muted">上面那张测试图是内置的「一行算式」；云端通了但没识别出内容很常见。
+        真正要验证识别质量，用一张真实答题卡裁切图去判卷页试。</p>
+      {% endif %}
+    </div>
+    {% endif %}
+  </section>
+</form>
+
+<script>
+(function () {
+  var select = document.getElementById('backend-select');
+  var hints = {{ backends | tojson }};
+  var testBackend = document.getElementById('test-backend');
+  function sync() {
+    var value = select.value;
+    ['paddle_vl', 'vlm', 'local', 'manual'].forEach(function (key) {
+      var box = document.getElementById('fields-' + key);
+      if (box) { box.hidden = (key !== value); }
+    });
+    var hint = document.getElementById('backend-hint');
+    if (hint) {
+      var row = hints.find(function (item) { return item.key === value; });
+      hint.textContent = row ? (row.hint + (row.available ? '' : '（' + row.note + '）')) : '';
+    }
+    if (testBackend) { testBackend.value = value; }
+  }
+  if (select) { select.addEventListener('change', sync); sync(); }
+})();
+</script>
+{% endblock %}

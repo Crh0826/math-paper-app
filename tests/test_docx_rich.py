@@ -16,7 +16,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from docx_rich import Token, extract_tokens, plain_text, stats  # noqa: E402
 
-ROOT = r"E:\OCR"
+try:
+    import paths as _paths
+    ROOT = _paths.resolve_qbank(legacy=_paths.LEGACY_QBANK)
+except Exception:  # pragma: no cover
+    ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "qbank")
 Q_OMML = os.path.join(ROOT, "00001.docx")      # 6 个 OMML，0 张图
 Q_OLE = os.path.join(ROOT, "01000.docx")       # 4 个 OLE 公式对象（WMF 预览）
 Q_TABS = os.path.join(ROOT, "00002.docx")      # 选项用制表符分隔

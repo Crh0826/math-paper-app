@@ -30,3 +30,11 @@ Thumbs.db
 dist/
 build/
 *.spec.bak
+
+# 硬写云端 key 的探针脚本：绝不入库
+tools/compare_glm_ocr.py
+tools/compare_glm_ocr_padded.py
+tools/compare_vlm.py
+tools/probe_glm_ocr.py
+tools/probe_glm_ocr_api.py
+tools/probe_glm_ocr_page.py

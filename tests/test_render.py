@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import glob
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -127,8 +128,8 @@ def owned_temp_dirs(pid: int) -> list:
 # ------------------------------------------------------------------ 1. Word 探测
 class WordProbeTest(unittest.TestCase):
     def test_probe_never_raises(self):
-        self.assertIsInstance(render.word_available(), bool)
-        path = render.word_path()
+        self.assertIsInstance(render.word_available(refresh=True), bool)
+        path = render.word_path(refresh=True)
         self.assertIn(path, (None, path))
         if path:
             self.assertTrue(os.path.isfile(path), path)
@@ -155,13 +156,24 @@ class WordUnavailableTest(unittest.TestCase):
         self.pdf = os.path.join(self.tmp, "out.pdf")
 
     def test_not_installed_raises_word_unavailable(self):
-        with mock.patch.object(render, "_find_word_exe", return_value=None):
+        """Word 与 LibreOffice 都没有 → no_backend（带安装建议），且不产出半截 PDF。"""
+        with mock.patch.object(render, "_find_word_exe", return_value=None), \
+                mock.patch.object(render, "_find_soffice", return_value=None):
             with self.assertRaises(render.WordUnavailable) as ctx:
                 render.docx_to_pdf(self.docx, self.pdf)
         exc = ctx.exception
-        self.assertEqual(exc.reason, "not_installed")
+        self.assertEqual(exc.reason, "no_backend")
+        self.assertIn("LibreOffice", str(exc), "要告诉用户装什么")
+        self.assertIn("Word", str(exc))
         self.assertTrue(str(exc).strip(), "异常文本不能是空的（上层要直接显示）")
-        self.assertFalse(os.path.exists(self.pdf), "没 Word 就不能产出半截 PDF")
+        self.assertFalse(os.path.exists(self.pdf), "没后端就不能产出半截 PDF")
+
+    def test_require_word_keeps_legacy_not_installed_reason(self):
+        """`_require_word()` 的老语义/错误码不变（别的调用方还按 not_installed 处理）。"""
+        with mock.patch.object(render, "_find_word_exe", return_value=None):
+            with self.assertRaises(render.WordUnavailable) as ctx:
+                render._require_word()
+        self.assertEqual(ctx.exception.reason, "not_installed")
 
     def test_dispatch_error_becomes_word_unavailable(self):
         with mock.patch.object(render, "_find_word_exe", return_value=sys.executable), \
@@ -641,6 +653,173 @@ class OrphanSweepTest(unittest.TestCase):
             render._sweep_orphan_word(max_age_s=600)
         self.assertTrue(os.path.isdir(path), "刚建的目录不能当孤儿清掉")
 
+
+class LibreOfficeBackendTest(unittest.TestCase):
+    """用户反馈第 2 条：没有 Word 时用 LibreOffice（soffice headless）出 PDF。
+
+    本机（打包机）没装 LibreOffice，所以用**伪造的 soffice**（.cmd 包一层 python 脚本）
+    验证整条链路：探测 → 调命令行 → 产物落位 → 页数/A4 校验 → 错误详情带 stderr 前 20 行。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="render_lo_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        # 探测有缓存：每个用例开始/结束都清掉，别把伪造的 soffice/word 路径漏给别的用例
+        render._soffice_cache = "unset"
+        render._word_path_cache = "unset"
+        self.addCleanup(self._reset_caches)
+        self.docx = make_docx(os.path.join(self.tmp, "in.docx"))
+        self.pdf = os.path.join(self.tmp, "out.pdf")
+        self.soffice = self._make_fake_soffice()
+
+    @staticmethod
+    def _reset_caches():
+        render._soffice_cache = "unset"
+        render._word_path_cache = "unset"
+
+    # -- 伪造 soffice：把输入 docx 名字换成 pdf（内容是一页真 PDF，A4 或 Letter 可选）--
+    def _make_fake_soffice(self) -> str:
+        helper = os.path.join(self.tmp, "fake_soffice.py")
+        script = "\n".join([
+            "import os, sys",
+            "import pymupdf",
+            "mode = os.environ.get('FAKE_SOFFICE_MODE', 'ok')",
+            "if mode == 'fail':",
+            "    for i in range(25):",
+            "        sys.stderr.write('stderr 行%d：转换爆炸\\n' % (i + 1))",
+            "    sys.exit(3)",
+            "outdir = None",
+            "docx = None",
+            "args = sys.argv[1:]",
+            "for i, a in enumerate(args):",
+            "    if a == '--outdir' and i + 1 < len(args):",
+            "        outdir = args[i + 1]",
+            "    if a.lower().endswith('.docx'):",
+            "        docx = a",
+            "if not outdir or not docx:",
+            "    sys.stderr.write('fake soffice: 缺 --outdir 或 docx\\n')",
+            "    sys.exit(2)",
+            "stem = os.path.splitext(os.path.basename(docx))[0]",
+            "out = os.path.join(outdir, stem + '.pdf')",
+            "size = (612.0, 792.0) if mode == 'letter' else (595.28, 841.89)",
+            "doc = pymupdf.open()",
+            "page = doc.new_page(width=size[0], height=size[1])",
+            "for i in range(40):",
+            "    page.insert_text((72, 80 + i * 16), 'fake soffice pdf line %02d' % i)",
+            "doc.save(out)",
+            "doc.close()",
+            "print('convert %s -> %s using filter : writer_pdf_Export' % (docx, out))",
+        ]) + "\n"
+        with open(helper, "w", encoding="utf-8") as fh:
+            fh.write(script)
+        if os.name == "nt":
+            wrapper = os.path.join(self.tmp, "soffice.cmd")
+            with open(wrapper, "w", encoding="utf-8") as fh:
+                fh.write('@echo off\r\n"%s" "%s" %%*\r\n' % (sys.executable, helper))
+        else:
+            wrapper = os.path.join(self.tmp, "soffice")
+            with open(wrapper, "w", encoding="utf-8") as fh:
+                fh.write('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, helper))
+            os.chmod(wrapper, 0o755)
+        return wrapper
+
+    def _soffice_env(self, mode="ok"):
+        return {"LIBREOFFICE_PATH": self.soffice, "FAKE_SOFFICE_MODE": mode}
+
+    def test_detection_env_var_wins(self):
+        with mock.patch.dict(os.environ, {"LIBREOFFICE_PATH": self.soffice}):
+            render._soffice_cache = "unset"
+            self.assertEqual(render._find_soffice(), os.path.abspath(self.soffice))
+            self.assertTrue(render.soffice_available(refresh=True))
+
+    def test_probe_backend_prefers_word_and_reports_shape(self):
+        with mock.patch.object(render, "_find_word_exe", return_value=sys.executable), \
+                mock.patch.dict(os.environ, {"LIBREOFFICE_PATH": self.soffice}):
+            render._word_path_cache = "unset"
+            render._soffice_cache = "unset"
+            probe = render.probe_backend(refresh=True)
+        self.assertTrue(probe["word"])
+        self.assertTrue(probe["libreoffice"])
+        self.assertEqual(probe["chosen"], "word", "Word 必须优先，不能因为装了 LO 就换后端")
+        for key in ("word", "libreoffice", "chosen", "detail"):
+            self.assertIn(key, probe)
+
+    def test_libreoffice_converts_when_word_missing(self):
+        with mock.patch.object(render, "_find_word_exe", return_value=None), \
+                mock.patch.dict(os.environ, self._soffice_env("ok")), \
+                mock.patch.object(render, "_cross_process_lock",
+                                  lambda *a, **k: contextlib.nullcontext()):
+            pages, secs = render.docx_to_pdf(self.docx, self.pdf)
+        self.assertGreaterEqual(pages, 1)
+        self.assertGreater(secs, 0)
+        self.assertEqual(render.last_backend(), "libreoffice")
+        with open(self.pdf, "rb") as fh:
+            self.assertTrue(fh.read(4).startswith(b"%PDF"), "产物不是 PDF")
+        with render.pymupdf.open(self.pdf) as doc:
+            self.assertAlmostEqual(doc[0].rect.width, 595.28, delta=0.5)
+
+    def test_libreoffice_stderr_goes_into_error_detail(self):
+        with mock.patch.object(render, "_find_word_exe", return_value=None), \
+                mock.patch.dict(os.environ, self._soffice_env("fail")), \
+                mock.patch.object(render, "_cross_process_lock",
+                                  lambda *a, **k: contextlib.nullcontext()):
+            with self.assertRaises(render.RenderError) as ctx:
+                render.docx_to_pdf(self.docx, self.pdf)
+        msg = str(ctx.exception)
+        self.assertIn("退出码 3", msg)
+        self.assertIn("转换爆炸", msg, "stderr 要带进错误详情：%s" % msg)
+        self.assertLessEqual(msg.count("stderr 行"), 20, "stderr 只留最后 20 行")
+
+    def test_non_a4_pdf_is_rejected(self):
+        import paper
+
+        with mock.patch.object(render, "_find_word_exe", return_value=None), \
+                mock.patch.dict(os.environ, self._soffice_env("letter")), \
+                mock.patch.object(render, "_cross_process_lock",
+                                  lambda *a, **k: contextlib.nullcontext()):
+            with self.assertRaises(paper.PaperError) as ctx:
+                render.docx_to_pdf(self.docx, self.pdf)
+        code = getattr(ctx.exception, "code", "") or ""
+        self.assertEqual(code, "pdf_not_a4", "非 A4 要按 t48 的码报出来：%r" % (ctx.exception,))
+
+    def test_no_backend_mentions_both_options(self):
+        with mock.patch.object(render, "_find_word_exe", return_value=None), \
+                mock.patch.object(render, "_find_soffice", return_value=None):
+            with self.assertRaises(render.WordUnavailable) as ctx:
+                render.docx_to_pdf(self.docx, self.pdf)
+        msg = str(ctx.exception)
+        self.assertEqual(ctx.exception.reason, "no_backend")
+        self.assertIn("Word", msg)
+        self.assertIn("LibreOffice", msg)
+        self.assertIn("macOS", msg, "要给非 Windows 用户安装建议")
+
+    def test_active_backend_uses_probe(self):
+        with mock.patch.object(render, "_find_word_exe", return_value=None), \
+                mock.patch.dict(os.environ, {"LIBREOFFICE_PATH": self.soffice}):
+            render._soffice_cache = "unset"
+            self.assertEqual(render.active_backend(), "libreoffice")
+
+
+class RenderCliTest(unittest.TestCase):
+    """`python -m render --check`：非 Windows 用户装完 LibreOffice 先用它确认探测结果。"""
+
+    def test_cli_check_prints_backend(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = render._main(["--check"])
+        text = buf.getvalue()
+        self.assertIn("PDF 后端", text)
+        self.assertIn("Word", text)
+        self.assertIn("LibreOffice", text)
+        self.assertEqual(code, 0 if render.probe_backend(refresh=True)["chosen"] else 1)
+
+    def test_cli_json_is_machine_readable(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            render._main(["--check", "--json"])
+        data = json.loads(buf.getvalue())
+        for key in ("word", "libreoffice", "chosen", "detail"):
+            self.assertIn(key, data)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

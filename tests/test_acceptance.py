@@ -52,7 +52,11 @@ import train            # noqa: E402
 
 DB_PATH = os.path.join(APP, "data", "app.db")
 OUT = os.path.join(APP, "out", "acceptance_v1")
-REAL_DOCX = r"E:\OCR"
+try:
+    import paths as _paths
+    REAL_DOCX = _paths.resolve_qbank(legacy=_paths.LEGACY_QBANK)
+except Exception:  # pragma: no cover
+    REAL_DOCX = os.path.join(APP, "qbank")
 
 PAGE_W, PAGE_H = 2480, 3508
 PID = "P20261031-001"
@@ -146,6 +150,34 @@ def manifest_a():
 
 
 # ---------------------------------------------------------------- T1 数据层
+#: 卷面里不是题框的装饰表（t59 的「班级 / 姓名 / 学号」学生栏是 1×3 表）
+_DECOR_WORDS = ("班级", "姓名", "学号", "座位号")
+
+
+def _is_decor_table(el) -> bool:
+    """1×3 且文字含学生栏标签 → 装饰表（纸张排版用，不是题框）。"""
+    try:
+        from docx.table import Table
+        tbl = Table(el, None)
+        n_cols = len(tbl.columns)
+        text = "".join(t.text for row in tbl.rows for t in row.cells)
+    except Exception:              # noqa: BLE001
+        return False
+    return n_cols == 3 and any(w in text for w in _DECOR_WORDS)
+
+
+def _item_boxes(doc):
+    """卷面正文里的题框（1×1 表），去掉学生栏这类装饰表。"""
+    out = []
+    for el in doc.element.body:
+        if not (isinstance(el.tag, str) and el.tag.endswith("}tbl")):
+            continue
+        if _is_decor_table(el):
+            continue
+        out.append(el)
+    return out
+
+
 class T1DataLayer(unittest.TestCase):
     """CONTRACT §1 的库结构 + 团队约定的硬数字。"""
 
@@ -176,6 +208,9 @@ class T1DataLayer(unittest.TestCase):
             "five_digit_no": c.execute(
                 "SELECT COUNT(*) FROM questions WHERE no GLOB '[0-9][0-9][0-9][0-9][0-9]'"
             ).fetchone()[0],
+            "six_digit_no": c.execute(
+                "SELECT COUNT(*) FROM questions WHERE no GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'"
+            ).fetchone()[0],
         }
         got["qtype"] = dict(c.execute(
             "SELECT qtype, COUNT(*) FROM questions GROUP BY qtype ORDER BY 2 DESC").fetchall())
@@ -190,15 +225,26 @@ class T1DataLayer(unittest.TestCase):
             "SELECT COUNT(*) FROM questions WHERE COALESCE(chapter,'')=''").fetchone()[0]
         got["kp_ids"] = [r[0] for r in c.execute(
             "SELECT kp_id FROM kps ORDER BY kp_id").fetchall()]
+        # t93：题数一律从库实时算，不再钉死某个数字（数据天天在长）
+        got["by_subject"] = dict(c.execute(
+            "SELECT subject_pk, COUNT(*) FROM questions GROUP BY subject_pk"
+            " ORDER BY 2 DESC").fetchall())
+        got["subject_total"] = sum(got["by_subject"].values())
+        got["cross_subject_dup_no"] = c.execute(
+            "SELECT COUNT(*) FROM (SELECT no FROM questions GROUP BY no"
+            " HAVING COUNT(DISTINCT subject_pk) > 1)").fetchone()[0]
+        got["non_digit_no"] = c.execute(
+            "SELECT COUNT(*) FROM questions WHERE no GLOB '*[^0-9]*'").fetchone()[0]
         got["integrity"] = c.execute("PRAGMA integrity_check").fetchone()[0]
         got["tables"] = sorted(r[0] for r in c.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall())
         got["regime"] = "trimmed" if got["without_answer"] == 0 else "full"
         dump("data_layer.json", got)
 
-        # 两种口径都认（用户决定：无答案题从题库删掉，22,898 → 12,280）
+        # 两种口径都认（用户决定：无答案题从题库删掉，22,898 → 12,280；
+        # t17 又把 bank/final 的 75,468 道 6 位题入库 → 87,748，所以这里只守下界）
         if got["regime"] == "trimmed":
-            self.assertEqual(12280, got["questions"], "裁剪后 questions 应 = 12,280")
+            self.assertGreaterEqual(got["questions"], 12280, "裁剪后 questions 至少 12,280")
             self.assertEqual(got["questions"], got["with_answer"], "每题都必须有答案")
             self.assertGreater(got["families"], 0, "题族表不能空")
             self.assertGreaterEqual(got["families"], got["distinct_family_key"],
@@ -213,9 +259,34 @@ class T1DataLayer(unittest.TestCase):
             self.assertEqual(got["families"], got["distinct_family_key"],
                              "families 表族数应等于 questions.family_key 去重数")
         self.assertEqual(got["questions"], got["distinct_no"], "no 必须唯一（主键）")
-        self.assertEqual(got["questions"], got["five_digit_no"], "题号必须是 5 位数字串")
         self.assertEqual("ok", got["integrity"], "PRAGMA integrity_check")
-        self.assertEqual(0, got["unnamed_kp"], "每题都要有 kp_id")
+
+        # ---- t93：结构性条件（数字全从库实时算，不再钉死某一天的题数）
+        self.assertEqual(got["questions"], got["subject_total"],
+                         "总题数必须等于各学科题数之和")
+        self.assertGreaterEqual(got["by_subject"].get("math7a", 0), 18000,
+                                "math7a 题数异常偏低（低于 18,000）：%s"
+                                % got["by_subject"].get("math7a"))
+        self.assertIn("physics", got["by_subject"],
+                      "导入的物理题不见了（应存在于 questions.subject_pk）")
+        physics_nos = [r[0] for r in c.execute(
+            "SELECT no FROM questions WHERE subject_pk='physics'")]
+        self.assertTrue(physics_nos, "physics 学科没有题")
+        bad_block = [n for n in physics_nos if not str(n).startswith("99")]
+        self.assertEqual([], bad_block,
+                         "物理题必须落在 99xxx 号段（避免再和数学 0xxxx 撞号）：%r"
+                         % bad_block[:5])
+        self.assertEqual(0, got["cross_subject_dup_no"],
+                         "存在跨学科同题号（会互相覆盖）：%d 个"
+                         % got["cross_subject_dup_no"])
+        self.assertEqual(0, got["non_digit_no"], "题号必须是纯数字串")
+        # kp_id：老题库（math*）必须每道都有；导入件允许暂缺知识点
+        missing_kp = c.execute(
+            "SELECT subject_pk, COUNT(*) FROM questions WHERE COALESCE(kp_id,'')=''"
+            " GROUP BY subject_pk").fetchall()
+        math_missing = sum(n for sub, n in missing_kp if str(sub).startswith("math"))
+        self.assertEqual(0, math_missing,
+                         "数学题必须每题都有 kp_id（缺 %d 道）" % math_missing)
         self.assertLessEqual(set(got["qtype"]), {"选择", "填空", "解答", "判断", "其他"},
                              "qtype 必须在契约枚举内：%s" % sorted(got["qtype"]))
         self.assertGreater(len(got["qtype"]), 0, "题库不能没有题型")
@@ -624,8 +695,7 @@ class T4PaperFidelity(unittest.TestCase):
         _publish(cls.built["docx"], "paper")
         cls.build_s = time.time() - cls.t0
         cls.doc = Document(cls.built["docx"])
-        cls.boxes = [el for el in cls.doc.element.body
-                     if isinstance(el.tag, str) and el.tag.endswith("}tbl")]
+        cls.boxes = _item_boxes(cls.doc)       # 排除学生栏等装饰表
         cls.rels = {rid: rel.target_ref for rid, rel in cls.doc.part.rels.items()}
         import zipfile
         with zipfile.ZipFile(cls.built["docx"]) as _z:
@@ -644,7 +714,10 @@ class T4PaperFidelity(unittest.TestCase):
         for item, box in zip(self.manifest["items"], self.boxes):
             no = item["no"]
             src_path = os.path.join(REAL_DOCX, "%s.docx" % no)
-            self.assertTrue(os.path.exists(src_path), "源 docx 不存在：%s" % src_path)
+            if not os.path.exists(src_path):
+                # t17 入库的 75,468 道 6 位题没有源 docx，走 questions.tokens_json 回退排版；
+                # 这条用例只比对「有 docx 的题」的 token 保真度。
+                continue
             exp = {k: 0 for k in _MARKERS}
             exp_media = 0
             exp_hashes = set()
@@ -899,35 +972,61 @@ class T5CardGeometry(unittest.TestCase):
             self.assertIsNotNone(gray, "答题卡 PNG 读不出来：%s" % png)
             corners, ids, _ = det.detectMarkers(gray)
             found = sorted(int(i) for i in np.ravel(ids)) if ids is not None else []
+            # 位置真值也取 manifest（v4 每页 id 分组不同，card.ARUCO_POS 只覆盖 0..3）
+            want_pos = {int(mk["id"]): (float(mk["x"]), float(mk["y"]),
+                                        float(mk.get("size") or card.ARUCO_SIZE))
+                        for mk in ((page.get("marks") or {}).get("aruco") or [])}
             offs = {}
             if ids is not None:
                 for c, i in zip(corners, np.ravel(ids)):
                     mid = int(i)
-                    if mid in card.ARUCO_POS:
+                    if mid in want_pos:
                         cx, cy = c.reshape(-1, 2).mean(axis=0)
-                        px, py = card.ARUCO_POS[mid]
-                        offs[mid] = round(max(abs(cx - (px + card.ARUCO_SIZE / 2.0)),
-                                              abs(cy - (py + card.ARUCO_SIZE / 2.0))), 2)
-            rows.append({"page": page["page"], "found": found, "center_offset_px": offs})
-            self.assertEqual([0, 1, 2, 3], found,
-                             "第 %d 页 ArUco 检出 %s（应 0/1/2/3）" % (page["page"], found))
-            for mid, off in offs.items():
-                self.assertLess(off, 8.0, "第 %d 页 ArUco %d 位置偏了 %.1fpx"
-                                % (page["page"], mid, off))
+                        px, py, size = want_pos[mid]
+                        offs[mid] = round(max(abs(cx - (px + size / 2.0)),
+                                              abs(cy - (py + size / 2.0))), 2)
+            # v4：页序写在 ArUco id 里（第 p 页 = 4(p-1)..4(p-1)+3），真值以 manifest 为准
+            marks = (page.get("marks") or {}).get("aruco") or []
+            want_ids = sorted(int(mk["id"]) for mk in marks)
+            self.assertEqual(4, len(marks), "第 %d 页应在 manifest 里有 4 个 ArUco" % page["page"])
+            base = (int(page["page"]) - 1) * card.ARUCO_PER_PAGE
+            self.assertEqual(sorted([base, base + 1, base + 2, base + 3]), want_ids,
+                             "第 %d 页 ArUco 分组不对：%s（应 %d..%d）"
+                             % (page["page"], want_ids, base, base + 3))
+            rows.append({"page": page["page"], "found": found,
+                         "want": want_ids, "center_offset_px": offs})
+            self.assertEqual(want_ids, found,
+                             "第 %d 页 ArUco 检出 %s（应 %s）"
+                             % (page["page"], found, want_ids))
+            for mk in marks:                      # 位置按 manifest 的 x/y 子图定位逐个核对
+                mid = int(mk["id"])
+                self.assertIn(mid, offs, "第 %d 页没检出 ArUco %d" % (page["page"], mid))
+                self.assertLess(offs[mid], 8.0, "第 %d 页 ArUco %d 位置偏了 %.1fpx"
+                                % (page["page"], mid, offs[mid]))
         prev = load_json("card_geometry.json")
         prev.update({"aruco": rows, "pages": len(self.pages)})
         dump("card_geometry.json", prev)
 
     def test_03_qr_payload(self):
+        """v4：**只有第 1 页**印 QR（页序改用 ArUco id 分组）；其余页必须没有 QR。"""
         rows = []
         for page, png in zip(self.pages, self.fx["res"]["png"]):
             img = read_gray(png)
             self.assertIsNotNone(img, "答题卡 PNG 读不出来：%s" % png)
             payload = card.read_qr(img, page["qr"])
-            rows.append({"page": page["page"], "payload": payload})
-            self.assertIsNotNone(payload, "第 %d 页 QR 解不出来" % page["page"])
-            self.assertEqual(PID, payload.get("pid"), "QR 里的卷号不对")
-            self.assertEqual(page["page"], payload.get("p"), "QR 里的页码不对")
+            rows.append({"page": page["page"], "payload": payload,
+                         "has_qr_in_manifest": bool(page.get("qr"))})
+            if page["page"] == 1:
+                self.assertTrue(page.get("qr"), "第 1 页 manifest 里必须有 QR")
+                self.assertIsNotNone(payload, "第 1 页 QR 解不出来")
+                self.assertEqual(PID, payload.get("pid"), "QR 里的卷号不对")
+                self.assertEqual(1, payload.get("p"), "QR 里的页码应为 1")
+                self.assertEqual(card.CARD_VERSION, payload.get("v"),
+                                 "QR 里的版本号应等于 card.CARD_VERSION")
+            else:
+                self.assertFalse(page.get("qr"), "v4 只有第 1 页印 QR，第 %d 页不该有"
+                                 % page["page"])
+                self.assertIsNone(payload, "第 %d 页不该解出 QR" % page["page"])
         prev = load_json("card_geometry.json")
         prev["qr"] = rows
         dump("card_geometry.json", prev)
@@ -1067,6 +1166,7 @@ class T6GradePhotos(unittest.TestCase):
         cls.manifest = fx["manifest"]
         cls.card = fx["res"]["card"]
         cls.pages = cls.card["pages"]
+        cls.page_by_no = {p["page"]: p for p in cls.pages}
         cls.tmp = _ensure(os.path.join(RUNDIR, "grade"))
         cls.photos_dir = _ensure(os.path.join(RUNDIR, "photos"))
         cls.grade_out = _ensure(os.path.join(OUT, "grading"))
@@ -1121,7 +1221,7 @@ class T6GradePhotos(unittest.TestCase):
 
     def test_01_ten_photos(self):
         rows = []
-        warp_ok = qr_ok = 0
+        warp_ok = qr_ok = qr_checked = 0
         omr_total = omr_agree = omr_unsure = 0
         pending = 0
         bad_rows = []
@@ -1129,9 +1229,13 @@ class T6GradePhotos(unittest.TestCase):
         for path, pno in self.photo_pages:
             res = grade.grade_image(self.conn, PID, path, out_dir=self.grade_out)
             ok_warp = bool(res.get("warp_ok"))
+            # v4：只有 manifest 里标了 qr 的页（第 1 页）才有 QR，其余页不参与 QR 成功率
+            has_qr = bool((self.page_by_no.get(pno) or {}).get("qr"))
             ok_qr = bool(res.get("qr_ok"))
             warp_ok += 1 if ok_warp else 0
-            qr_ok += 1 if ok_qr else 0
+            if has_qr:
+                qr_checked += 1
+                qr_ok += 1 if ok_qr else 0
             items = res.get("items") or []
             page_omr = page_agree = page_unsure = 0
             for u in items:
@@ -1164,6 +1268,7 @@ class T6GradePhotos(unittest.TestCase):
         agreement = (omr_agree / float(omr_total)) if omr_total else 0.0
         dump("grade_photos.json", {
             "photos": self.N_PHOTOS, "warp_ok": warp_ok, "qr_ok": qr_ok,
+            "qr_checked": qr_checked,
             "elapsed_s": round(dt, 2),
             "omr_units": omr_total, "omr_agree": omr_agree, "omr_unsure": omr_unsure,
             "omr_agreement": round(agreement, 4),
@@ -1172,7 +1277,9 @@ class T6GradePhotos(unittest.TestCase):
         })
         self.assertGreaterEqual(warp_ok, 9, "标定成功率 %d/%d（要求 ≥9/10）"
                                 % (warp_ok, self.N_PHOTOS))
-        self.assertGreaterEqual(qr_ok, 9, "QR 解出率 %d/%d" % (qr_ok, self.N_PHOTOS))
+        self.assertGreater(qr_checked, 0, "没有任何一页带 QR，QR 链路没被测到")
+        self.assertEqual(qr_checked, qr_ok,
+                         "带 QR 的页 QR 必须全解出来：%d/%d" % (qr_ok, qr_checked))
         self.assertGreater(omr_total, 0, "一张卷子上的选择题都没判到")
         self.assertEqual(0, omr_unsure, "选择题出现 unsure：%s" % bad_rows[:3])
         self.assertEqual(omr_total, omr_agree,
@@ -1233,9 +1340,16 @@ class T4bOmmAndMathType(unittest.TestCase):
                     ooml.append((r["no"], r["qtype"], n_math))
                 elif n_embed and not n_math:
                     mathtype.append((r["no"], r["qtype"], n_embed))
-            # 排序后取前 10，结果稳定可复现
-            cls.ooml = sorted(ooml, key=lambda x: x[0])[:10]
-            cls.mathtype = sorted(mathtype, key=lambda x: x[0])[:10]
+            # 排序后取前 10，结果稳定可复现；**先按题库体检过滤**（t85：00026 已被标
+            # fig_missing，直接进卷会被 picker 按「不能印到卷面」挡掉）
+            import quality as _quality
+            def _printable(items):
+                nos = [no for no, _, _ in items]
+                ok, _blocked = _quality.filter_printable(conn, nos, need_answer=True)
+                keep = set(ok)
+                return [it for it in items if it[0] in keep]
+            cls.ooml = _printable(sorted(ooml, key=lambda x: x[0]))[:10]
+            cls.mathtype = _printable(sorted(mathtype, key=lambda x: x[0]))[:10]
             cls.picked = [(no, qt, "OMML") for no, qt, _ in cls.ooml] + \
                          [(no, qt, "MathType") for no, qt, _ in cls.mathtype]
             nos = [p[0] for p in cls.picked]
@@ -1255,8 +1369,7 @@ class T4bOmmAndMathType(unittest.TestCase):
         from docx import Document
         from lxml import etree
         doc = Document(built["docx"])
-        boxes = [el for el in doc.element.body
-                 if isinstance(el.tag, str) and el.tag.endswith("}tbl")]
+        boxes = _item_boxes(doc)               # 排除学生栏等装饰表
         rels = {rid: r.target_ref for rid, r in doc.part.rels.items()}
         self.assertEqual(20, len(boxes), "20 题应各有一个题框")
 

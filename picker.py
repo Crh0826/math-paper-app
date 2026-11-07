@@ -33,6 +33,7 @@ import copy
 import datetime
 import json
 import random
+import sqlite3
 import re
 import time
 from collections.abc import Mapping
@@ -47,6 +48,9 @@ _QT_ORDER = {q: i for i, q in enumerate(QTYPES)}
 #: 契约 §3 page
 PAGE = {"w_pt": 595.3, "h_pt": 841.9, "dpi": 300, "w_px": 2480, "h_px": 3508}
 
+DEFAULT_SUBJECT = "math7a"
+_FIG_CACHE: dict = {}
+_EXCL_CACHE: dict = {}     # t73：体检排除题的属性（按库+学科+口径），供纯 Python 减法计数      # t73：fig_missing 计算式缓存（键=库+行数）     # t62：多学科库里不传学科 = 数学（七年级上·沪科版），防跨科混卷
 DEFAULT_SEED = 42
 DEFAULT_TITLE = "训练卷"
 #: requirements 默认值；`exclude_mismatch=None` 表示「跟着 need_answer 走」（判分卷默认排掉答案不符的题）
@@ -91,7 +95,7 @@ class SelectError(ValueError):
 
 
 class ScopeError(SelectError):
-    """scope 里的章节/知识点在库里不存在。"""
+    """scope 里的学科/章节/知识点在库里不存在（或章节不属于所选学科）。"""
 
 
 class InsufficientQuestions(SelectError):
@@ -339,10 +343,22 @@ def normalize_params(params: dict) -> dict:
     mode = str(sc.get("kp_mode") or "any").strip().lower() or "any"
     if mode not in ("any", "all"):
         raise SelectError("scope.kp_mode 只能是 any / all：%r" % (sc.get("kp_mode"),))
+    #: t11 · 学科过滤：subject_pk（单选，组卷页下拉）与 subjects（多选/接口）取并集。
+    #: 两个都不给 = 不限（老接口兼容；只有单学科库的机器行为完全不变）。
+    subject_pk = str(sc.get("subject_pk") or "").strip()
+    subjects = _as_str_list(sc.get("subjects"), "scope.subjects")
+    if subject_pk and subject_pk not in subjects:
+        subjects = [subject_pk] + subjects
+    subject_default = not subjects
+    if subject_default:                 # t62：不传学科 → 默认数学，避免多学科混卷
+        subjects = [DEFAULT_SUBJECT]
     p["scope"] = {
         "chapters": _as_str_list(sc.get("chapters"), "scope.chapters"),
         "kps": _as_str_list(sc.get("kps"), "scope.kps"),
         "kp_mode": mode,
+        "subject_pk": subject_pk,
+        "subjects": subjects,
+        "subject_default": subject_default,
     }
 
     req = params.get("requirements") or {}
@@ -386,9 +402,10 @@ def normalize_params(params: dict) -> dict:
 
 
 # ---------------------------------------------------------------- 库查询
-def _distinct(conn, sql: str):
+def _distinct(conn, sql: str, args=()):
     try:
-        return {str(r[0]) for r in conn.execute(sql) if r[0] is not None and str(r[0]) != ""}
+        return {str(r[0]) for r in conn.execute(sql, list(args))
+                if r[0] is not None and str(r[0]) != ""}
     except Exception:  # noqa: BLE001 - 裸连接/空库时不该炸
         return set()
 
@@ -402,28 +419,96 @@ def _unknown_kp(kp: str, known: set) -> bool:
     return True
 
 
+def scope_subjects(scope: dict) -> list:
+    """scope 里的学科列表（subject_pk + subjects 去重合并）；空 = 不限。"""
+    out = []
+    single = str(scope.get("subject_pk") or "").strip()
+    for s in ([single] if single else []) + list(scope.get("subjects") or []):
+        s = str(s).strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def _subject_clause(scope: dict, null_safe: bool = True):
+    """(SQL 片段, 参数)：学科过滤。与章节/知识点是 AND 关系（选了学科再在其中选范围）。"""
+    subjects = scope_subjects(scope)
+    if not subjects:
+        return "", []
+    # 与 COALESCE(subject_pk,'math7a') IN (...) 语义等价，但写成 subject_pk IN (...) 才能吃到
+    # idx_q_subject 索引（COALESCE 会让 SQLite 全表扫，t73 实测 89ms → 20ms）
+    marks = ",".join("?" * len(subjects))
+    if null_safe and DEFAULT_SUBJECT in subjects:
+        return (" AND (subject_pk IN (%s) OR subject_pk IS NULL)" % marks, list(subjects))
+    return " AND subject_pk IN (%s)" % marks, list(subjects)
+
+
 def _validate_scope(conn, scope: dict) -> None:
+    """校验 scope：学科必须存在，章节/知识点必须在该学科范围内（避免跨学科混选）。"""
+    subjects = scope_subjects(scope)
+    subject_sql, subject_args = _subject_clause(scope)
+    known_sub = (_distinct(conn, "SELECT subject_pk FROM subjects")
+                 | _distinct(conn, "SELECT DISTINCT subject_pk FROM questions"))
+    try:
+        if conn.execute("SELECT 1 FROM questions WHERE subject_pk IS NULL LIMIT 1").fetchone():
+            known_sub = known_sub | {DEFAULT_SUBJECT}          # NULL 当 math7a
+    except Exception:
+        pass
+    if known_sub:
+        bad_sub = [s for s in subjects if s not in known_sub]
+        if bad_sub:
+            raise ScopeError("未知学科：%s；库里可用学科：%s"
+                             % ("、".join(bad_sub), "、".join(sorted(known_sub))))
+
     chapters, kps = scope["chapters"], scope["kps"]
     if not chapters and not kps:
         return
-    known_ch = _distinct(conn, "SELECT DISTINCT chapter FROM questions")
-    known_kp = _distinct(conn, "SELECT kp_id FROM kps") | \
-        _distinct(conn, "SELECT DISTINCT kp_id FROM questions")
-    bad_ch = [c for c in chapters if known_ch and c not in known_ch]
-    if bad_ch:
-        raise ScopeError("未知章节：%s；库里可用章节：%s"
-                         % ("、".join(bad_ch), "、".join(sorted(known_ch))))
+    ch_sql = "SELECT DISTINCT chapter FROM questions WHERE 1=1" + subject_sql
+    kp_sql_q = "SELECT kp_id FROM kps WHERE 1=1" + subject_sql
+    kp_q_sql = "SELECT DISTINCT kp_id FROM questions WHERE 1=1" + subject_sql
+    known_ch = _distinct(conn, ch_sql, subject_args)
+    known_kp = _distinct(conn, kp_sql_q, subject_args) | _distinct(conn, kp_q_sql, subject_args)
+    if subjects:
+        # 只查了学科内的章节；若该学科在 questions 里还没有行，用 kps 表兜底一次
+        if not known_ch:
+            known_ch = _distinct(conn, "SELECT DISTINCT chapter FROM kps WHERE 1=1" + subject_sql,
+                                 subject_args)
+        if not known_kp:
+            known_kp = _distinct(conn, "SELECT kp_id FROM kps WHERE 1=1" + subject_sql,
+                                 subject_args)
+    # t97：章节必须属于当前学科。以前 known_ch 为空（该学科题目没写章节）时整段跳过，
+    # 于是「物理 + 残留的数学章节」被当成合法过滤 → 命中 0 行 → 报「题量不够」。
+    if subjects:
+        if chapters and not known_ch:
+            raise ScopeError(
+                "这些章节不属于当前学科（%s）：%s；本学科可用章节：（无，该学科题目还没有章节信息）"
+                % ("、".join(subjects), "、".join(chapters)))
+        bad_ch = [c for c in chapters if c not in known_ch]
+        if bad_ch:
+            raise ScopeError(
+                "这些章节不属于当前学科（%s）：%s；本学科可用章节：%s"
+                % ("、".join(subjects), "、".join(bad_ch),
+                   "、".join(sorted(known_ch)[:80])))
+    else:
+        bad_ch = [c for c in chapters if known_ch and c not in known_ch]
+        if bad_ch:
+            raise ScopeError("未知章节：%s；库里可用章节：%s"
+                             % ("、".join(bad_ch), "、".join(sorted(known_ch)[:80])))
     bad_kp = [k for k in kps if known_kp and _unknown_kp(k, known_kp)]
     if bad_kp:
-        raise ScopeError("未知知识点：%s；库里可用知识点（部分）：%s"
-                         % ("、".join(bad_kp), "、".join(sorted(known_kp)[:80])))
+        raise ScopeError("未知知识点：%s；库里可用知识点（部分）%s：%s"
+                         % ("、".join(bad_kp),
+                            "（学科 %s 内）" % "、".join(subjects) if subjects else "",
+                            "、".join(sorted(known_kp)[:80])))
 
 
-def _scope_clause(scope: dict):
-    """(SQL 片段, 参数)。两个列表都空 → 不限制；x.0 → 整章（同前缀的全部 kp）。"""
+def _scope_clause(scope: dict, null_safe: bool = True):
+    """(SQL 片段, 参数)。学科是 AND；章节/知识点两列表都空 → 该维度不限制；
+    x.0 → 整章（同前缀的全部 kp）。"""
+    subject_sql, subject_args = _subject_clause(scope, null_safe=null_safe)
     chapters, kps, mode = scope["chapters"], scope["kps"], scope["kp_mode"]
     if not chapters and not kps:
-        return "", []
+        return subject_sql, subject_args
     sql, args = "", []
     if chapters:
         sql = "chapter IN (%s)" % ",".join("?" * len(chapters))
@@ -443,7 +528,7 @@ def _scope_clause(scope: dict):
         else:
             sql = kp_sql
         args += kp_args
-    return " AND " + sql, args
+    return " AND " + sql + subject_sql, args + subject_args
 
 
 def _load_quality(conn):
@@ -525,14 +610,15 @@ def _candidates(conn, qtype: str, p: dict, quality: dict = None, stats: dict = N
 def _rows_by_nos(conn, nos: list) -> dict:
     """按题号批量取行（nos 精确题集用）：
 
-    {no: (no, qtype, chapter, kp_id, family, answer_raw, option_count, is_empty, text_plain, fmt)}
+    {no: (no, qtype, chapter, kp_id, family, answer_raw, option_count, is_empty,
+          text_plain, fmt, subject_pk)}
     """
     out = {}
     chunk = 400
     for i in range(0, len(nos), chunk):
         part = list(nos[i:i + chunk])
         sql = ("SELECT no, qtype, chapter, kp_id, family_key, answer_raw, option_count, "
-               "is_empty, text_plain, fmt FROM questions WHERE no IN (%s)"
+               "is_empty, text_plain, fmt, subject_pk FROM questions WHERE no IN (%s)"
                % ",".join("?" * len(part)))
         for row in conn.execute(sql, part):
             out[str(row[0])] = row
@@ -540,7 +626,7 @@ def _rows_by_nos(conn, nos: list) -> dict:
 
 
 def _picked_from_nos(conn, p: dict, quality: dict = None):
-    """按 params.nos 出精确卷：顺序照给、不随机；题号/题型/答案/体检对不上一律报错。"""
+    """按 params.nos 出精确卷：顺序照给、不随机；题号/题型/学科/答案/体检对不上一律报错。"""
     nos = list(p["nos"])
     excluded = set(p.get("exclude_nos") or [])
     clash = [no for no in nos if no in excluded]
@@ -551,6 +637,14 @@ def _picked_from_nos(conn, p: dict, quality: dict = None):
     missing = [no for no in nos if no not in rows]
     if missing:
         raise SelectError("nos 里的题号在题库里不存在：%s" % "、".join(missing[:10]))
+
+    subjects = scope_subjects(p["scope"])
+    if subjects:
+        outside = [no for no in nos
+                   if str(rows[no][10] or "") and str(rows[no][10]) not in subjects]
+        if outside:
+            raise SelectError("nos 里的题号不属于所选学科（%s）：%s"
+                              % ("、".join(subjects), "、".join(outside[:10])))
 
     quality = {} if quality is None else quality
     need_answer = p["requirements"]["need_answer"]
@@ -657,6 +751,28 @@ def _picked_random(conn, p: dict, quality: dict = None):
     return picked, pools, totals
 
 
+def _count_other_subject(conn, p: dict) -> int:
+    """其他学科里「本来可出」的题量（只按题型/有答案算，不含体检与 scope 的章节限制）。
+
+    用于组卷页提示「已排除非本学科 N 道」，让用户知道跨科题被挡掉了。
+    """
+    subs = scope_subjects(p["scope"])
+    if not subs:
+        return 0
+    marks = ",".join("?" * len(subs))
+    cond = " AND NOT (COALESCE(subject_pk, '%s') IN (%s))" % (DEFAULT_SUBJECT, marks)
+    extra = " AND answer_raw<>''" if p["requirements"]["need_answer"] else ""
+    total = 0
+    for qt in QTYPES:
+        try:
+            total += int(conn.execute(
+                "SELECT COUNT(*) FROM questions WHERE qtype=? AND is_empty=0"
+                + extra + cond, [qt] + list(subs)).fetchone()[0])
+        except Exception:
+            return 0
+    return total
+
+
 def pool_report(conn, params: dict) -> dict:
     """各题型可选题量 + 被题库体检挡掉的逐类计数。
 
@@ -673,11 +789,377 @@ def pool_report(conn, params: dict) -> dict:
         available[qt] = len(_candidates(conn, qt, p, quality, qt_stats))
         for k in EXCLUDE_KEYS:
             stats[k] += qt_stats.get(k, 0)
-    return {"available": available, "excluded": stats, "quality_table": has_table}
+    try:
+        other = _count_other_subject(conn, p)
+    except Exception:
+        other = 0
+    return {"available": available, "excluded": stats, "quality_table": has_table,
+            "subject": scope_subjects(p["scope"]),
+            "excluded_other_subject": other,
+            "subject_default": bool(p["scope"].get("subject_default"))}
+
+
+def _fig_missing_rows(conn, subjects=None) -> list:
+    """「缺图」题（体检 flag fig_missing 或题干说如图却没图）的属性行，按库缓存。"""
+    subs = tuple(sorted(str(x) for x in (subjects or []) if str(x).strip()))
+    key = ("figrows", _db_tag(conn), subs)
+    hit = _FIG_CACHE.get(key)
+    if hit is not None:
+        return hit
+    refs = ("如图", "见图", "图中", "下图", "上图", "图①", "图②", "如下的图")
+    sql = ("SELECT q.no, q.qtype, q.subject_pk, q.chapter, q.kp_id FROM questions q"
+           " WHERE q.is_empty=0 AND ("
+           "  EXISTS (SELECT 1 FROM quality_flags qg WHERE qg.no=q.no"
+           "          AND qg.flags LIKE '%fig_missing%')"
+           "  OR ((" + " OR ".join(["q.text_plain LIKE ?" for _ in refs]) + ")"
+           "      AND q.fmt NOT LIKE '%embed%' AND q.fmt NOT LIKE '%ole%'"
+           "      AND q.fmt NOT LIKE '%table%'))")
+    args = ["%%%s%%" % r for r in refs]
+    if subs:
+        sql += " AND q.subject_pk IN (%s)" % ",".join("?" * len(subs))
+        args += list(subs)
+    try:
+        rows = [tuple(r) for r in conn.execute(sql, args)]
+    except sqlite3.OperationalError:
+        rows = []
+    _FIG_CACHE[key] = rows
+    return rows
+
+
+def _bad_choice_nos(conn, subjects=None) -> set:
+    """选择题里答案不是选项字母的题号（need_answer 时 _candidates 会跳过）。"""
+    subs = tuple(sorted(str(x) for x in (subjects or []) if str(x).strip()))
+    key = ("choice", _db_tag(conn), subs)
+    hit = _FIG_CACHE.get(key)
+    if hit is not None:
+        return hit
+    sql = ("SELECT no, answer_raw FROM questions WHERE qtype='选择' AND is_empty=0"
+           " AND answer_raw<>''")
+    args = []
+    if subs:
+        sql += " AND subject_pk IN (%s)" % ",".join("?" * len(subs))
+        args += list(subs)
+    try:
+        nos = {str(no) for no, ans in conn.execute(sql, args)
+               if not parse_answer_key(ans, "选择")}
+    except sqlite3.OperationalError:
+        nos = set()
+    _FIG_CACHE[key] = nos
+    return nos
+
+
+def _scope_hit(scope: dict, subject_pk: str, chapter: str, kp_id: str) -> bool:
+    """Python 版 scope 判定（与 _scope_clause 等价），给减法用。"""
+    subs = scope_subjects(scope)
+    if subs and subject_pk not in subs:
+        return False
+    chapters = scope.get("chapters") or []
+    kps = scope.get("kps") or []
+    mode = scope.get("kp_mode") or "any"
+    chapter_ok = (not chapters) or (chapter in chapters)
+    kp_id = kp_id or ""
+    if kps:
+        def _kp_hit(k):
+            if k.endswith(".0") and len(k) > 2:      # 1.0 = 整章知识点
+                return kp_id == k or kp_id.startswith(k[:-1])
+            return kp_id == k
+        kp_ok = any(_kp_hit(k) for k in kps)
+    else:
+        kp_ok = True
+    if chapters and kps:
+        return (chapter_ok or kp_ok) if mode != "all" else (chapter_ok and kp_ok)
+    return chapter_ok and kp_ok
+
+
+def _count_nos_in_scope(conn, p: dict, nos: list) -> dict:
+    """给定题号里落在本范围（且满足基础过滤）的题量，按题型。"""
+    if not nos:
+        return {}
+    clause, args = _scope_clause(p["scope"], null_safe=False)
+    where = ["is_empty = 0"]
+    if p["requirements"]["need_answer"]:
+        where.append("answer_raw<>''")
+    if p["requirements"]["exclude_no_family"]:
+        where.append("family_key IS NOT NULL AND family_key<>''")
+    if clause:
+        where.append(clause.replace(" AND ", "", 1))
+    out = {}
+    for i in range(0, len(nos), 200):
+        chunk = nos[i:i + 200]
+        sql = ("SELECT qtype, COUNT(*) FROM questions WHERE no IN (%s) AND %s GROUP BY qtype"
+               % (",".join("?" * len(chunk)), " AND ".join(where)))
+        for row in conn.execute(sql, chunk + list(args)):
+            out[row[0]] = out.get(row[0], 0) + int(row[1] or 0)
+    return out
+
+
+def _db_tag(conn) -> str:
+    """缓存键：库文件 + 行数 + 体检行数 + 本连接写入次数（导入/改答案后自动失效）。"""
+    try:
+        rows = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
+    except sqlite3.OperationalError:
+        return ""
+    try:
+        flags = conn.execute("SELECT COUNT(*) FROM quality_flags").fetchone()[0]
+    except sqlite3.OperationalError:
+        flags = 0
+    try:
+        changes = int(getattr(conn, "total_changes", 0) or 0)
+    except Exception:  # noqa: BLE001
+        changes = 0
+    try:
+        name = conn.execute("PRAGMA database_list").fetchone()[2] or ""
+    except sqlite3.OperationalError:
+        name = ""
+    return "%s|%s|%s|%s" % (name, rows, flags, changes)
+
+
+def clear_cache() -> None:
+    """清掉 picker 侧的计数缓存（导入/重跑体检后由 server 调用）。"""
+    _FIG_CACHE.clear()
+    _EXCL_CACHE.clear()
+
+
+def _excluded_rows(conn, req: dict, subjects=None) -> list:
+    """被体检/缺图挡掉的题的属性行（qtype, subject, chapter, kp, has_answer, has_family）。
+
+    冷算一次（质量 flags + 缺图文本扫描 + 一次 join，约 100ms），之后按 scope 在内存里减。
+    """
+    subs = tuple(sorted(str(x) for x in (subjects or []) if str(x).strip()))
+    key = ("excl", _db_tag(conn), subs,
+           (tuple(MISMATCH_FLAGS) if req["exclude_mismatch"] else ()),
+           bool(req["strict"]), bool(req["exclude_fig_missing"]))
+    hit = _EXCL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    flags = list(PRINT_BLOCKING_FLAGS)
+    if req["exclude_mismatch"]:
+        flags += list(MISMATCH_FLAGS)
+    if req["strict"]:
+        flags += list(STRICT_FLAGS)
+    nos = set()
+    if flags:
+        like = " OR ".join(["flags LIKE ?" for _ in flags])
+        try:
+            nos |= {str(r[0]) for r in conn.execute(
+                "SELECT no FROM quality_flags WHERE " + like, ["%%%s%%" % f for f in flags])}
+        except sqlite3.OperationalError:
+            pass
+    if req["exclude_fig_missing"]:
+        nos |= {str(r[0]) for r in _fig_missing_rows(conn, subs)}
+    rows = []
+    if nos:
+        # 用 CTE VALUES 而不是临时表：临时表写入会改 conn.total_changes，缓存键就永远命中不了
+        vals = ",".join(["(?)"] * len(nos))
+        sql = ("WITH excl(no) AS (VALUES " + vals + ")"
+               " SELECT q.qtype, q.subject_pk, q.chapter, q.kp_id, q.answer_raw<>'',"
+               " (q.family_key IS NOT NULL AND q.family_key<>'')"
+               " FROM questions q WHERE q.no IN (SELECT no FROM excl) AND q.is_empty=0")
+        rows = [(r[0], r[1], r[2], r[3], bool(r[4]), bool(r[5]))
+                for r in conn.execute(sql, list(nos))]
+    _EXCL_CACHE[key] = rows
+    return rows
+
+
+def _excluded_in_scope(conn, p: dict) -> dict:
+    """排除题里落在本范围、且本会入选的数量（按题型）。"""
+    req = p["requirements"]
+    out = {}
+    for qtype, subject_pk, chapter, kp_id, has_answer, has_family in _excluded_rows(
+            conn, req, scope_subjects(p["scope"])):
+        if req["need_answer"] and not has_answer:
+            continue
+        if req["exclude_no_family"] and not has_family:
+            continue
+        if not _scope_hit(p["scope"], subject_pk, chapter, kp_id):
+            continue
+        out[qtype] = out.get(qtype, 0) + 1
+    return out
+
+
+def _excluded_nos(conn, req: dict, subjects=None) -> set:
+    """被体检/缺图挡掉的题号（按库+口径缓存）。"""
+    subs = tuple(sorted(str(x) for x in (subjects or []) if str(x).strip()))
+    key = ("excl", _db_tag(conn), subs,
+           (tuple(MISMATCH_FLAGS) if req["exclude_mismatch"] else ()),
+           bool(req["strict"]), bool(req["exclude_fig_missing"]))
+    hit = _EXCL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    flags = list(PRINT_BLOCKING_FLAGS)
+    if req["exclude_mismatch"]:
+        flags += list(MISMATCH_FLAGS)
+    if req["strict"]:
+        flags += list(STRICT_FLAGS)
+    nos = set()
+    if flags:
+        like = " OR ".join(["flags LIKE ?" for _ in flags])
+        try:
+            nos |= {str(r[0]) for r in conn.execute(
+                "SELECT no FROM quality_flags WHERE " + like, ["%%%s%%" % f for f in flags])}
+        except sqlite3.OperationalError:
+            pass
+    if req["exclude_fig_missing"]:
+        nos |= {str(r[0]) for r in _fig_missing_rows(conn, subs)}
+    _EXCL_CACHE[key] = nos
+    return nos
+
+
+def _excluded_index(conn, req: dict, where: list, args: list, nos) -> list:
+    """排除题按 (qtype, subject, chapter, kp) 聚合成条数并缓存。
+
+    只算一次（约 70ms），之后每个范围在内存里按 scope 求和（~1ms）。
+    """
+    # 注意：key 里不放 scope（where/args），只按 库+口径 缓存 —— 换成别的单元也命中
+    key = ("exclidx", _db_tag(conn), len(nos), hash(frozenset(nos)))
+    hit = _EXCL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    if not nos:
+        _EXCL_CACHE[key] = []
+        return []
+    vals = ",".join(["(?)"] * len(nos))
+    sql = ("WITH excl(no) AS (VALUES " + vals + ")"
+           " SELECT q.qtype, q.subject_pk, q.chapter, q.kp_id,"
+           " q.answer_raw<>'', (q.family_key IS NOT NULL AND q.family_key<>''), COUNT(*)"
+           " FROM questions q WHERE q.no IN (SELECT no FROM excl) AND q.is_empty=0"
+           " GROUP BY 1,2,3,4,5,6")
+    rows = [(r[0], r[1], r[2], r[3], bool(r[4]), bool(r[5]), int(r[6]))
+            for r in conn.execute(sql, list(nos))]
+    _EXCL_CACHE[key] = rows
+    return rows
+
+
+def _count_these(conn, where: list, args: list, nos) -> dict:
+    """在给定题号集合里、再按 base 过滤条件计数（按题型）。"""
+    if not nos:
+        return {}
+    vals = ",".join(["(?)"] * len(nos))
+    sql = ("WITH excl(no) AS (VALUES " + vals + ")"
+           " SELECT qtype, COUNT(*) FROM questions"
+           " WHERE no IN (SELECT no FROM excl) AND " + " AND ".join(where)
+           + " GROUP BY qtype")
+    return {row[0]: int(row[1] or 0) for row in conn.execute(sql, list(nos) + list(args))}
+
+
+def _ensure_count_index(conn) -> None:
+    """确保「剩余题量」用的覆盖索引存在（真库 87k 行下 113ms → 28ms）。
+
+    只读连接/无权限时静默跳过（不影响正确性，只是慢一点）。
+    """
+    key = ("idx", _db_tag(conn))
+    if key in _EXCL_CACHE:
+        return
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_q_count ON questions("
+                     "subject_pk, is_empty, qtype, answer_raw, fmt, text_plain)")
+        conn.commit()
+    except (sqlite3.OperationalError, sqlite3.DatabaseError):
+        pass
+    _EXCL_CACHE[key] = True
+
+
+def _aggregate_counts(conn, subs, req: dict) -> list:
+    """把题库按 (subject, chapter, kp, qtype, 有答案, 有题族) 预聚合一次并缓存。
+
+    t85：换 scope 首次也要快 —— 真库 27,774 行扫一遍约 150ms，之后任何学科/单元/知识点
+    组合都只是在内存里按 scope 求和（~1ms）。
+    """
+    subs = tuple(sorted(str(x) for x in (subs or []) if str(x).strip()))
+    key = ("agg", _db_tag(conn), subs,
+           bool(req.get("need_answer")), bool(req.get("exclude_no_family")))
+    hit = _EXCL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    sql = ("SELECT subject_pk, COALESCE(chapter,''), COALESCE(kp_id,''), qtype,"
+           " (answer_raw<>''), (family_key IS NOT NULL AND family_key<>''), COUNT(*)"
+           " FROM questions WHERE is_empty=0")
+    args = []
+    if subs:
+        sql += " AND subject_pk IN (%s)" % ",".join("?" * len(subs))
+        args += list(subs)
+    sql += " GROUP BY 1,2,3,4,5,6"
+    try:
+        rows = [(r[0], r[1], r[2], r[3], bool(r[4]), bool(r[5]), int(r[6]))
+                for r in conn.execute(sql, args)]
+    except sqlite3.OperationalError:
+        rows = []
+    _EXCL_CACHE[key] = rows
+    return rows
+
+
+def _count_sql(conn, p: dict) -> dict:
+    """纯 SQL 计数快路径：范围总数（覆盖索引）+ 几处小减法（按题号集合精确减）。"""
+    req = p["requirements"]
+    subs = scope_subjects(p["scope"])
+    if DEFAULT_SUBJECT in subs:
+        # 老库可能有 subject_pk IS NULL 的行（等价 math7a）；`OR ... IS NULL` 会让索引失效，
+        # 这种库直接回退慢路径，保证结果一致。
+        try:
+            if conn.execute("SELECT 1 FROM questions WHERE subject_pk IS NULL LIMIT 1").fetchone():
+                return None
+        except sqlite3.OperationalError:
+            return None
+    where = ["is_empty = 0"]
+    args = []
+    clause, clause_args = _scope_clause(p["scope"], null_safe=False)
+    if clause:
+        where.append(clause.replace(" AND ", "", 1))
+        args += clause_args
+    if req["need_answer"]:
+        where.append("answer_raw <> ''")
+    if req["exclude_no_family"]:
+        where.append("family_key IS NOT NULL AND family_key<>''")
+    out = {qt: 0 for qt in QTYPES}
+    try:
+        for (_sub, chapter, kp_id, qtype, has_answer, has_family,
+             n) in _aggregate_counts(conn, subs, req):
+            if qtype not in out:
+                continue
+            if req["need_answer"] and not has_answer:
+                continue
+            if req["exclude_no_family"] and not has_family:
+                continue
+            if _scope_hit(p["scope"], _sub, chapter, kp_id):
+                out[qtype] += n
+        drops = set(_excluded_nos(conn, req, subs))
+        if req["need_answer"]:
+            drops |= _bad_choice_nos(conn, subs)
+        drops |= {str(x) for x in (p.get("exclude_nos") or []) if str(x).strip()}
+        for (qtype, subject_pk, chapter, kp_id, has_answer, has_family,
+             n) in _excluded_index(conn, req, where, args, drops):
+            if req["need_answer"] and not has_answer:
+                continue
+            if req["exclude_no_family"] and not has_family:
+                continue
+            if qtype in out and _scope_hit(p["scope"], subject_pk, chapter, kp_id):
+                out[qtype] -= n
+        for qt in out:
+            out[qt] = max(0, out[qt])
+    except sqlite3.OperationalError:
+        return None
+    return out
 
 
 def count_available(conn, params: dict) -> dict:
-    """各题型当前可选题量（按 scope / requirements / 题库体检过滤后）。"""
+    """各题型当前可选题量（按 scope / requirements / 题库体检过滤后）。
+
+    t73：走纯 SQL 计数快路径（真库 87k 行 <100ms）；``count_available_slow`` 保留逐行版
+    用于一致性测试（两者结果必须逐组相等）。
+    """
+    p = normalize_params(params)
+    _validate_scope(conn, p["scope"])
+    try:
+        fast = _count_sql(conn, p)
+    except sqlite3.OperationalError:
+        fast = None
+    if fast is None:                     # 老库/索引缺失 → 逐行参考实现
+        return count_available_slow(conn, params)
+    return fast
+
+
+def count_available_slow(conn, params: dict) -> dict:
+    """逐行实现的参考版（与选题完全同一套代码路径），只用于对拍与降级。"""
     return pool_report(conn, params)["available"]
 
 

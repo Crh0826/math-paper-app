@@ -36,6 +36,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -279,21 +280,337 @@ def _gray(run, hex_color="666666") -> None:
 # ---------------------------------------------------------------- 题库取 token
 _tokens_cache = {}
 
+#: t94 · 有同名 qbank docx 但因为是导入题而被忽略的题号（供自检统计）
+_imported_shadowed: set = set()
+#: t11 · 缺原始 docx 时回退查 questions.tokens_json 的库路径。
+#: None = 按 paths 解析（环境变量/config/data/app.db）；测试与打包可显式指定。
+_TOKENS_DB_PATH = None
 
-def source_tokens(no: str):
-    """原始题目 docx → token 列表（带媒体二进制）。原始 docx 全程只读。"""
-    if no in _tokens_cache:
-        return _tokens_cache[no]
-    path = os.path.join(SRC_ROOT, "%s.docx" % no)
-    if not os.path.exists(path):
-        raise PaperError("题目 docx 不存在，没法印卷：%s（题号 %s）" % (path, no))
+
+def set_tokens_db_path(path) -> None:
+    """指定回退用的题目库（None = 回到 paths.resolve_db()）；顺带清 token 缓存。"""
+    global _TOKENS_DB_PATH
+    _TOKENS_DB_PATH = str(path) if path else None
+    _tokens_cache.clear()
+
+
+def tokens_db_path() -> str:
+    """tokens_json 回退用的数据库路径（显式指定优先，否则 paths.resolve_db()）。"""
+    if _TOKENS_DB_PATH:
+        return _TOKENS_DB_PATH
     try:
-        tokens = extract_tokens(path)
-    except Exception as exc:  # noqa: BLE001
-        raise PaperError("题目 %s 的 docx 解析失败：%s" % (no, exc))
-    if not tokens:
-        raise PaperError("题目 %s 的 docx 里没有可排版内容：%s" % (no, path))
-    _tokens_cache[no] = tokens
+        return _paths.resolve_db()
+    except Exception:       # noqa: BLE001 - paths 坏了也别让印卷炸在其他地方
+        return ""
+
+
+def clear_tokens_cache() -> None:
+    """清 token 缓存（测试、以及题库文件被补上后要重新读的场景）。"""
+    _tokens_cache.clear()
+
+
+def _db_tokens_json(no: str) -> str:
+    """questions.tokens_json 原文；查不到 / 库不可用一律返回 ""（由调用方给统一报错）。"""
+    db = tokens_db_path()
+    if not db or not os.path.isfile(db):
+        return ""
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(db, timeout=3.0)
+        try:
+            row = conn.execute("SELECT tokens_json FROM questions WHERE no=?",
+                               (str(no),)).fetchone()
+        finally:
+            conn.close()
+    except Exception:       # noqa: BLE001 - 锁库/无表/坏库都退化到「没有 tokens_json」
+        return ""
+    return str(row[0] or "") if row else ""
+
+
+def _db_question_row(no: str) -> dict:
+    """questions 里这一行的 (src_title, text_plain)；查不到返回 {}。
+
+    t94：导入题的题号（99001… 或历史遗留的 00018…）可能与 ``qbank/<no>.docx``
+    的原始数学题撞号，而 docx 是「保真首选」——不看库就会把别科的题印上去。
+    """
+    db = tokens_db_path()
+    if not db or not os.path.isfile(db):
+        return {}
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(db, timeout=3.0)
+        try:
+            row = conn.execute("SELECT src_title, text_plain FROM questions WHERE no=?",
+                               (str(no),)).fetchone()
+        finally:
+            conn.close()
+    except Exception:       # noqa: BLE001 - 锁库/无表/坏库都按「查不到」
+        return {}
+    if not row:
+        return {}
+    return {"src_title": str(row[0] or ""), "text_plain": str(row[1] or "")}
+
+
+#: t88 · 导入的图片根目录（``data/figures/<subject_pk>/<no>/<seq>.<ext>``）
+_FIGURES_ROOT = None
+
+
+def set_figures_root(path) -> None:
+    """指定图片根目录（None = 与题库同级的 figures/）；顺带清 token 缓存。"""
+    global _FIGURES_ROOT
+    _FIGURES_ROOT = str(path) if path else None
+    _tokens_cache.clear()
+
+
+def figures_root() -> str:
+    if _FIGURES_ROOT:
+        return _FIGURES_ROOT
+    db = tokens_db_path()
+    if db:
+        return os.path.join(os.path.dirname(os.path.abspath(db)), "figures")
+    return os.path.join(APP_DIR, "data", "figures")
+
+
+def _subject_of(no: str) -> str:
+    """题号 → 学科（用于定位 figures/<subject_pk>/<no>/）；查不到返回 ""。"""
+    db = tokens_db_path()
+    if not db or not os.path.isfile(db):
+        return ""
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(db, timeout=3.0)
+        try:
+            row = conn.execute("SELECT COALESCE(subject_pk,'') FROM questions WHERE no=?",
+                               (str(no),)).fetchone()
+        finally:
+            conn.close()
+        return str(row[0] or "") if row else ""
+    except Exception:       # noqa: BLE001
+        return ""
+
+
+def _figure_bytes(no: str, name: str):
+    """按 tokens_json 里的图片名找磁盘文件 → (相对名, bytes, ext) 或 None。
+
+    查找顺序：``<root>/<subject_pk>/<no>/<name>`` → ``<root>/*/<no>/<name>``
+    （题干名可能带子目录，取 basename 匹配）。
+    """
+    root = figures_root()
+    base = os.path.basename(str(name or ""))
+    if not base or not os.path.isdir(root):
+        return None
+    subject = _subject_of(no)
+    cands = []
+    if subject:
+        cands.append(os.path.join(root, subject, str(no), base))
+    cands.append(os.path.join(root, str(no), base))          # 没有学科层的老结构
+    # 兼容旧落盘名（t88 早期把图存成 1.png/2.png/3.png）：
+    # 同目录下按「题号/题号_N」前缀找，找到就用——总比卷面缺图强。
+    stem, ext = os.path.splitext(base)
+    alt_names = []
+    if stem.isdigit():
+        alt_names.append(stem + ext)
+    for d in [os.path.join(root, subject, str(no)) if subject else "",
+              os.path.join(root, str(no))]:
+        if not d or not os.path.isdir(d):
+            continue
+        try:
+            files = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for fn in files:
+            fstem, fext = os.path.splitext(fn)
+            if fstem == str(no) or fstem.startswith(str(no) + "_"):
+                alt_names.append(fn)
+        if len(files) == 1:                                  # 该题只有一张图 → 就是它
+            alt_names.append(files[0])
+    for fn in alt_names:
+        for d in [os.path.join(root, subject, str(no)) if subject else "",
+                  os.path.join(root, str(no))]:
+            if not d:
+                continue
+            p = os.path.join(d, fn)
+            cands.append(p)
+    for path in cands:
+        if os.path.isfile(path):
+            try:
+                with open(path, "rb") as fh:
+                    return base, fh.read(), os.path.splitext(base)[1].lower()
+            except OSError:
+                return None
+    # 兜底：扫一层学科目录
+    try:
+        for sub in os.listdir(root):
+            p = os.path.join(root, sub, str(no), base)
+            if os.path.isfile(p):
+                with open(p, "rb") as fh:
+                    return base, fh.read(), os.path.splitext(base)[1].lower()
+    except OSError:
+        pass
+    return None
+
+
+def _figure_drawing_xml(rid: str, cx: int, cy: int) -> str:
+    """生成一段内联图片 XML（compose.add_tokens 会把 rId 换成新注册的）。"""
+    return (
+        '<w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
+        ' distT="0" distB="0" distL="0" distR="0">'
+        '<wp:extent cx="%d" cy="%d"/>'
+        '<wp:docPr id="1" name="figure"/>'
+        '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        '<pic:nvPicPr><pic:cNvPr id="0" name="figure"/><pic:cNvPicPr/></pic:nvPicPr>'
+        '<pic:blipFill><a:blip r:embed="%s"'
+        ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>'
+        '<a:stretch><a:fillRect/></a:stretch></pic:blipFill>'
+        '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="%d" cy="%d"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>'
+        '</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>'
+        % (cx, cy, rid, cx, cy))
+
+
+def _figure_token(no: str, name: str):
+    """tokens_json 里的图片名 → Token（从 figures 目录读二进制）。
+
+    读不到返回 None（调用方决定是报错还是跳过）——绝不“假装有图”。
+    """
+    got = _figure_bytes(no, name)
+    if not got:
+        return None
+    base, data, ext = got
+    width_pt, height_pt = 240.0, 160.0
+    try:
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as im:
+            w, h = im.size
+        if w and h:
+            max_w, max_h = 200.0, 110.0   # 图画小一点：整块不让拆，图一高就整题换页（半页空白）
+            scale = min(max_w / float(w), max_h / float(h), 1.0)
+            width_pt, height_pt = w * scale, h * scale
+    except Exception:       # noqa: BLE001 - 量不出尺寸就按默认大小
+        pass
+    rid = "rIdFig1"
+    cx, cy = int(width_pt * 12700), int(height_pt * 12700)   # pt → EMU
+    return Token(kind="embed", xml=_figure_drawing_xml(rid, cx, cy),
+                 media=[(rid, base, data)], width_pt=width_pt, height_pt=height_pt)
+
+
+def _token_media_count(item: dict) -> int:
+    try:
+        return int(item.get("n_media") or 0)
+    except (TypeError, ValueError):
+        return len(item.get("media_names") or [])
+
+
+def tokens_from_json(no: str, raw) -> list:
+    """questions.tokens_json → Token 列表（无原始 docx 时的回退排版）。
+
+    t88 起：embed token 会去 ``data/figures/`` 找图；找到就真插进卷面，找不到才报错。
+
+    build_db 存的是 ``Token.to_dict(with_data=False)``：有 kind/text/xml，但**没有图片二进制**。
+    所以：
+      * text / math / 无图表格 → 原样排版；
+      * embed（MathType/OLE/WMF/图片）或带媒体的题内表格 → 报 PaperError
+        （印出来会缺图，缺图的卷子比报错更糟）；
+      * 其它 kind（importers 写入的 analysis 等）不是卷面内容 → 跳过。
+    """
+    if isinstance(raw, (list, tuple)):
+        data = list(raw)
+    else:
+        try:
+            data = json.loads(raw or "[]")
+        except (TypeError, ValueError) as exc:
+            raise PaperError("题目 %s 的 tokens_json 不是合法 JSON：%s" % (no, exc))
+    if not isinstance(data, list):
+        raise PaperError("题目 %s 的 tokens_json 不是列表：%s"
+                         % (no, type(data).__name__))
+    out = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip()
+        if kind == "text":
+            text = str(item.get("text") or "")
+            if text:
+                out.append(Token(kind="text", text=text))
+        elif kind == "math":
+            xml = str(item.get("xml") or "")
+            if not xml:
+                raise PaperError("题目 %s 的 math token 没有 xml，回退排版会丢公式" % no)
+            out.append(Token(kind="math", xml=xml))
+        elif kind == "table":
+            n_media = _token_media_count(item)
+            if n_media:
+                raise PaperError(
+                    "题目 %s 有图（题内表格含 %d 张图），tokens_json 里只有图片名、没有图片数据，"
+                    "回退排版会缺图；请补原始 docx" % (no, n_media))
+            xml = str(item.get("xml") or "")
+            if not xml:
+                raise PaperError("题目 %s 的 table token 没有 xml，回退排版会丢表格" % no)
+            out.append(Token(kind="table", xml=xml,
+                             rows=int(item.get("rows") or 0),
+                             cols=int(item.get("cols") or 0)))
+        elif kind == "embed":
+            name = item.get("name") or (item.get("media_names") or ["未命名"])[0]
+            # t88：导入的图落在 data/figures/<subject_pk>/<no>/ 下，直接读出来插进卷面
+            tok = _figure_token(no, name) if name else None
+            if tok is not None:
+                out.append(tok)
+                continue
+            raise PaperError(
+                "题目 %s 有图（embed：%s），figures 目录里找不到这张图、tokens_json 里也没有"
+                "图片二进制，回退排版会缺图；请补原始 docx，或用 ZIP 把图片导进来"
+                % (no, name or "未命名"))
+        # 其它 kind（例如 analysis）：不是卷面内容，跳过
+    if not out:
+        raise PaperError("题目 %s 在库里的 tokens_json 没有可排版内容（空题），没法印卷" % no)
+    return out
+
+
+def source_tokens(no: str, tokens_json=None):
+    """题号 → token 列表（带媒体二进制）。
+
+    取数顺序（t11）：
+      1. 原始 docx（保真首选，带媒体二进制）；
+      2. docx 不存在 → 回退 ``questions.tokens_json``（15 万题绝大多数没有原始 docx），
+         只支持无图题（见 ``tokens_from_json``）；
+      3. 两边都没有 → ``PaperError``（明确告诉运维缺什么）。
+    """
+    key = str(no)
+    if tokens_json is None and key in _tokens_cache:
+        return _tokens_cache[key]
+    path = os.path.join(SRC_ROOT, "%s.docx" % key)
+    row = _db_question_row(key)
+    # t94：导入题（src_title='import'）绝不用 qbank 的原始 docx——题号撞号会印出别科的题。
+    imported = str(row.get("src_title") or "") == "import"
+    if os.path.exists(path) and imported:
+        _imported_shadowed.add(key)     # 供体检/自检统计：这题有同名 docx 但被忽略
+    elif os.path.exists(path):
+        try:
+            tokens = extract_tokens(path)
+        except Exception as exc:  # noqa: BLE001
+            raise PaperError("题目 %s 的 docx 解析失败：%s" % (key, exc))
+        if not tokens:
+            raise PaperError("题目 %s 的 docx 里没有可排版内容：%s" % (key, path))
+        _tokens_cache[key] = tokens
+        return tokens
+
+    raw = tokens_json if tokens_json is not None else _db_tokens_json(key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raise PaperError(
+            "题目 %s 印不了：原始 docx 不存在（%s），库里也没有 tokens_json（数据库 %s）；"
+            "请补原始 docx，或先跑导入管道把题面写进 questions.tokens_json"
+            % (key, path, tokens_db_path() or "未配置"))
+    tokens = tokens_from_json(key, raw)
+    _tokens_cache[key] = tokens
     return tokens
 
 
@@ -403,13 +720,17 @@ def _add_title_block(doc, manifest: dict, spec: dict = None) -> None:
     run.font.size = Pt(FONT_SIZE_TITLE)
     _set_cn_font(run, "黑体")
 
+    # 学生信息栏（t59）：班级/姓名/学号 —— 与答题卡 v3 的学生信息区对应，卷面也知道是谁的
+    _add_student_line(doc, spec)
+
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_after = Pt(2)
-    r = p.add_run("卷号：%s　　姓名：____________　　班级：____________　　日期：____________"
-                  % pid)
-    r.font.size = Pt(10.5)
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(spec["title_gap_pt"])
+    r = p.add_run("卷号：%s" % pid)
+    r.font.size = Pt(9)
     _set_cn_font(r)
+    _gray(r, "666666")
 
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -420,6 +741,78 @@ def _add_title_block(doc, manifest: dict, spec: dict = None) -> None:
     _set_cn_font(r)
     _gray(r, "666666")
     _bottom_border(p, color="404040", sz=6)
+
+
+#: 学生手写栏的行高（≥8mm 便于手写）与字号
+STUDENT_ROW_MM = 8.0
+STUDENT_FONT_PT = 11.0
+STUDENT_LABELS = ("班级：", "姓名：", "学号：")
+
+
+def _add_student_line(doc, spec: dict = None) -> None:
+    """首页填写栏「班级：____　姓名：____　学号：____」（与答题卡学生信息区对应）。
+
+    用 1×3 无框表格：每格一个标签 + 一段**字符下划线**的空格（不用图片/不用表格边框带来的
+    rId 关系，保真闸门不会因此多出媒体）。行高 ≥8mm，字号 11pt，学生直接用笔填。
+    """
+    spec = spec or layout_spec()
+    width = _content_w(spec) / len(STUDENT_LABELS)
+    table = doc.add_table(rows=1, cols=len(STUDENT_LABELS))
+    table.autofit = False
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    tr = table.rows[0]
+    for i, label in enumerate(STUDENT_LABELS):
+        cell = table.cell(0, i)
+        cell.width = Pt(width)
+        table.columns[i].width = Pt(width)
+        p = cell.paragraphs[0]
+        p.paragraph_format.space_before = Pt(1)
+        p.paragraph_format.space_after = Pt(1)
+        run = p.add_run(label)
+        run.font.size = Pt(STUDENT_FONT_PT)
+        _set_cn_font(run)
+        # 手写线的两种做法里，**字符下划线对行尾空白不生效**（Word 不给尾随空格画线），
+        # 所以这里用「单元格底框」画一条通栏横线：稳定、与字号无关、不引入图片关系
+        blank = p.add_run("\u3000\u3000\u3000\u3000\u3000\u3000")
+        blank.font.size = Pt(STUDENT_FONT_PT)
+        _set_cn_font(blank)
+        _cell_bottom_border(cell, color="595959", sz=6)
+    # 行高：atLeast 8mm（twips = 1/20 pt）
+    trPr = tr._tr.get_or_add_trPr()
+    height = OxmlElement("w:trHeight")
+    height.set(qn("w:val"), str(int(round(STUDENT_ROW_MM / 25.4 * 72 * 20))))
+    height.set(qn("w:hRule"), "atLeast")
+    trPr.append(height)
+    _table_no_borders(table)
+
+
+def _cell_bottom_border(cell, color: str = "595959", sz: int = 6) -> None:
+    """给单元格画一条底边（学生手写线）。"""
+    tcPr = cell._tc.get_or_add_tcPr()
+    borders = tcPr.find(qn("w:tcBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tcBorders")
+        tcPr.append(borders)
+    bottom = borders.find(qn("w:bottom"))
+    if bottom is None:
+        bottom = OxmlElement("w:bottom")
+        borders.append(bottom)
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), str(int(sz)))
+    bottom.set(qn("w:space"), "0")
+    bottom.set(qn("w:color"), color)
+
+
+def _table_no_borders(table) -> None:
+    """整表去边框（学生栏只靠字符下划线，不要表格框线）。"""
+    tblPr = table._tbl.tblPr
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = OxmlElement("w:" + edge)
+        el.set(qn("w:val"), "none")
+        el.set(qn("w:sz"), "0")
+        tblPr.append(borders)
+        borders.append(el)
 
 
 def _groups(items) -> list:
@@ -587,7 +980,7 @@ def _fill_cell(doc, registry, cell, tokens) -> None:
 
 
 # ---------------------------------------------------------------- 选项对齐
-_OPT_PREV_OK = " \t\u3000\n\x00（(：:；;、"
+_OPT_PREV_OK = " \t\u3000\n\x00（(：:；;、）)"   # 题干常以「（）」「()」结尾，右括号后面紧跟 A． 也算选项标签（t96）
 
 
 def _units_of(tokens):
@@ -926,9 +1319,18 @@ def observed_counts(docx_path: str) -> dict:
         if name in _MARKERS:
             counts[name] = counts.get(name, 0) + 1
     body = root.find(qn("w:body"))
+    decor_tables = 0
     if body is not None:
-        body_tables = sum(1 for el in body if _qn_local(el) == "tbl")
-    return {"counts": counts, "body_tables": body_tables,
+        for el in body:
+            if _qn_local(el) != "tbl":
+                continue
+            rows = [r for r in el if _qn_local(r) == "tr"]
+            cells = [c for c in rows[0] if _qn_local(c) == "tc"] if rows else []
+            if rows and len(rows) == 1 and len(cells) == 1:
+                body_tables += 1          # 一题一框：1 行 1 列
+            else:
+                decor_tables += 1         # 版面装饰表（首页学生信息栏 1×3）不算题框
+    return {"counts": counts, "body_tables": body_tables, "decor_tables": decor_tables,
             "media_files": len(media), "media_hashes": media_hashes}
 
 
@@ -996,7 +1398,7 @@ def check_docx(docx_path: str, manifest: dict, expected: dict = None) -> dict:
             % (len(missing), ", ".join(h[:8] for h in missing[:5])))
 
     content_tables = (counts.get("tbl", 0) - obs["body_tables"]
-                      - exp.get("option_tables", 0))
+                      - obs.get("decor_tables", 0) - exp.get("option_tables", 0))
     if content_tables != exp["tbl"]:
         raise FidelityError("题内表格数不一致：原始题面 %d 个，卷面 %d 个"
                             % (exp["tbl"], content_tables))
@@ -1013,6 +1415,7 @@ def check_docx(docx_path: str, manifest: dict, expected: dict = None) -> dict:
         "pages": 0,
         "n_items": exp["n_items"],
         "n_items_observed": obs["body_tables"],
+        "decor_tables": obs.get("decor_tables", 0),
         "items_ok": exp["n_items"] == obs["body_tables"],
         "formula_tokens": exp["formula_tokens"],
         "formula_omml_expected": exp["oMath"],
@@ -1165,7 +1568,8 @@ def build_calibration_pdf(path: str, *, title: str = "", pid: str = "") -> str:
         "A4 外框量出来差 1 mm 以上，也说明被缩放。",
         "刻度尺每格 10 mm，共 100 mm，可直接对照。",
         "",
-        "本页不判卷，只为校准；在组卷页取消勾选「附校准页」即可不打印这一页。",
+        "本页不判卷，只为校准。平时不会跟着打印：设置 → 打印里关掉「打印时附带校准页」，\n"
+        "或随时在卷子详情页「单独下载校准页」把它打一张。",
     ]
     ty = y0 + side + 30
     for line in lines:

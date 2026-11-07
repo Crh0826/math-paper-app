@@ -278,16 +278,21 @@ class TestRealLibrary(unittest.TestCase):
         import time
         conn = sqlite3.connect("file:%s?mode=ro" % REAL_DB.replace("\\", "/"), uri=True)
         try:
+            total = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
             t0 = time.time()
             res = dedupe.scan(conn, write=False)
             elapsed = time.time() - t0
         finally:
             conn.close()
-        self.assertEqual(12280, res["scanned"])  # t25 裁剪后：只保留有答案的题
-        self.assertLess(elapsed, 60.0, "全库近重复检测太慢：%.1fs" % elapsed)
-        # t25 裁剪后（只留有答案题）：真重复为 0；只剩「题干骨架相同、公式不同」的假阳性，
-        # 这正是内容门控要挡住的，text_only 口径仍能看到它们。
-        self.assertEqual(0, res["groups"], "裁剪后不该还有真重复")
+        # t17（75k 入库）后库规模不再写死：全库扫描必须覆盖每一行。
+        self.assertEqual(total, res["scanned"], "全库扫描要覆盖 questions 每一行")
+        self.assertLess(elapsed, 180.0, "全库近重复检测太慢：%.1fs" % elapsed)
+        # 入库后近重复族主要来自「同一篇材料的完形/阅读（不同空）」这类共享材料题，
+        # 不是真重复；这里守两条不变量：族数占比 < 5%、单族不超过 200 题。
+        self.assertLess(res["groups"], total * 0.05,
+                        "近重复族过多：%d / %d" % (res["groups"], total))
+        self.assertLessEqual(res["largest_group"], 200,
+                             "单族过大（疑似共享材料被判重）：%d" % res["largest_group"])
         self.assertGreater(res["text_only_groups"], 0, "只按题干比会误并出一堆")
         self.assertGreaterEqual(res["affected"], 0)
 

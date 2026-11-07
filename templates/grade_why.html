@@ -160,16 +160,8 @@
         <small>沪科版七年级上 · 拍照判卷</small>
       </span>
     </a>
-    <nav class="nav" aria-label="主导航">
-      <a class="nav-item" href="/">组卷</a>
-      <a class="nav-item" href="/papers">我的卷子</a>
-      <a class="nav-item is-active" href="/submissions" aria-current="page">判卷</a>
-      <a class="nav-item" href="/records">判卷记录</a>
-      <a class="nav-item" href="/train">训练</a>
-      <a class="nav-item" href="/guide">使用指南</a>
-      <a class="nav-item" href="/health">自检</a>
-    </nav>
-    <a class="ghost-link mono" href="/healthz" target="_blank" rel="noopener">healthz</a>
+    {% set nav_active = "grade" %}
+      {% include "_nav.html" %}
   </div>
 </header>
 

@@ -4,9 +4,10 @@
 设计要点（判卷侧 grade.py 直接依赖这些坐标，改动必须同步契约）：
 
 * 坐标系：300dpi 规范像素，A4 = 2480×3508，原点左上（CONTRACT §3）。
-* 四角 ArUco：DICT_4X4_50，id 0/1/2/3 = 左上/右上/右下/左下，边长 18mm(212px)，
+* 四角 ArUco：DICT_4X4_50，**第 p 页 id = 4p..4p+3**（左上/右上/右下/左下），边长 14mm(165px)，
   距纸边 12mm(142px)。标定侧按 4 个角点做透视复原到 2480×3508。
-* 右上卷号 QR：30mm(354px)，纠错级 H，payload 固定为 {"pid":..., "p":<卡内页序>}。
+* 右上卷号 QR：**只有第 1 页**，24mm(283px)，纠错级 H，payload ``{"pid","p":1,"v":4}``；
+  v4 起页序不写在 QR 里，而是用 ArUco id 分组（第 p 页 = 4p..4p+3）。
   frame 内自带 4 模块静区；QR 的 p 用「卡内页序 1..N」（稳定、好查表），
   卡面印刷的页码另放在 page["label"]（接在卷面最后一页之后）。
 * 每题左侧 4×4 ID 格：16bit = 12bit 题序 + 4bit 校验，cell 24px，
@@ -52,7 +53,8 @@ def mm(v: float) -> int:
 #: 四角 ArUco
 ARUCO_DICT_ID = cv2.aruco.DICT_4X4_50
 DICT_4X4_50 = ARUCO_DICT_ID  # 便于测试/判卷侧按名字断言
-ARUCO_SIZE = mm(18)      # 212
+ARUCO_SIZE = mm(14)      # 165（v4：从 18mm 缩到 14mm，纸面标记面积减半）
+ARUCO_SIZE_V3 = mm(18)   # 212（旧卡尺寸；判卷按 manifest 里的 marks.aruco[].size 走，不靠常量）
 ARUCO_MARGIN = mm(12)    # 142
 ARUCO_POS = {
     0: (ARUCO_MARGIN, ARUCO_MARGIN),                                          # 左上
@@ -62,24 +64,30 @@ ARUCO_POS = {
 }
 
 #: 卷号 QR（右上，位于右上 ArUco 正下方）
-QR_SIZE = mm(30)         # 354
-QR_POS = (PAGE_W - ARUCO_MARGIN - QR_SIZE, ARUCO_MARGIN + ARUCO_SIZE + mm(4))  # (1984, 400)
+QR_SIZE = mm(24)         # 283（v4：从 30mm 缩到 24mm，只在第 1 页）
+QR_SIZE_V3 = mm(30)      # 354（旧卡尺寸，判卷按 manifest 里的 qr.size 走）
+QR_POS = (PAGE_W - ARUCO_MARGIN - QR_SIZE, ARUCO_MARGIN + ARUCO_SIZE + mm(4))
+#: v4 页序编码：第 p 页（0 基）四角 id = 4p + 角号；一页 4 个，DICT_4X4_50 够 12 页
+ARUCO_PER_PAGE = 4
+ARUCO_MAX_PAGES = 50 // ARUCO_PER_PAGE      # 12
 QR_ECC = "H"
 
 #: 正文区（所有作答单元都必须落在里面）
 BODY_RECT = (100, 800, 2240, 2320)   # x, y, w, h  → 100..2340 / 800..3120
 
 #: 每题标识格（t46）：5×5=25 位，前 20 位 = 题号，后 5 位 = CRC-5 校验
-CARD_VERSION = 2                  # 5×5 标识（编码题号）
+CARD_VERSION = 4                  # 4 = 只在第 1 页印 QR；页序改用 ArUco id 分组
+CARD_VERSION_V3 = 3               # 3 = 每页 1 QR + 固定 0..3 四角（只兼容不生成）
 LEGACY_CARD_VERSION = 1           # 旧卡：4×4 标识（编码卷内题序），只兼容不生成
 ID_GRID = 5
 LEGACY_ID_GRID = 4                # 旧卡（manifest.card.version=1）的 4×4 标识
 ID_CELL = 24                      # 约 2mm@300dpi，与旧版视觉一致
 ID_SIZE = ID_GRID * ID_CELL       # 120
 ID_TOP_DY = 6                     # id_box.y = 题块 top + 6
-NO_BITS = 20                      # 题号位宽（22,898 < 2^20）
+NO_BITS = 20                      # 题号位宽：22,898 老题（5 位）+ 15 万题（6 位）都编得下
 CHK_BITS = ID_GRID * ID_GRID - NO_BITS   # 5 位校验
-MAX_NO = (1 << NO_BITS) - 1
+MAX_NO = (1 << NO_BITS) - 1       # 1,048,575：t11 起 6 位题号（100000..1048575）合法
+NO_MIN_WIDTH = 5                  # 题号最小位数（"%05d"）：6 位/7 位自然变长，旧号仍是 5 位
 ID_COL_X = 155
 
 #: 省纸两列版式（t38）：正文左右各一列，每列内部左右各留 8mm
@@ -135,6 +143,16 @@ HEADER_GAP = 10
 QUESTION_NO_FONT = 26
 
 ID_ORIGIN_X = (col_id_x(0), col_id_x(1))
+
+#: 学生信息区（v3）：页眉下、正文上，不进正文流
+STUDENT_TOP = 380                # 页眉下方、让开左上 ArUco（142..354）
+STUDENT_H = 410                  # 底部 790 < 正文 800，绝不压题
+STUDENT_DIGITS = 8
+STUDENT_GAP = 4                  # 行间距
+STUDENT_COL_GAP = 18             # 位间距
+STUDENT_MIN_CELL = 30
+STUDENT_THRESHOLD = 0.35         # 与 OMR 同一套墨迹阈值
+STUDENT_RIGHT = 1960             # 让开右上 QR（1984 起）
 
 CARD_PDF_NAME = "card.pdf"
 
@@ -193,8 +211,17 @@ def _crc5(value: int) -> int:
     return crc & 0b11111
 
 
+def fmt_no(v) -> str:
+    """题号整数 → 字符串（"03370" 5 位补零；10 万以上自然是 6 位）。
+
+    15 万题口径（t11）：题号 100000..1048575 也编进同一个 20 位字段，
+    所以这里只保证**最小** 5 位，不截断位数。
+    """
+    return "%0*d" % (NO_MIN_WIDTH, int(v))
+
+
 def encode_id_bits(no) -> list:
-    """题号（"03370" / 3370）→ 25 个 0/1（5×5 行优先）：20 位题号 + 5 位 CRC。"""
+    """题号（"03370" / 3370 / "100001"）→ 25 个 0/1（5×5 行优先）：20 位题号 + 5 位 CRC。"""
     try:
         v = int(str(no).strip())
     except (TypeError, ValueError):
@@ -207,7 +234,7 @@ def encode_id_bits(no) -> list:
 
 
 def decode_id_bits(bits):
-    """25 个 0/1 → 5 位题号字符串（"03370"）；长度/CRC 不对返回 None。"""
+    """25 个 0/1 → 题号字符串（"03370" / "100001"）；长度/CRC 不对返回 None。"""
     try:
         bits = [1 if int(b) else 0 for b in bits]
     except Exception:
@@ -222,9 +249,9 @@ def decode_id_bits(bits):
         chk = (chk << 1) | b
     if chk != _crc5(v):
         return None
-    if not (1 <= v <= 99999):        # 00000 不是题号；>99999 也不可能是本库题
+    if not (1 <= v <= MAX_NO):       # 00000 不是题号；20 位装得下的都是本库可能有的题号
         return None
-    return "%05d" % v
+    return fmt_no(v)
 
 
 def encode_idx_bits(idx) -> list:
@@ -553,6 +580,36 @@ def _fit_size(d, s, max_w, size, bold=False, min_size=12):
     return size
 
 
+def page_marker_ids(page_no: int) -> dict:
+    """第 page_no 页（1 基）的四角 id → {角号(0..3): marker_id}。
+
+    v4 约定：第 p 页（0 基）= ``4p .. 4p+3``；角号沿用 ARUCO_POS：
+    0=左上 1=右上 2=右下 3=左下。第 1 页 → 0/1/2/3（与旧卡同 id，
+    所以旧卡的第 1 页照片用新逻辑也能标定）。
+    """
+    base = (max(1, int(page_no)) - 1) * ARUCO_PER_PAGE
+    return {corner: base + corner for corner in ARUCO_POS}
+
+
+def decode_page_from_ids(ids) -> int | None:
+    """四角 marker id → 页序（1 基）；不是「同一页的完整四角」就返回 None。
+
+    * 新卡（v4）：id 4p..4p+3 全在 → p+1；
+    * 旧卡（v2/v3）：每页都是 0..3 → 返回 1（页序只能靠 QR 定）。
+    """
+    try:
+        got = {int(i) for i in ids}
+    except (TypeError, ValueError):
+        return None
+    if len(got) != ARUCO_PER_PAGE:
+        return None
+    for page0 in range(ARUCO_MAX_PAGES):
+        want = set(range(page0 * ARUCO_PER_PAGE, page0 * ARUCO_PER_PAGE + ARUCO_PER_PAGE))
+        if got == want:
+            return page0 + 1
+    return None
+
+
 def _qr_np(payload: dict, size: int = QR_SIZE) -> np.ndarray:
     data = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     q = qrcode.QRCode(
@@ -667,11 +724,18 @@ def render_page(manifest: dict, page: dict, png_path: str, n_pages: int) -> str:
 
     _draw_header(d, manifest, page["page"], n_pages, page["label"])
 
-    # ArUco 四角
-    for mid, (mx, my) in ARUCO_POS.items():
-        _paste(img, _aruco_np(mid), mx, my)
-    # 卷号 QR
-    _paste(img, _qr_np(page["qr"]["payload"]), page["qr"]["x"], page["qr"]["y"])
+    # ArUco 四角（v4：每页 id = 4(p-1)..4(p-1)+3，页序就在标记里）
+    for mk in (page.get("marks") or {}).get("aruco") or []:
+        _paste(img, _aruco_np(int(mk["id"])), int(mk["x"]), int(mk["y"]))
+    # 卷号 QR（v4 只有第 1 页有）
+    qr = page.get("qr")
+    if qr:
+        _paste(img, _qr_np(qr["payload"], int(qr.get("size") or QR_SIZE)),
+               qr["x"], qr["y"])
+
+    # 学生信息区（v3，只第 1 页）
+    if page.get("student"):
+        _draw_student(d, page["student"])
 
     # 题型标注（中文说明）
     for hd in page.get("headers", []):
@@ -722,7 +786,7 @@ def read_qr(image, qr: dict, pad: int = 24) -> object:
     grade.py 直接复用这个函数；多后端 + 放大重试，避免单一 cv2 解码器的偶发失手。
     """
     img = _load_gray(image)
-    if img is None:
+    if img is None or not qr:
         return None
     x, y, s = int(qr["x"]), int(qr["y"]), int(qr.get("size") or QR_SIZE)
     x0, y0 = max(0, x - pad), max(0, y - pad)
@@ -752,7 +816,7 @@ def iter_answer_cells(card: dict, pid: str = None):
     判卷侧（grade.py / 批量 OCR 拼图）直接按 box 在原图上裁切即可，格内是纯白不留字。
     """
     for page in card.get("pages") or []:
-        page_pid = (page.get("qr") or {}).get("payload", {}).get("pid")
+        page_pid = ((page.get("qr") or {}).get("payload") or {}).get("pid") or pid
         for it in page.get("items") or []:
             kind = it.get("kind")
             if kind == KIND_FILL:
@@ -807,12 +871,188 @@ def pngs_to_pdf(png_paths: list, pdf_path: str, title: str = "答题卡") -> str
 
 
 # ---------------------------------------------------------------- 主入口
+# ---------------------------------------------------------------- 学生信息区（v3）
+def student_layout(digits: int = None, top: int = None, cell_px: int = None,
+                   gap: int = STUDENT_GAP) -> dict:
+    """学号涂卡区版式：**每位一行 10 格（0-9）**，共 N 行；右侧姓名/班级手写框。
+
+    * 位数默认 8，可配 6/8/10（`student_digits`）；位数越多行越高，格子会自动缩；
+    * 46mm 高度装不下「6mm 格 × 10 行」，所以格子按可用高度自适应（实测 ~40px），
+      真实 `cell_px` 写进 manifest，判卷按它裁切即可，不依赖常量；
+    * 每个格都带绝对坐标，判卷侧不用再算。
+    """
+    digits = int(digits or STUDENT_DIGITS)
+    if digits not in (6, 8, 10):
+        digits = STUDENT_DIGITS
+    top = STUDENT_TOP if top is None else int(top)
+    if cell_px is None:
+        cell = (STUDENT_H - 64 - (digits - 1) * gap) // digits
+        cell = max(STUDENT_MIN_CELL, min(71, cell))
+    else:
+        cell = max(STUDENT_MIN_CELL, min(71, int(cell_px)))
+    col_pitch = cell + 6           # 同一行里相邻数字的间距
+    row_pitch = cell + gap
+    x0 = 380
+    y0 = top + 64
+    rows = []
+    for i in range(digits):
+        cells = []
+        for dgt in range(10):
+            cells.append({
+                "digit": dgt,
+                "x": x0 + dgt * col_pitch,
+                "y": y0 + i * row_pitch,
+                "w": cell, "h": cell,
+            })
+        rows.append({"index": i + 1, "cells": cells})
+    grid_w = 10 * col_pitch - 6
+    name_x = x0 + grid_w + 120
+    return {
+        "no_digits": digits,
+        "origin": [x0, y0],
+        "cell_px": cell,
+        "grid_px": row_pitch,
+        "gap_px": gap,
+        "col_pitch": col_pitch,
+        "row_pitch": row_pitch,
+        "threshold": STUDENT_THRESHOLD,
+        "layout": "row-per-digit",     # 每位一行 10 格
+        "area": {"x": 275, "y": top, "w": STUDENT_RIGHT - 275, "h": STUDENT_H},
+        "digits_grid": {"x": x0, "y": y0, "w": grid_w,
+                        "h": digits * row_pitch - gap},
+        "columns": rows,
+        "name_box": {"x": name_x, "y": y0 + 20, "w": 560, "h": 100},
+        "class_box": {"x": name_x, "y": y0 + 170, "w": 560, "h": 100},
+        "hint": "学号请用黑色笔把对应数字整个涂黑，涂错一格即作废",
+    }
+
+
+def encode_student_bits(student_no, digits: int = STUDENT_DIGITS) -> list:
+    """学号 → 每位数字（0-9）列表；不足左补 0，非数字位记 None。"""
+    digits = int(digits or STUDENT_DIGITS)
+    s = str(student_no if student_no is not None else "").strip()
+    s = "".join(ch for ch in s if ch.isdigit())
+    if not s:
+        return [None] * digits
+    s = s[-digits:].rjust(digits, "0")
+    return [int(ch) for ch in s]
+
+
+def decode_student_bits(col_ratios, threshold: float = STUDENT_THRESHOLD,
+                        max_unknown: int = 1):
+    """每位 10 个墨迹比 → 学号字符串（未知位写成 '?'）。
+
+    * 每位取墨迹最深的那一格，低于阈值算「该位未知」；
+    * 未知位超过 `max_unknown`（默认 1）→ 返回 None；
+    * 全空/格式不对一律返回 None，**绝不抛异常**。
+    """
+    try:
+        if not col_ratios:
+            return None
+        out = []
+        unknown = 0
+        for col in col_ratios:
+            best_i, best = None, -1.0
+            for d, r in enumerate(col or []):
+                try:
+                    rv = float(r)
+                except (TypeError, ValueError):
+                    continue
+                if rv > best:
+                    best, best_i = rv, d
+            if best_i is None or best < float(threshold):
+                out.append("?")
+                unknown += 1
+            else:
+                out.append(str(best_i))
+        if unknown > int(max_unknown):
+            return None
+        return "".join(out)
+    except Exception:
+        return None
+
+
+def student_ink_ratios(card_info: dict, image, threshold: float = None) -> list:
+    """从复原图上学号区取每格墨迹比 → [[10 个], ...]（按位）。"""
+    st = (card_info or {}).get("student") or {}
+    cols = st.get("columns") or []
+    if not cols:
+        return []
+    img = _load_gray(image)
+    if img is None:
+        return []
+    out = []
+    for col in cols:
+        row = []
+        for c in col.get("cells") or []:
+            patch = crop_cell(img, c, inset=max(3, int(c.get("w", 41)) // 6))
+            if patch is None or getattr(patch, "size", 0) == 0:
+                row.append(0.0)
+            else:
+                row.append(float((patch < 128).mean()))
+        out.append(row)
+    return out
+
+
+def read_student_no(card_info: dict, image, threshold: float = None) -> str:
+    """读学号 → 字符串（含 '?' 表示该位没涂/太淡）；读不出返回 ""，绝不抛异常。"""
+    try:
+        st = (card_info or {}).get("student") or {}
+        if not st.get("columns"):
+            return ""          # v1/v2 卡没有学生区
+        th = float(threshold if threshold is not None
+                   else st.get("threshold", STUDENT_THRESHOLD))
+        ratios = student_ink_ratios(card_info, image)
+        if not ratios:
+            return ""
+        return decode_student_bits(ratios, threshold=th, max_unknown=1) or ""
+    except Exception:
+        return ""
+
+
+def _dashed_rect(d, x0, y0, x1, y1, dash: int = 14, gap: int = 10, fill=120, width=2):
+    x = x0
+    while x < x1:
+        d.line([(x, y0), (min(x + dash, x1), y0)], fill=fill, width=width)
+        d.line([(x, y1), (min(x + dash, x1), y1)], fill=fill, width=width)
+        x += dash + gap
+    y = y0
+    while y < y1:
+        d.line([(x0, y), (x0, min(y + dash, y1))], fill=fill, width=width)
+        d.line([(x1, y), (x1, min(y + dash, y1))], fill=fill, width=width)
+        y += dash + gap
+
+
+def _draw_student(d, st: dict, dark: bool = False):
+    """画学生信息区：虚线外框 + 每位一行 10 格 + 姓名/班级手写框。"""
+    a = st["area"]
+    _dashed_rect(d, a["x"], a["y"], a["x"] + a["w"], a["y"] + a["h"])
+    _text(d, a["x"] + 16, a["y"] + 6, "学生信息（学号涂卡）", _font(22, True))
+    _text(d, st["name_box"]["x"], a["y"] + 12, st.get("hint") or "", _font(18), fill=90)
+    # 列头：0..9（对齐每一行的 10 个格子）
+    first = st["columns"][0]["cells"]
+    for c in first:
+        _text(d, c["x"] + c["w"] // 3, st["origin"][1] - 24, str(c["digit"]), _font(18))
+    # 行号：第 1..N 位
+    for i, row in enumerate(st["columns"]):
+        y = row["cells"][0]["y"]
+        _text(d, a["x"] + 16, y + st["cell_px"] // 3, "第%d位" % (i + 1), _font(18))
+    for row in st["columns"]:
+        for c in row["cells"]:
+            d.rectangle([c["x"], c["y"], c["x"] + c["w"], c["y"] + c["h"]],
+                        outline=40 if dark else 60, width=2)
+    for key, label in (("name_box", "姓名："), ("class_box", "班级：")):
+        b = st[key]
+        _text(d, b["x"] - 90, b["y"] + b["h"] // 2 - 14, label, _font(26, True))
+        d.rectangle([b["x"], b["y"], b["x"] + b["w"], b["y"] + b["h"]], outline=80, width=2)
+
+
 def build_card(manifest: dict, out_dir: str) -> dict:
     """生成答题卡 → {"pdf", "png": [...], "card": {...}, "manifest": manifest, "health": {...}}
 
     * `card` 字段同时合并进传入的 manifest（`manifest["card"]`），页码接卷面最后一页；
     * `manifest["card"]["version"]` = `CARD_VERSION`（2 = 5×5 编码题号；1 = 旧卡 4×4，只兼容不生成）；
-    * QR payload = `{"pid", "p", "v"}`：`p` 是本卡页序（判卷按它选页），`v` 是卡版本；
+    * QR payload = `{"pid", "p", "v"}`：v4 只在第 1 页印（`p` 恒为 1），页序看 `marks.aruco[].id`；
     * **`health` 是返回值，不写进 manifest**（`manifest["card"]["health"]` 一直为空，别去那里找）。
     """
     os.makedirs(out_dir, exist_ok=True)
@@ -840,15 +1080,19 @@ def build_card(manifest: dict, out_dir: str) -> dict:
             "page": i,
             "label": label,
             "body": {"x": BODY_RECT[0], "y": BODY_RECT[1], "w": BODY_RECT[2], "h": BODY_RECT[3]},
+            # v4：页序编码在 ArUco id 里（第 p 页 = 4p..4p+3），见 page_marker_ids()
+            "group": i - 1,
             "marks": {"aruco": [
-                {"id": mid, "x": xy[0], "y": xy[1], "size": ARUCO_SIZE}
-                for mid, xy in sorted(ARUCO_POS.items())
+                {"id": mid, "corner": corner, "x": ARUCO_POS[corner][0],
+                 "y": ARUCO_POS[corner][1], "size": ARUCO_SIZE}
+                for corner, mid in sorted(page_marker_ids(i).items())
             ]},
-            "qr": {
+            # 只有第 1 页印 QR（带 pid + 版本；p 固定 1，页序不再靠它）
+            "qr": ({
                 "x": QR_POS[0], "y": QR_POS[1], "size": QR_SIZE,
-                # p = 本卡页序（判卷按它选页，多页卡必须逐页不同）；v = 卡版本
-                "payload": {"pid": str(manifest.get("pid") or ""), "p": i, "v": CARD_VERSION},
-            },
+                "payload": {"pid": str(manifest.get("pid") or ""), "p": 1,
+                            "v": CARD_VERSION},
+            } if i == 1 else None),
             "headers": list(pg["headers"]),
             "items": [],
         }
@@ -863,6 +1107,13 @@ def build_card(manifest: dict, out_dir: str) -> dict:
             page["items"].append(entry)
         pages.append(page)
 
+    student = None
+    if manifest.get("student_area", True) is not False:
+        student = student_layout(digits=manifest.get("student_digits"),
+                                 cell_px=manifest.get("student_cell_px"))
+        if pages:
+            pages[0]["student"] = student
+
     card = {
         "pages": pages,
         "n_pages": n_pages,
@@ -873,7 +1124,13 @@ def build_card(manifest: dict, out_dir: str) -> dict:
         "w_px": PAGE_W,
         "h_px": PAGE_H,
         "version": CARD_VERSION,
+        # 判卷侧据此判断「页序在 ArUco id 里」（v4）还是「靠每页 QR 的 p」（v2/v3）
+        "aruco_groups": True,
+        "aruco_per_page": ARUCO_PER_PAGE,
+        "qr_pages": [1],
     }
+    if student is not None:
+        card["student"] = student
 
     pngs = []
     for page in pages:
@@ -918,7 +1175,21 @@ def _main(argv=None):
         ],
     }
     res = build_card(manifest, out_dir)
-    print(json.dumps({"pdf": res["pdf"], "png": res["png"], "pages": res["card"]["n_pages"]},
+    # 学生信息区裁剪图（给人工核对版式用）
+    st = res["card"].get("student") or {}
+    crop_path = None
+    if st.get("area"):
+        from PIL import Image as _Image
+        a = st["area"]
+        with _Image.open(res["png"][0]) as im:
+            crop = im.crop((a["x"], a["y"], a["x"] + a["w"], a["y"] + a["h"]))
+            crop_path = os.path.join(out_dir, "student_area.png")
+            crop.save(crop_path)
+    print(json.dumps({"pdf": res["pdf"], "png": res["png"], "pages": res["card"]["n_pages"],
+                      "version": res["card"]["version"],
+                      "student_no_digits": st.get("no_digits"),
+                      "student_cell_px": st.get("cell_px"),
+                      "student_area_png": crop_path},
                      ensure_ascii=False, indent=2))
 
 

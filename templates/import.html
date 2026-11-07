@@ -1,0 +1,606 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page_title }} · 数学题库工作台</title>
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  /* 导入页自带的最小样式（与判卷上传页同款：拖放区 / 状态卡 / 表格） */
+  /* app.css 里 input[type=text] 是 width:100% 但没有 border-box，会撑出卡片 20px；
+     这里在本页兜住（不改全局样式，避免影响组卷/判卷页）。 */
+  *, *::before, *::after { box-sizing: border-box; }
+  input, select, textarea, button { max-width: 100%; box-sizing: border-box; }
+  /* 手机窄屏：顶栏里 brand/nav 都是 flex 子项，默认 min-width:auto 会被内容撑宽，
+     导致整页横向溢出（375px 下能滚出一截）。这里显式归零并允许换行。 */
+  html, body { max-width: 100%; overflow-x: hidden; }
+  .topbar-inner, .nav, .brand, .brand-text, .page, .card { min-width: 0; }
+  .brand-text strong, .brand-text small { white-space: normal; }
+  .topbar-inner { flex-wrap: wrap; }
+  .nav { flex-wrap: wrap; }
+  @media (max-width: 520px) {
+    .topbar-inner { gap: 8px; padding: 8px 12px; }
+    .nav { gap: 2px; }
+    .nav-item { padding: 4px 7px; font-size: 13px; }
+    .ghost-link { display: none; }
+  }
+  .footer {
+    max-width: 1080px; margin: 0 auto; padding: 18px 20px 42px;
+    color: var(--muted); font-size: 12.5px;
+    display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+
+  /* 拖放区：真实 input 铺满整块（手机才点得动），不要加 capture */
+  .file-drop {
+    position: relative; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 6px; min-height: 140px; padding: 18px 16px;
+    border: 2px dashed #93a4c0; border-radius: 14px; background: #f7f9fd;
+    cursor: pointer; text-align: center; -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation; overflow-wrap: anywhere;
+  }
+  .file-drop:active, .file-drop:focus-within { background: #eef3fb; border-color: #3b82f6; }
+  .file-drop-input {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    opacity: 0; cursor: pointer; font-size: 16px; z-index: 2;
+  }
+  .file-drop-icon { font-size: 30px; line-height: 1; }
+  .file-drop-title { font-weight: 700; font-size: 18px; color: var(--ink); }
+  .file-drop-hint { font-size: 13px; color: var(--muted); }
+  .file-drop.has-file { border-style: solid; border-color: #16a34a; background: #f2fbf5; }
+
+  .stat-row { display: flex; gap: 10px; flex-wrap: wrap; margin: 4px 0 14px; }
+  .stat {
+    flex: 1 1 120px; min-width: 96px; background: #fbfcfd; border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 12px;
+  }
+  .stat b { display: block; font-size: 22px; line-height: 1.2; }
+  .stat span { font-size: 12.5px; color: var(--muted); }
+  .stat.ok b { color: var(--ok); }
+  .stat.warn b { color: var(--warn); }
+  .stat.bad b { color: var(--danger); }
+
+  .imp-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .imp-table th, .imp-table td {
+    text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line-soft);
+    vertical-align: top;
+  }
+  .imp-table th { font-size: 12.5px; color: var(--muted); font-weight: 600; white-space: nowrap; }
+  .imp-table td.num { color: var(--muted); white-space: nowrap; }
+  .imp-table .stem-cell { min-width: 120px; overflow-wrap: anywhere; }
+  .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+  details.fold { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 12px 0; }
+  details.fold > summary { cursor: pointer; font-weight: 600; font-size: 13.5px; }
+  details.fold[open] > summary { margin-bottom: 8px; }
+
+  /* 提交遮罩：大文件校验要十几秒，别让用户以为没反应而重复点 */
+  .busy-mask {
+    position: fixed; inset: 0; background: rgba(15, 23, 42, .38);
+    display: none; align-items: center; justify-content: center; z-index: 9999;
+  }
+  .busy-mask.show { display: flex; }
+  .busy-box {
+    background: #fff; border-radius: 14px; padding: 22px 26px; text-align: center;
+    box-shadow: 0 20px 50px rgba(15, 23, 42, .25); max-width: 320px;
+  }
+  .busy-spin {
+    width: 30px; height: 30px; margin: 0 auto 12px; border-radius: 50%;
+    border: 3px solid #dbe4f5; border-top-color: #2f6feb; animation: spin .9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .busy-title { font-weight: 700; }
+  .busy-hint { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+  .inline-note { font-size: 13px; color: var(--warn); margin-top: 8px; }
+
+  /* 「让 AI 帮你转」折叠区块（t76） */
+  details.ai-hint { margin-bottom: 16px; }
+  details.ai-hint > summary.ai-summary {
+    cursor: pointer; list-style: none; display: flex; flex-direction: column; gap: 2px;
+  }
+  details.ai-hint > summary.ai-summary::-webkit-details-marker { display: none; }
+  details.ai-hint > summary.ai-summary strong { font-size: 16px; }
+  details.ai-hint[open] > summary.ai-summary { margin-bottom: 12px; }
+  /* 折叠时没有三角标记（list-style:none），给个明确的「点开」提示，别让人以为是纯标题 */
+  details.ai-hint > summary.ai-summary::after {
+    content: "点开看怎么用 ▾"; color: var(--accent); font-size: 12.5px; font-weight: 600;
+    margin-top: 4px;
+  }
+  details.ai-hint[open] > summary.ai-summary::after { content: "收起 ▴"; }
+  .ai-body { min-width: 0; }
+  .ai-steps { margin: 0 0 12px; padding-left: 20px; color: var(--ink-2); font-size: 13.5px; }
+  .ai-steps li { margin: 4px 0; }
+  .ai-actions {
+    display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 10px;
+  }
+  .ai-prompt {
+    width: 100%; box-sizing: border-box; min-height: 260px; resize: vertical;
+    font: 12.5px/1.6 ui-monospace, Consolas, "Courier New", monospace;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    background: #fbfcfd; border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 12px; color: var(--ink-2);
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">Σ</span>
+      <span class="brand-text">
+        <strong>数学题库工作台</strong>
+        <small>沪科版七年级上 · 题库导入</small>
+      </span>
+    </a>
+    {% set nav_active = "import" %}
+      {% include "_nav.html" %}
+  </div>
+</header>
+
+<main class="page">
+  <div class="page-head">
+    <h1>导入题库</h1>
+    <p class="lede">
+      支持 <strong>CSV / Excel / JSON / docx 目录</strong>。先「只校验」看前 20 行与问题行，确认无误再勾「确认导入」写库。
+      <span class="muted">单次 ≤ {{ max_rows | num }} 行、文件 ≤ {{ "%.0f" | format(max_upload_mb) }} MB；
+        题号已存在且内容相同会跳过，内容变了会更新。</span>
+    </p>
+  </div>
+
+  {% if message %}
+  <div class="banner banner-{{ 'error' if report and report.failed and not report.inserted and not report.updated else 'ok' }}" role="status">
+    <div class="banner-head"><span class="banner-dot" aria-hidden="true"></span>{{ message }}</div>
+    {% if report and report.dry_run and report.total %}
+    <p class="banner-text">这是<strong>校验预览</strong>：还没有写库。确认没问题再点下面的「确认导入」。</p>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {# ---------------------------------------------------------------- 上传态 #}
+  {# 没有 JSON？让 AI 帮你转：默认折叠，不挤占上传区；提示词正文由服务端 ai_prompt 注入 #}
+  <details class="card ai-hint" id="ai-hint">
+    <summary class="ai-summary">
+      <strong>没有 JSON？让 AI 帮你转</strong>
+      <span class="muted">把 Word 里的题贴给任意 AI，按我们的格式产出 JSON，再拖回下面导入</span>
+    </summary>
+    <div class="ai-body">
+      <ol class="ai-steps">
+        <li><strong>复制提示词</strong>：点「复制提示词」，整段提示词就进剪贴板了。</li>
+        <li><strong>贴给任意 AI</strong>：把提示词 + 从 Word 复制的题目文本一起发给 ChatGPT / DeepSeek / 豆包 / 通义都行。</li>
+        <li><strong>存成 .json 再拖回来</strong>：把 AI 返回的 JSON 原样存成 qbank.json，回到下面「选择文件」拖进来，先「只校验」看一眼。</li>
+      </ol>
+      <div class="ai-actions">
+        <button type="button" class="btn btn-primary" id="copy-prompt" data-target="ai-prompt">复制提示词</button>
+        <a class="btn" href="/import/template.json" download id="download-template">下载示例 JSON</a>
+        <span class="muted" id="copy-feedback" role="status" aria-live="polite"></span>
+      </div>
+      <textarea id="ai-prompt" class="ai-prompt" readonly rows="24" spellcheck="false"
+                aria-label="给 AI 的提示词（可全选复制）">{{ ai_prompt }}</textarea>
+      <p class="field-hint">示例文件里有 1 道选择题 + 1 道填空题（题号故意用 99001 / 99002，
+        不会覆盖你的真题），照着它的字段改就行；下载到的 <span class="mono">{{ template_name }}</span>
+        拖回本页可直接导入。</p>
+    </div>
+  </details>
+
+  <section class="card" id="panel-upload" {% if report %}hidden{% endif %}>
+    <h2>1. 选择文件</h2>
+    <form id="import-form" method="post" action="/import" enctype="multipart/form-data">
+      <label class="file-drop" id="drop" for="qfile">
+        <input type="file" id="qfile" name="file" class="file-drop-input"
+               accept=".csv,.json,.xlsx,.xls,.txt">
+        <span class="file-drop-icon" aria-hidden="true">📄</span>
+        <span class="file-drop-title">点这里选文件，或把文件拖进来</span>
+        <span class="file-drop-hint">CSV / Excel（.xlsx/.xls）/ JSON；docx 题库请填下面的目录路径</span>
+        <span class="file-drop-hint" id="picked-name">还没选文件</span>
+      </label>
+
+      <div class="grid grid-2" style="margin-top:14px">
+        <label class="field">
+          <span class="field-label">文件格式</span>
+          <select name="format" id="format">
+            <option value="" {% if not form.format %}selected{% endif %}>自动识别（看扩展名）</option>
+            <option value="csv" {% if form.format == 'csv' %}selected{% endif %}>CSV（.csv）</option>
+            <option value="excel" {% if form.format == 'excel' %}selected{% endif %}>Excel（.xlsx / .xls）</option>
+            <option value="json" {% if form.format == 'json' %}selected{% endif %}>JSON（.json）</option>
+            <option value="docx" {% if form.format == 'docx' %}selected{% endif %}>docx 题库目录（全量重建）</option>
+          </select>
+          <span class="field-hint">认不出扩展名时才需要手动选。</span>
+        </label>
+        <label class="field">
+          <span class="field-label">学科</span>
+          <input type="text" name="subject" list="subject-list" value="{{ form.subject or '' }}"
+                 placeholder="数学" autocomplete="off">
+          <span class="field-hint">同一份文件里每题也可以带「学科」列覆盖。</span>
+        </label>
+        <label class="field">
+          <span class="field-label">年级</span>
+          <input type="text" name="grade" value="{{ form.grade or '' }}" placeholder="七年级上" autocomplete="off">
+        </label>
+        <label class="field">
+          <span class="field-label">教材版本</span>
+          <input type="text" name="version" value="{{ form.version or '' }}" placeholder="沪科版" autocomplete="off">
+        </label>
+      </div>
+      <datalist id="subject-list">
+        {% for s in subjects %}<option value="{{ s.name }}">{{ s.grade }} {{ s.version }}</option>{% endfor %}
+      </datalist>
+
+      <label class="field" style="margin-top:12px">
+        <span class="field-label">docx 题库目录（只有 docx 导入要填）</span>
+        <input type="text" name="docx_dir" value="{{ form.docx_dir or '' }}"
+               placeholder="例如 D:\题库\数学七上（里面是 00001.docx …）" autocomplete="off">
+        <span class="field-hint">docx 是全量重建（只收有答案题），需要目录里的 *.docx 原件。</span>
+      </label>
+
+      <div class="check-list" style="margin-top:10px">
+        <label class="check">
+          <input type="checkbox" name="dry_run" id="dry-run" value="1"
+                 {% if form.dry_run %}checked{% endif %}>
+          <span>只校验不导入<em class="muted">（推荐先看一眼：不写库）</em></span>
+        </label>
+        <label class="check">
+          <input type="checkbox" name="renumber" id="renumber-box" value="1"
+                 {% if form.renumber %}checked{% endif %}>
+          <span>题号冲突时自动改用本学科号段<em class="muted">（不勾 = 拒绝冲突行，绝不覆盖别的学科的题）</em></span>
+        </label>
+        <label class="check">
+          <input type="checkbox" name="confirm" id="confirm-box" value="1">
+          <span>确认导入<em class="muted">（不勾 = 只校验；docx 全量重建必须勾）</em></span>
+        </label>
+      </div>
+
+      <div class="form-actions">
+        <span class="muted">预览只读文件、不写库；确认导入才真正落库。</span>
+        <button class="btn btn-primary" type="submit" id="submit-btn">开始校验</button>
+      </div>
+    </form>
+  </section>
+
+  {# ---------------------------------------------------------------- 预览态 #}
+  {% if report and report.dry_run %}
+  <section class="card" id="panel-preview">
+    <h2>2. 校验预览（还没写库）</h2>
+    <div class="stat-row">
+      <div class="stat"><b>{{ report.total | num }}</b><span>文件总行数</span></div>
+      {# total/failed 可能都为 0（认不出格式、空文件）→ 合法行不能算成负数 #}
+      {% set ok_rows = [((report.total or 0) - (report.failed or 0)), 0] | max %}
+      <div class="stat ok"><b>{{ ok_rows | num }}</b><span>合法行</span></div>
+      <div class="stat {{ 'bad' if report.failed else '' }}"><b>{{ report.failed | num }}</b><span>问题行</span></div>
+      <div class="stat warn"><b>{{ report.skipped | num }}</b><span>已存在跳过（会更新变化行）</span></div>
+    </div>
+
+    {% set rows = report.get('items') if report.get is defined else report['items'] %}
+    {% if rows %}
+    <h3 style="font-size:15px;margin:14px 0 6px">前 20 行预览</h3>
+    <div class="table-scroll">
+      <table class="imp-table">
+        <thead><tr><th>行号</th><th>题号</th><th>题型</th><th>题干摘要</th><th>答案</th><th>状态</th></tr></thead>
+        <tbody>
+          {% for it in rows[:20] %}
+          <tr>
+            <td class="num">{{ it.line or loop.index }}</td>
+            <td class="mono">{{ it.no or '—' }}</td>
+            <td>{{ it.qtype or '—' }}</td>
+            <td class="stem-cell">{{ (it.stem or '')[:60] }}{% if (it.stem or '')|length > 60 %}…{% endif %}</td>
+            <td class="mono">{{ it.answer or '—' }}</td>
+            <td>{% if it.error %}<span class="pill pill-warn">坏行</span>{% else %}<span class="pill pill-ok">可导入</span>{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="field-hint">本次只回传了统计与问题行（逐行预览由后端可选提供）。合法行 {{ ok_rows | num }} 行会按下面的问题清单修完后一起导入。</p>
+    {% endif %}
+
+    {# t88：ZIP 带图导入的结果 —— 图片张数 / 未匹配 / 仍缺图 #}
+    {% if report.format == 'zip' or report.get('figures_saved') is not none and report.get('figures_saved') is defined %}
+    {% set f_saved = report.get('figures_saved') or 0 %}
+    {% set f_skip = report.get('figures_skipped') or 0 %}
+    {% set f_bad = report.get('figures_unmatched_count') or 0 %}
+    {% set f_miss = report.get('figures_still_missing_count') or 0 %}
+    {% if f_saved or f_skip or f_bad or f_miss %}
+    <div class="banner banner-warn" role="status" style="margin-top:12px">
+      <div class="banner-head"><span class="banner-dot" aria-hidden="true"></span>
+        图片导入：落盘 <b>{{ f_saved }}</b> 张{% if f_skip %}、重复跳过 {{ f_skip }} 张{% endif %}{% if f_bad %}、未匹配 {{ f_bad }} 个{% endif %}{% if f_miss %}、仍缺图 {{ f_miss }} 道{% endif %}
+      </div>
+      {% if report.get('figures_unmatched') %}
+      <p class="banner-text muted">未匹配的文件：<span class="mono">{% for u in report.get('figures_unmatched')[:10] %}{{ u.file }}（{{ u.reason }}）{% if not loop.last %}；{% endif %}{% endfor %}</span></p>
+      {% endif %}
+      {% if report.get('figures_still_missing') %}
+      <p class="banner-text muted">仍缺图题号：<span class="mono">{{ report.get('figures_still_missing') | join("、") }}</span> —— 检查文件名是否以题号开头（如 <span class="mono">00004.png</span>）。</p>
+      {% endif %}
+      <p class="banner-text muted">图片存在 <span class="mono">data/figures/&lt;学科&gt;/&lt;题号&gt;/</span>，卷面会按题号取图印出来。</p>
+    </div>
+    {% endif %}
+    {% endif %}
+
+    {% if report.fig_missing %}
+    <div class="banner banner-warn" role="status" style="margin-top:12px">
+      <div class="banner-head"><span class="banner-dot" aria-hidden="true"></span>
+        含图题缺图 {{ report.fig_missing }} 道（题干提到「如图／如图所示的图像」但没有图片）</div>
+      <p class="banner-text"><strong>这些题组卷时会被自动跳过</strong>，不会出现在卷子上（学生看不到图就没法做）。</p>
+      {% if report.fig_missing_nos %}
+      <p class="banner-text muted">缺图题号：<span class="mono">{{ report.fig_missing_nos | join("、") }}</span>{% if report.fig_missing > (report.fig_missing_nos | length) %} …还有 {{ report.fig_missing - (report.fig_missing_nos | length) }} 题{% endif %}</p>
+      {% endif %}
+      <p class="banner-text muted">想把这些题用上：把图片一起导入（表格加「图片」列 / JSON 的 figures），或把题干里的「如图」改掉。</p>
+    </div>
+    {% endif %}
+
+    {% if report.errors %}
+    <h3 style="font-size:15px;margin:14px 0 6px">问题行（共 {{ report.errors | length }} 条）</h3>
+    <div class="table-scroll">
+      <table class="imp-table">
+        <thead><tr><th>行号</th><th>原因</th></tr></thead>
+        <tbody>
+          {% for e in report.errors[:20] %}
+          <tr><td class="num">{{ e.line if e.line is defined and e.line else '—' }}</td>
+              <td>{{ e.reason }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if report.errors | length > 20 %}
+    <p class="field-hint">还有 {{ (report.errors | length) - 20 }} 条没列出来，下载 JSON 报告可看全部。</p>
+    {% endif %}
+    {% endif %}
+
+    <div class="form-actions">
+      <a class="btn" href="/import">重新选择文件</a>
+      <a class="btn" href="/import/report.json" target="_blank" rel="noopener">JSON 报告</a>
+      <button class="btn btn-primary" type="button" id="confirm-btn">确认导入</button>
+      <span class="muted" id="confirm-hint">确认后才会写库；文件已保留在本页，不用重新选。</span>
+    </div>
+  </section>
+  {% endif %}
+
+  {# ---------------------------------------------------------------- 报告态 #}
+  {% if report and not report.dry_run %}
+  <section class="card" id="panel-report">
+    <h2>导入报告</h2>
+    <div class="stat-row">
+      <div class="stat ok"><b>{{ report.inserted | num }}</b><span>新增</span></div>
+      <div class="stat"><b>{{ report.updated | num }}</b><span>更新</span></div>
+      <div class="stat warn"><b>{{ report.skipped | num }}</b><span>已存在跳过（内容相同）</span></div>
+      <div class="stat {{ 'bad' if report.failed else '' }}"><b>{{ report.failed | num }}</b><span>失败</span></div>
+    </div>
+    <dl class="kv">
+      <dt>格式</dt><dd>{{ report.format or '—' }}</dd>
+      <dt>耗时</dt><dd>{{ report.elapsed_s }} 秒</dd>
+      <dt>写库</dt><dd>{% if report.dry_run %}否（只校验）{% else %}是{% endif %}</dd>
+      <dt>题库</dt><dd class="mono">{{ report.db_path }}</dd>
+    </dl>
+
+    {# 按学科分组：by_subject = {subject_pk: {inserted, skipped, failed}}；缺失/空/非 dict 都不渲染 #}
+    {% if report.fig_missing %}
+    <div class="banner banner-warn" role="status" style="margin-top:12px">
+      <div class="banner-head"><span class="banner-dot" aria-hidden="true"></span>
+        含图题缺图 {{ report.fig_missing }} 道（题干提到「如图／如图所示的图像」但没有图片）</div>
+      <p class="banner-text"><strong>这些题组卷时会被自动跳过</strong>，不会出现在卷子上（学生看不到图就没法做）。</p>
+      {% if report.fig_missing_nos %}
+      <p class="banner-text muted">缺图题号：<span class="mono">{{ report.fig_missing_nos | join("、") }}</span>{% if report.fig_missing > (report.fig_missing_nos | length) %} …还有 {{ report.fig_missing - (report.fig_missing_nos | length) }} 题{% endif %}</p>
+      {% endif %}
+      <p class="banner-text muted">想把这些题用上：把图片一起导入（表格加「图片」列 / JSON 的 figures），或把题干里的「如图」改掉。</p>
+    </div>
+    {% endif %}
+
+    {% set bs = report.by_subject if report.by_subject is defined else none %}
+    {% if bs is mapping and bs %}
+    <h3 style="font-size:15px;margin:16px 0 6px">按学科</h3>
+    <div class="table-scroll">
+      <table class="imp-table">
+        <thead><tr><th>学科</th><th>新增</th><th>跳过</th><th>失败</th></tr></thead>
+        <tbody>
+          {% for pk, st in bs.items() %}
+          {% set ns = namespace(label=pk) %}
+          {% for s in subjects %}
+            {% if s.subject_pk == pk %}
+              {% set ns.label = ((s.name or '') ~ ' ' ~ (s.grade or '') ~ ' ' ~ (s.version or '')).strip() %}
+            {% endif %}
+          {% endfor %}
+          <tr>
+            <td>{{ ns.label }}</td>
+            <td>{{ (st.inserted or 0) | num if st is mapping else '—' }}</td>
+            <td>{{ (st.skipped or 0) | num if st is mapping else '—' }}</td>
+            <td>{{ (st.failed or 0) | num if st is mapping else '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+
+    {% if report.errors %}
+    <details class="fold">
+      <summary>错误明细（{{ report.errors | length }} 条，点开看）</summary>
+      <div class="table-scroll">
+        <table class="imp-table">
+          <thead><tr><th>行号</th><th>原因</th></tr></thead>
+          <tbody>
+            {% for e in report.errors %}
+            <tr><td class="num">{{ e.line if e.line is defined and e.line else '—' }}</td>
+                <td>{{ e.reason }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+    {% endif %}
+
+    <div class="form-actions">
+      <button class="btn btn-primary" type="button" id="again-btn">再导一次</button>
+      <a class="btn" href="/import/report.json" target="_blank" rel="noopener">下载 JSON 报告</a>
+      <a class="btn" href="/">回组卷页</a>
+    </div>
+  </section>
+  {% endif %}
+
+  {% if not report %}
+  <section class="card">
+    <h2>文件格式怎么排</h2>
+    <p class="muted" style="margin-top:0">
+      CSV / Excel 第一行是表头，至少要有 <span class="mono">题号</span>、<span class="mono">题型</span>、
+      <span class="mono">题干</span>、<span class="mono">答案</span> 四列；选项可以拆成 A/B/C/D 四列，
+      也可以一列里用竖线：<span class="mono">A．1|B．2|C．3|D．4</span>。
+    </p>
+    <p class="muted">JSON 用 <span class="mono">{"items": [...]}</span> 或裸数组；每题字段：
+      <span class="mono">no / qtype / stem / options / answer / analysis / kp_id / chapter</span>。
+      表头别名（题号/编号、题型/类型、题干/题目、答案/正确答案、解析、知识点/考点、章节、图片）都认。</p>
+    {% if subjects %}
+    <p class="muted">已有学科：{% for s in subjects %}<span class="pill">{{ s.name }} {{ s.grade }} {{ s.version }}</span> {% endfor %}</p>
+    {% endif %}
+    {% if last_report %}
+    <p class="field-hint">上一次导入：{{ last_report.inserted | num }} 新增 / {{ last_report.updated | num }} 更新 /
+      {{ last_report.failed | num }} 失败（{{ last_report.format or '—' }}）。</p>
+    {% endif %}
+  </section>
+  {% endif %}
+</main>
+
+<footer class="footer">
+  <span>题库组卷 · 答题卡生成 · 拍照判卷 · 错题训练</span>
+  <span class="mono">本地运行，数据不出机器</span>
+</footer>
+
+<div class="busy-mask" id="busy" aria-live="polite">
+  <div class="busy-box">
+    <div class="busy-spin" aria-hidden="true"></div>
+    <div class="busy-title">正在校验…</div>
+    <div class="busy-hint">大文件要十几秒，请勿重复点击或关闭页面。</div>
+  </div>
+</div>
+
+<script>
+/* 「复制提示词」：优先 navigator.clipboard，失败回退「选中 + execCommand」，都失败就提示手动复制 */
+(function () {
+  var btn = document.getElementById('copy-prompt');
+  var box = document.getElementById('ai-prompt');
+  var fb = document.getElementById('copy-feedback');
+  if (!btn || !box) { return; }
+
+  function feedback(msg) { if (fb) { fb.textContent = msg; } }
+
+  function fallbackCopy() {
+    try {
+      box.removeAttribute('readonly');
+      box.focus();
+      box.select();
+      if (box.setSelectionRange) { box.setSelectionRange(0, box.value.length); }
+      var ok = document.execCommand ? document.execCommand('copy') : false;
+      box.setAttribute('readonly', 'readonly');
+      return !!ok;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  btn.addEventListener('click', function () {
+    var text = box.value || '';
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        feedback('已复制 ' + text.length + ' 个字符，去贴给 AI 吧');
+      }).catch(function () {
+        feedback(fallbackCopy() ? '已复制（回退方式）' : '复制失败：请手动全选下面的提示词再复制');
+      });
+    } else {
+      feedback(fallbackCopy() ? '已复制（回退方式）' : '复制失败：请手动全选下面的提示词再复制');
+    }
+  });
+})();
+</script>
+
+<script>
+(function () {
+  var form = document.getElementById('import-form');
+  var input = document.getElementById('qfile');
+  var drop = document.getElementById('drop');
+  var picked = document.getElementById('picked-name');
+  var busy = document.getElementById('busy');
+  var confirmBox = document.getElementById('confirm-box');
+  var dryBox = document.getElementById('dry-run');
+  var keep = null;                 // 本页保留的文件，供「确认导入」复用
+
+  function showBusy() { if (busy) { busy.classList.add('show'); } }
+
+  function setPicked(file) {
+    if (!file) { return; }
+    keep = file;
+    if (picked) { picked.textContent = '已选：' + file.name + '（' + Math.round(file.size / 1024) + ' KB）'; }
+    if (drop) { drop.classList.add('has-file'); }
+  }
+
+  if (input) {
+    input.addEventListener('change', function () {
+      setPicked(input.files && input.files[0]);
+    });
+  }
+  if (drop) {
+    ['dragenter', 'dragover'].forEach(function (ev) {
+      drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.add('has-file'); });
+    });
+    ['dragleave', 'drop'].forEach(function (ev) {
+      drop.addEventListener(ev, function (e) { e.preventDefault(); });
+    });
+    drop.addEventListener('drop', function (e) {
+      var file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (!file || !input) { return; }
+      try {
+        var dt = new DataTransfer();
+        dt.items.add(file);
+        input.files = dt.files;
+      } catch (err) { /* 老浏览器：保留在 keep 里，确认时再塞回 */ }
+      setPicked(file);
+    });
+  }
+
+  var confirmBtn = document.getElementById('confirm-btn');
+  if (confirmBtn) {
+    confirmBtn.addEventListener('click', function () {
+      if (!form) { return; }
+      if (dryBox) { dryBox.checked = false; }
+      if (confirmBox) { confirmBox.checked = true; }
+      // 把保留的文件塞回 input（两步式：确认时要把文件再提交一次）
+      if (input && keep) {
+        try {
+          var dt2 = new DataTransfer();
+          dt2.items.add(keep);
+          input.files = dt2.files;
+        } catch (err) { /* 下面按有没有文件给出提示 */ }
+      }
+      if (input && (!input.files || !input.files.length)) {
+        var hint = document.getElementById('confirm-hint');
+        if (hint) {
+          hint.textContent = '浏览器没保留文件：请点「重新选择文件」，选同一个文件后勾「确认导入」再提交。';
+          hint.className = 'inline-note';
+        }
+        var up = document.getElementById('panel-upload');
+        if (up) { up.hidden = false; up.scrollIntoView({ behavior: 'smooth' }); }
+        return;
+      }
+      showBusy();
+      form.submit();
+    });
+  }
+
+  if (form) {
+    form.addEventListener('submit', function () {
+      if (input && input.files && input.files.length) { setPicked(input.files[0]); }
+      showBusy();
+    });
+  }
+
+  var again = document.getElementById('again-btn');
+  if (again) {
+    again.addEventListener('click', function () {
+      var up = document.getElementById('panel-upload');
+      var rep = document.getElementById('panel-report');
+      if (rep) { rep.hidden = true; }
+      if (up) { up.hidden = false; up.scrollIntoView({ behavior: 'smooth' }); }
+      if (form) { form.reset(); }
+      if (picked) { picked.textContent = '还没选文件'; }
+      if (drop) { drop.classList.remove('has-file'); }
+    });
+  }
+})();
+</script>
+</body>
+</html>

@@ -17,17 +17,12 @@
         <small>{{ brand_sub }}</small>
       </span>
     </a>
-    <nav class="nav" aria-label="主导航">
-      {% for item in nav %}
-        {% if item.enabled %}
-        <a class="nav-item{% if item.key == nav_active %} is-active{% endif %}" href="{{ item.href }}"
-           {% if item.key == nav_active %}aria-current="page"{% endif %}>{{ item.label }}</a>
-        {% else %}
-        <span class="nav-item is-soon" aria-disabled="true" title="{{ item.soon_hint }}">{{ item.label }}<i class="badge">未启用</i></span>
-        {% endif %}
-      {% endfor %}
-    </nav>
-    <a class="ghost-link mono" href="/healthz" target="_blank" rel="noopener" title="自检数据（JSON）">healthz</a>
+    {# t100 · 导航 5 项 + 「更多 ▾」
+       一级只留天天用的：组卷 / 我的卷子 / 判卷 / 训练 / 设置；
+       其余（导入题库、顺序管理、使用指南、自检）收进「更多」，healthz 不再放导航。
+       NAV 数据源在 server.py（本任务 scope 外），所以这里按 key 分流，不改数据源。 #}
+    {% set nav_main = ["compose", "papers", "grade", "train", "settings"] %}
+    {% include "_nav.html" %}
   </div>
 </header>
 

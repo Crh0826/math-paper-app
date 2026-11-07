@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h1>顺序管理</h1>
+  <p class="muted">
+    组卷页的<strong>学科 / 年级下拉</strong>与<strong>单元列表</strong>都按这里的顺序显示。
+    用 ↑ ↓ 调整，改完点「保存顺序」；「恢复默认」按题库原始顺序重排。
+  </p>
+
+  {% if flash %}
+  <div class="banner {{ 'is-ok' if notice_tone == 'ok' else 'is-fail' }}" role="status">{{ flash }}</div>
+  {% endif %}
+
+  {% if not subjects %}
+  <p class="muted">题库里还没有学科信息（questions.subject_pk 为空），先在「导入题库」或「重建题库」里把学科导进来。</p>
+  {% else %}
+  <form method="post" action="/manage/order" id="order-form">
+    <input type="hidden" name="action" value="save">
+    <input type="hidden" name="subject_pk" value="{{ current }}">
+
+    <div class="grid grid-2">
+      <div class="order-col">
+        <h2>学科（{{ subjects | length }}）</h2>
+        <ol class="order-list" id="subject-list">
+          {% for s in subjects %}
+          <li class="order-item{% if s.subject_pk == current %} is-current{% endif %}" data-key="{{ s.subject_pk }}">
+            <span class="order-label">
+              <a href="/manage/order?subject_pk={{ s.subject_pk }}">{{ s.label }}</a>
+            </span>
+            <span class="order-btns">
+              <button type="button" class="btn btn-ghost ord-up" title="上移">↑</button>
+              <button type="button" class="btn btn-ghost ord-down" title="下移">↓</button>
+            </span>
+            <input type="hidden" name="subjects" value="{{ s.subject_pk }}">
+          </li>
+          {% endfor %}
+        </ol>
+        <p class="muted">点学科名切换右侧的单元列表。</p>
+      </div>
+
+      <div class="order-col">
+        <h2>单元（{{ current }}）</h2>
+        {% if chapters %}
+        <ol class="order-list" id="chapter-list">
+          {% for c in chapters %}
+          <li class="order-item" data-key="{{ c.chapter }}">
+            <span class="order-label">
+              {{ c.chapter }}
+              {% if not c.ordered %}<span class="muted">（未排序）</span>{% endif %}
+            </span>
+            <span class="order-btns">
+              <button type="button" class="btn btn-ghost ord-up" title="上移">↑</button>
+              <button type="button" class="btn btn-ghost ord-down" title="下移">↓</button>
+            </span>
+            <input type="hidden" name="chapters" value="{{ c.chapter }}">
+          </li>
+          {% endfor %}
+        </ol>
+        {% else %}
+        <p class="muted">这个学科还没有单元（questions.chapter 为空）。</p>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">保存顺序</button>
+      <button type="submit" form="reset-form" class="btn btn-ghost">恢复默认</button>
+    </div>
+  </form>
+
+  <form method="post" action="/manage/order" id="reset-form">
+    <input type="hidden" name="action" value="reset">
+    <input type="hidden" name="subject_pk" value="{{ current }}">
+  </form>
+  {% endif %}
+</section>
+<script>
+(function () {
+  function move(li, dir) {
+    if (!li) { return; }
+    var parent = li.parentNode;
+    if (!parent) { return; }
+    if (dir < 0) {
+      var prev = li.previousElementSibling;
+      if (prev) { parent.insertBefore(li, prev); }
+    } else {
+      var next = li.nextElementSibling;
+      if (next) { parent.insertBefore(next, li); }
+    }
+  }
+  ['subject-list', 'chapter-list'].forEach(function (id) {
+    var list = document.getElementById(id);
+    if (!list) { return; }
+    list.addEventListener('click', function (ev) {
+      var btn = ev.target.closest ? ev.target.closest('button') : null;
+      if (!btn) { return; }
+      if (btn.classList.contains('ord-up')) {
+        move(btn.closest('li'), -1);
+      } else if (btn.classList.contains('ord-down')) {
+        move(btn.closest('li'), 1);
+      }
+    });
+  });
+})();
+</script>
+{% endblock %}

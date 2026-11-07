@@ -167,5 +167,37 @@ class TestPreview(_Base):
         self.assertNotEqual(old["seed"], new["seed"], "换一套必须换 seed")
 
 
+class TestTrainSeed(_Base):
+    """训练卷走同一条路：留空=自动换，显式给 seed=可复现。"""
+
+    def make_paper(self):
+        return self.compose(seed="777")
+
+    def test_train_seed_auto(self):
+        pid = self.make_paper()
+        nos = self.nos_of(pid)[:2]
+        a = self.client.post("/train", data={"nos": ",".join(nos), "n_per": "2"},
+                             follow_redirects=False)
+        b = self.client.post("/train", data={"nos": ",".join(nos), "n_per": "2"},
+                             follow_redirects=False)
+        self.assertEqual(302, a.status_code, a.text[:300])
+        self.assertEqual(302, b.status_code, b.text[:300])
+        pa = self.params_of(a.headers["location"].rsplit("/", 1)[-1])
+        pb = self.params_of(b.headers["location"].rsplit("/", 1)[-1])
+        self.assertNotEqual(pa["seed"], pb["seed"], "训练卷留空 seed 也要每次不同")
+
+    def test_train_seed_fixed_is_reproducible(self):
+        pid = self.make_paper()
+        nos = self.nos_of(pid)[:2]
+        a = self.client.post("/train", data={"nos": ",".join(nos), "n_per": "2", "seed": "1234"},
+                             follow_redirects=False)
+        b = self.client.post("/train", data={"nos": ",".join(nos), "n_per": "2", "seed": "1234"},
+                             follow_redirects=False)
+        pid_a = a.headers["location"].rsplit("/", 1)[-1]
+        pid_b = b.headers["location"].rsplit("/", 1)[-1]
+        self.assertEqual(1234, self.params_of(pid_a)["seed"])
+        self.assertEqual(self.nos_of(pid_a), self.nos_of(pid_b), "同 seed 训练卷必须一致")
+
+
 if __name__ == "__main__":
     unittest.main()

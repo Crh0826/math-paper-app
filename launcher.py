@@ -11,8 +11,9 @@
   然后把 ``paper.SRC_ROOT`` 指过去（卷面/保真体检要从原始 docx 取公式与图片）。
 * **起服务**：uvicorn 在工作线程里跑；端口被占自动 +1 重试；起来后再开浏览器
   （``MATH_NO_BROWSER=1`` 不自动开，命令行窗口也能看到地址）。
-* **局域网**：``--lan`` 或 ``MATHAPP_LAN=1`` → 绑 0.0.0.0 并保证有 4 位访问码（复用 server 实现），
-  打印手机可访问的地址；本机 127.0.0.1 永远免访问码。
+* **一套程序**（t75）：绑定地址只看 ``config.json`` 的 ``server.host``（默认 ``0.0.0.0``），
+  不再由 ``--lan`` 决定；局域网能不能进由**设置页的「局域网访问」开关 + 访问码**控制，
+  本机 127.0.0.1 永远免访问码。``--lan`` 保留为兼容（等价于「启动时把开关打开」）。
 * **降级提示**：没装 Word 只提示「卷面 docx 仍在，PDF 会降级」，不退出（组卷/判卷照常用）。
 * **--check**：只体检打印（题库/数据库/配置/Word/端口），不启服务，方便排查与冒烟。
 """
@@ -451,11 +452,22 @@ def _load_cfg(config_path: str, host_override: str = None, port_override: int = 
         os.environ["MATH_APP_HOST"] = str(host_override)
     if port_override:
         os.environ["MATH_APP_PORT"] = str(port_override)
-    if lan:
-        os.environ["MATHAPP_LAN"] = "1"
     import server  # noqa: PLC0415
 
+    if lan:
+        # t75 兼容：--lan 不再决定绑定地址，只等价于「把设置里的局域网开关打开」
+        os.environ["MATHAPP_LAN"] = "1"
+        try:
+            server.save_server_settings(config_path, lan_enabled=True)
+        except Exception:          # noqa: BLE001 - 配置只读也不挡启动（env 兜底）
+            pass
     return server.load_server_config(config_path)
+
+
+def server_is_lan_host(host: str) -> bool:
+    """给提示用：这个绑定地址能不能被同 WiFi 的手机访问到。"""
+    text = str(host or "").strip()
+    return text not in ("", "127.0.0.1", "localhost", "::1", "0:0:0:0:0:0:0:1")
 
 
 def _pick_port(host: str, want: int, attempts: int = 20) -> int:
@@ -504,9 +516,9 @@ def serve(app, host: str, port: int, open_url: str | None = None,
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="数学题库工作台", description="题库组卷 · 答题卡生成 · 拍照判卷 · 错题训练（便携版）")
-    parser.add_argument("--host", default=None, help="监听地址（默认读 config.json；--lan 用 0.0.0.0）")
+    parser.add_argument("--host", default=None, help="监听地址（默认读 config.json 的 server.host，缺省 0.0.0.0）")
     parser.add_argument("--port", type=int, default=None, help="端口（默认 8710；被占自动 +1）")
-    parser.add_argument("--lan", action="store_true", help="开放到局域网（手机拍照判卷用，需访问码）")
+    parser.add_argument("--lan", action="store_true", help="兼容旧命令：等价于打开设置里的「局域网访问」开关（访问码照旧）")
     parser.add_argument("--no-browser", action="store_true", help="不自动开浏览器")
     parser.add_argument("--db", default=None, help="指定 app.db（默认程序目录 data/app.db）")
     parser.add_argument("--config", default=None, help="指定 config.json")
@@ -540,7 +552,11 @@ def main(argv=None) -> int:
     _ensure_out_dir(info["out"])
 
     cfg = _load_cfg(info["config"], args.host or None, args.port, args.lan)
-    host = "0.0.0.0" if args.lan else cfg["host"]
+    # t75：一套程序 —— 绑定地址只看 config.server.host（默认 0.0.0.0），--lan 不再改它
+    host = args.host or cfg["host"]
+    if args.lan and not server_is_lan_host(host):
+        _say("  [!] --lan 已兼容为「打开局域网开关」，但 config.server.host=%s 只监听本机；" % host)
+        _say("      想让手机能连：把 config.json 的 server.host 改成 0.0.0.0，或启动加 --host 0.0.0.0。")
     pin = ""
     if cfg.get("lan"):
         try:

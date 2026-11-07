@@ -11,7 +11,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from families import family_key, parse_label  # noqa: E402
 
-JSONL = r"E:\OCR\dedup\data\questions.jsonl"
+try:
+    import build_db as _bdb
+    JSONL = _bdb.JSONL          # 跟着 paths 走（题库搬进 qbank 后不再写死 E:\OCR\dedup）
+except Exception:               # noqa: BLE001
+    JSONL = r"E:\OCR\dedup\data\questions.jsonl"
 
 
 class TestParseLabel(unittest.TestCase):

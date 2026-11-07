@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import importlib.metadata as metadata
+import json
 import importlib.util
 import os
 import re
@@ -152,12 +153,26 @@ class TestStartBat(unittest.TestCase):
         self.assertIn("python -m uvicorn server:app", self.text)
         self.assertNotRegex(self.text, r"(?m)^\s*uvicorn\s+server:app")
 
-    def test_defaults_to_loopback_8710(self):
-        # 默认必须只监听本机（安全）；LAN 模式由 start.bat lan / start_lan.bat 显式打开
-        self.assertIn('set "HOST=127.0.0.1"', self.text)
+    def test_host_matches_config_example(self):
+        # 一套程序：start.bat 的监听地址必须与 config.example.json 的 server.host 一致。
+        # 「能不能从局域网进来」不看监听地址，看设置里的运行时开关（见下一条）。
+        m = re.search(r'set "HOST=([0-9.]+)"', self.text)
+        self.assertIsNotNone(m, "start.bat 要显式设置 HOST")
+        bat_host = m.group(1)
+        with open(os.path.join(APP_DIR, "config.example.json"), encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        self.assertEqual(cfg["server"]["host"], bat_host,
+                         "start.bat 的 HOST 要和 config.example.json 的 server.host 一致")
         self.assertIn("--host %HOST% --port 8710", self.text)
         self.assertIn("http://127.0.0.1:8710", self.text)
-        self.assertIn('if /i "%MATHAPP_LAN%"=="1" set "HOST=0.0.0.0"', self.text)
+
+    def test_lan_is_runtime_switch_not_host(self):
+        # 监听地址不再随 MATHAPP_LAN 变；MATHAPP_LAN 只等价于「设置里把开关点开」
+        self.assertNotIn('if /i "%MATHAPP_LAN%"=="1" set "HOST=0.0.0.0"', self.text,
+                         "监听地址不该再随 MATHAPP_LAN 改")
+        self.assertIn('if /i "%~1"=="lan" set "MATHAPP_LAN=1"', self.text)
+        self.assertIn("默认只允许本机", self.text, "注释要写清「监听 0.0.0.0 不等于允许访问」")
+        self.assertIn("局域网访问", self.text, "要指到设置里的开关")
 
     def test_opens_browser_after_start(self):
         self.assertIn("webbrowser.open", self.text)

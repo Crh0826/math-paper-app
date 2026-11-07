@@ -47,18 +47,11 @@
     });
   });
 
-  /* 3) 「刷新可出题量」：把当前勾选范围拼进查询串，重新算一遍 count_available */
-  var refreshCounts = $("#refresh-counts");
-  if (refreshCounts && form) {
-    refreshCounts.addEventListener("click", function () {
-      var data = new FormData(form);
-      var params = new URLSearchParams();
-      ["chapters", "kps", "kp_mode", "need_answer", "seed", "title"].forEach(function (key) {
-        data.getAll(key).forEach(function (value) { params.append(key, value); });
-      });
-      window.location.assign("/?" + params.toString() + "#range");
-    });
-  }
+  /* 3) 「刷新可出题量」：t80 起这段整页跳转已彻底删除。
+        原因：旧代码把表单参数拼成查询串整页重载，却不带 subject_pk，
+        重载后学科被重置（用户看到的「一点就跳回数学」）。
+        现在刷新由 templates/index.html 里的就地 fetch(/api/available) 负责，
+        本文件不再做任何整页跳转（回归断言见 tests/test_compose_buttons.py）。 */
 
   /* 4) 建卷要等十几秒：提交后按钮置灰 + 拉起遮罩；返回/错误页时遮罩必须能消失 */
   var overlay = $("#compose-overlay");

@@ -24,7 +24,11 @@ import secrets
 import shutil
 import sqlite3
 import sys
+from urllib.parse import quote_plus
+
+import db as dbmod
 import tempfile
+import threading
 import time
 import traceback
 from typing import Iterable
@@ -67,7 +71,8 @@ APP_SUBTITLE = "沪科版七年级上 · 本地运行"
 APP_TITLE = "题库组卷 · 答题卡生成 · 拍照判卷 · 错题训练"
 APP_VERSION = "0.1.0"
 
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"          # t75：一套程序，默认监听所有网卡；
+                              # 谁能访问由「设置 · 局域网访问」开关 + PIN 决定（回环永远放行）
 PORT = 8710
 
 STARTED_AT = time.time()
@@ -80,6 +85,8 @@ NAV = (
     {"key": "papers", "label": "我的卷子", "href": "/papers", "enabled": True, "soon_hint": ""},
     {"key": "grade", "label": "判卷", "href": "/submissions", "enabled": True, "soon_hint": ""},
     {"key": "train", "label": "训练", "href": "/train", "enabled": True, "soon_hint": ""},
+    {"key": "order", "label": "顺序管理", "href": "/manage/order", "enabled": True,
+     "soon_hint": ""},
     {"key": "settings", "label": "设置", "href": "/settings", "enabled": True, "soon_hint": ""},
     {"key": "guide", "label": "使用指南", "href": "/guide", "enabled": True, "soon_hint": ""},
     {"key": "health", "label": "自检", "href": "/health", "enabled": True, "soon_hint": ""},
@@ -198,6 +205,15 @@ def read_kps(conn: sqlite3.Connection, subject_pk: str = "") -> list[dict]:
         args.append(str(subject_pk))
     sql += " ORDER BY chapter, kp_id"
     rows = conn.execute(sql, args).fetchall()
+    # t69：章节按「顺序管理」页排的顺序（没排过的按原 SQL 顺序跟在后面）
+    if subject_pk:
+        try:
+            ranked = {it["chapter"]: i for i, it in enumerate(
+                dbmod.list_chapters_ordered(conn, subject_pk))}
+            rows = sorted(rows, key=lambda r: (ranked.get(r["chapter"] or "未分章", 10 ** 6),
+                                               str(r["chapter"] or ""), str(r["kp_id"] or "")))
+        except Exception:      # noqa: BLE001 - 老库/裸库没有 chapter_order 就保持原顺序
+            pass
     out = []
     for r in rows:
         out.append({
@@ -224,7 +240,8 @@ def read_subjects(conn: sqlite3.Connection) -> list[dict]:
         FROM questions q
         LEFT JOIN subjects s ON s.subject_pk = q.subject_pk
         GROUP BY q.subject_pk
-        ORDER BY n DESC, q.subject_pk
+        ORDER BY CASE WHEN COALESCE(s.sort_order, 0) > 0 THEN 0 ELSE 1 END,
+                 COALESCE(s.sort_order, 0), n DESC, q.subject_pk
     """
     try:
         rows = conn.execute(sql).fetchall()
@@ -568,14 +585,32 @@ def lan_ip() -> str | None:
     return best
 
 
-def load_server_config(config_path: str | None = None) -> dict:
-    """host/port/pin 从 config.json 的 server 段读；环境变量优先；默认 127.0.0.1:8710。
+def valid_pin(pin) -> bool:
+    """访问码：4-6 位纯数字。"""
+    text = str(pin or "").strip()
+    return 4 <= len(text) <= 6 and text.isdigit()
 
-    LAN 判定：`MATHAPP_LAN=1` 或 host 不是 loopback —— 两种情况都算「对外开放」，
-    此时必须启用访问码（pin），否则同一 WiFi 下谁都能翻卷子和答案。
+
+def pin_tail(pin) -> str:
+    """掩码用：只露最后 2 位（“••••17”）。"""
+    text = str(pin or "")
+    if not text:
+        return ""
+    return "•" * max(0, len(text) - 2) + text[-2:]
+
+
+def load_server_config(config_path: str | None = None) -> dict:
+    """host/port/pin/lan_enabled 从 config.json 的 server 段读；环境变量优先。
+
+    t75：**一套程序**
+    * 绑定地址只看 `server.host`（默认 ``0.0.0.0``），不再由 ``--lan`` 决定；
+    * 局域网能不能访问，看运行时开关 `server.lan_enabled`（默认关）——
+      关：非回环一律 403；开：非回环要 PIN。回环（127.0.0.1）永远放行；
+    * 兼容：`MATHAPP_LAN=1`（launcher ``--lan`` 走的就是它）等价于打开开关。
     """
     path = os.path.abspath(config_path or os.environ.get("MATH_APP_CONFIG") or DEFAULT_CONFIG)
     host, port, pin, error = HOST, PORT, "", None
+    lan_enabled = False
     if os.path.isfile(path):
         try:
             with open(path, encoding="utf-8") as fh:
@@ -584,6 +619,7 @@ def load_server_config(config_path: str | None = None) -> dict:
             host = str(server.get("host") or HOST)
             port = int(server.get("port") or PORT)
             pin = str(server.get("pin") or "").strip()
+            lan_enabled = _as_bool(server.get("lan_enabled"))
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             error = f"{exc.__class__.__name__}: {exc}"
     host = os.environ.get("MATH_APP_HOST") or host
@@ -592,9 +628,58 @@ def load_server_config(config_path: str | None = None) -> dict:
     except ValueError:
         pass
     lan_env = str(os.environ.get("MATHAPP_LAN") or "").strip().lower() in ("1", "true", "yes", "on")
-    lan = lan_env or is_lan_host(host)
+    lan = bool(lan_env or lan_enabled)
     return {"host": host, "port": port, "url": f"http://{host}:{port}/",
-            "lan": lan, "pin": pin, "config_path": path, "error": error}
+            "lan": lan, "lan_enabled": lan, "pin": pin,
+            "config_path": path, "error": error}
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def save_server_settings(config_path: str | None = None, **updates) -> dict:
+    """只改 config.json 的 ``server`` 段里的指定键（其它键/其它段原样保留）。
+
+    * 写前留 ``config.json.bak``（与设置页保存 OCR Key 的口径一致）；
+    * 文件不存在就新建；返回写后的 server 段。
+    """
+    path = os.path.abspath(config_path or os.environ.get("MATH_APP_CONFIG") or DEFAULT_CONFIG)
+    raw = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = json.load(fh) or {}
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    server = raw.get("server") if isinstance(raw.get("server"), dict) else {}
+    for key, value in (updates or {}).items():
+        if value is None:
+            continue
+        server[key] = value
+    raw["server"] = server
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if os.path.isfile(path):
+        try:
+            shutil.copyfile(path, path + ".bak")
+        except OSError:
+            pass
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(raw, fh, ensure_ascii=False, indent=2)
+    return dict(server)
+
+
+def firewall_hint(port: int = None) -> str:
+    """Windows 防火墙放行命令（设置页一键复制）。"""
+    return ('netsh advfirewall firewall add rule name="math-paper-app %d" '
+            'dir=in action=allow protocol=TCP localport=%d'
+            % (int(port or PORT), int(port or PORT)))
 
 
 def lan_url(port: int | None = None, pin: str = "") -> str | None:
@@ -961,6 +1046,52 @@ def collect_health(db_path: str, config_path: str | None = None,
     }
 
 
+#: 打印相关默认值：校准页**默认不打印**（省纸；只在换打印机/调边距时临时打开）
+PRINT_DEFAULTS = {"include_calibration": False}
+
+_TRUTHY = {"1", "true", "on", "yes", "y", "t"}
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    """config 里的开关：字符串/数字都认，认不出来回落 default（脏值绝不抛）。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value == 1
+    text = str(value).strip().lower()
+    if text in _TRUTHY:
+        return True
+    if text in ("0", "false", "off", "no", "n", "f", ""):
+        return False
+    return default
+
+
+def load_print_config(config_path: str | None = None) -> dict:
+    """读 config.json 的 ``print`` 段 → ``{"include_calibration": bool}``。
+
+    * 没配 / 配成垃圾值 → **False**（默认不打印校准页，与用户预期一致）
+    * 配置坏了也不抛：返回默认值，设置页照常能开
+    """
+    out = dict(PRINT_DEFAULTS)
+    path = os.path.abspath(config_path or os.environ.get("MATH_APP_CONFIG") or DEFAULT_CONFIG)
+    if not os.path.isfile(path):
+        return out
+    try:
+        with open(path, encoding="utf-8") as fh:
+            cfg = json.load(fh) or {}
+    except (OSError, ValueError):
+        return out
+    if not isinstance(cfg, dict):
+        return out
+    sect = cfg.get("print")
+    if isinstance(sect, dict) and "include_calibration" in sect:
+        out["include_calibration"] = _as_bool(sect.get("include_calibration"),
+                                              PRINT_DEFAULTS["include_calibration"])
+    return out
+
+
 def _now_iso() -> str:
     return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -1027,7 +1158,8 @@ def _values_from_pairs(pairs, *, need_answer_default: bool = True) -> dict:
 
     kp_mode = one("kp_mode", "any").strip().lower()
     return {
-        "title": (one("title").strip() or "七年级数学 · 训练卷 A")[:80],
+        # t72：标题留空就交给 _auto_title（学科/年级/版本）生成，不再写死「七年级数学 · 训练卷 A」
+        "title": one("title").strip()[:80],
         "seed": seed,
         "seed_text": seed_text,
         "n_choice": num("n_choice", 10),
@@ -1074,6 +1206,10 @@ def _params_from_values(values: dict) -> dict:
             if s not in merged:
                 merged.append(s)
         scope["subjects"] = merged
+    if not scope.get("subject_pk") and not scope.get("subjects"):
+        # t62：没选学科 = 数学（多学科库里必须有个默认，否则会跨科混卷）
+        scope["subject_pk"] = "math7a"
+        scope["subjects"] = ["math7a"]
     return {
         "title": values["title"],
         "mix": {qtype: int(values[field]) for qtype, field in MIX_FIELDS},
@@ -1087,6 +1223,38 @@ def _params_from_values(values: dict) -> dict:
     }
 
 
+def _subject_of_nos(conn, nos) -> str:
+    """错题里出现过的学科；唯一一个就按它，多个/没有就返回 ""。"""
+    nos = [str(n) for n in (nos or []) if str(n).strip()]
+    if not nos:
+        return ""
+    try:
+        marks = ",".join("?" * len(nos))
+        rows = conn.execute("SELECT DISTINCT COALESCE(subject_pk,'math7a') FROM questions"
+                            " WHERE no IN (%s)" % marks, nos).fetchall()
+        subs = [str(r[0]) for r in rows if r[0]]
+        return subs[0] if len(subs) == 1 else ""
+    except sqlite3.Error:
+        return ""
+
+
+def _filter_nos_by_subject(conn, nos, subject_pk: str) -> tuple:
+    """只留该学科的题号 → (kept, dropped)。"""
+    if not subject_pk or not nos:
+        return list(nos or []), []
+    try:
+        marks = ",".join("?" * len(nos))
+        rows = conn.execute(
+            "SELECT no, COALESCE(subject_pk,'math7a') FROM questions WHERE no IN (%s)"
+            % marks, list(nos)).fetchall()
+        by = {str(r[0]): str(r[1]) for r in rows}
+    except sqlite3.Error:
+        return list(nos), []
+    kept = [n for n in nos if by.get(str(n), subject_pk) == subject_pk]
+    dropped = [n for n in nos if by.get(str(n), subject_pk) != subject_pk]
+    return kept, dropped
+
+
 def _load_module(name: str):
     """按需 import 队友模块：起服务不依赖它们，缺了也能翻成友好错误页。"""
     import importlib
@@ -1094,15 +1262,142 @@ def _load_module(name: str):
     return importlib.import_module(name)
 
 
-def _count_available(conn, values: dict) -> dict:
-    """各题型「当前可出多少题」。mix 全 0 时给个哑 mix（count 只看 scope/requirements）。"""
+#: 可出题量缓存：真库 87,748 行算一次要 ~1.1 秒（picker 逐题型扫候选），
+#: 组卷页一加载就算一份，紧接着前端 /api/available 还会再问一次 —— 必须复用。
+_AVAIL_TTL = 60.0      # t73：导入后还要能立刻刷新，5 分钟太长
+_AVAIL_MAX = 128
+_AVAIL_CACHE: dict = {}
+_AVAIL_LOCK = threading.Lock()
+
+
+def clear_available_cache() -> int:
+    """清空「剩余题量」缓存（导入/重建后调用），返回清掉的条数。"""
+    with _AVAIL_LOCK:
+        n = len(_AVAIL_CACHE)
+        _AVAIL_CACHE.clear()
+    try:
+        _load_module("picker").clear_cache()      # picker 侧的 fig_missing 计数缓存
+    except Exception:  # noqa: BLE001 - picker 不在也不影响
+        pass
+    return n
+
+
+def _db_tag(conn) -> str:
+    try:
+        for row in conn.execute("PRAGMA database_list"):
+            if row[1] == "main":
+                return str(row[2] or "")
+    except sqlite3.Error:
+        pass
+    return ""
+
+
+def _avail_key(conn, values: dict):
+    return (_db_tag(conn), str(values.get("subject_pk") or ""),
+            tuple(sorted(str(c) for c in (values.get("chapters") or []))),
+            tuple(sorted(str(k) for k in (values.get("kps") or []))),
+            str(values.get("kp_mode") or "any"), bool(values.get("need_answer")))
+
+
+def _avail_cache_get(key):
+    now = time.time()
+    with _AVAIL_LOCK:
+        hit = _AVAIL_CACHE.get(key)
+        if hit and now - hit[0] < _AVAIL_TTL:
+            return dict(hit[1])
+        if hit:
+            _AVAIL_CACHE.pop(key, None)
+    return None
+
+
+def _avail_cache_put(key, counts: dict) -> None:
+    with _AVAIL_LOCK:
+        if len(_AVAIL_CACHE) >= _AVAIL_MAX:
+            oldest = min(_AVAIL_CACHE.items(), key=lambda kv: kv[1][0])[0]
+            _AVAIL_CACHE.pop(oldest, None)
+        _AVAIL_CACHE[key] = (time.time(), dict(counts))
+
+
+def clear_avail_cache() -> None:
+    with _AVAIL_LOCK:
+        _AVAIL_CACHE.clear()
+
+
+#: picker 的排除键 → 页面上给老师看的中文（内部键名不出现在页面上）
+EXCLUDE_LABELS = (
+    ("缺图", "fig_missing"),
+    ("体检不合格", "print_blocking"),
+    ("答案不匹配", "mismatch"),
+    ("严格模式挡掉", "strict"),
+)
+
+
+def _pool_payload(conn, values: dict) -> dict:
+    """一次算齐「可出题量 + 被排除明细」，同一缓存条目里两样都有。
+
+    picker.pool_report 本身就同时返回 available 与 excluded 四键，
+    以前只取 available、excluded 白算；「导入 23 题只剩 6 题」说不清楚就是这里丢的。
+    """
+    key = _avail_key(conn, values)
+    hit = _avail_cache_get(key)
+    if hit is not None and "available" in hit:
+        return hit
     params = _params_from_values(values)
     if sum(params["mix"].values()) <= 0:
         params["mix"] = {"选择": 1}
-    raw = _load_module("picker").count_available(conn, params)
-    data = raw.get("available") if isinstance(raw, dict) and "available" in raw else raw
-    return {str(k): int(v) for k, v in (data or {}).items()
-            if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    report = _load_module("picker").pool_report(conn, params) or {}
+    data = report.get("available") or {}
+    counts = {str(k): int(v) for k, v in data.items()
+              if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    excluded = {str(k): int(v or 0) for k, v in (report.get("excluded") or {}).items()}
+    payload = {"available": counts, "excluded": excluded}
+    _avail_cache_put(key, payload)
+    return payload
+
+
+def _count_available(conn, values: dict) -> dict:
+    """各题型「当前可出多少题」。mix 全 0 时给个哑 mix（count 只看 scope/requirements）。"""
+    return dict(_pool_payload(conn, values)["available"])
+
+
+def _fig_missing_nos(conn, values: dict, limit: int = 50) -> dict:
+    """本范围里「缺图」的题号（题干说如图但没图），最多给 limit 个 + 总数。
+
+    直接问 picker 要现成的缺图行（它已经按库缓存），再按 scope 过滤 —— 不重复实现过滤规则。
+    """
+    picker = _load_module("picker")
+    params = _params_from_values(values)
+    scope = params["scope"]
+    subs = list(scope.get("subjects") or [])
+    if not subs and scope.get("subject_pk"):
+        subs = [scope["subject_pk"]]
+    try:
+        rows = picker._fig_missing_rows(conn, subs)
+        nos = [str(r[0]) for r in rows
+               if picker._scope_hit(scope, r[2], r[3], r[4])]
+    except Exception:  # noqa: BLE001 - 列拿不全就给空，不影响主流程
+        traceback.print_exc()
+        return {"nos": [], "total": 0}
+    nos.sort()
+    return {"nos": nos[:limit], "total": len(nos)}
+
+
+def _excluded_detail(conn, values: dict) -> dict:
+    """被排除题的明细（中文标签 + 缺图题号），给组卷页与 /api/available 共用。"""
+    counts = _pool_payload(conn, values).get("excluded") or {}
+    rows = []
+    total = 0
+    for label, key in EXCLUDE_LABELS:
+        n = int(counts.get(key) or 0)
+        total += n
+        rows.append({"label": label, "count": n, "nos": [], "nos_total": 0})
+    if total:
+        fig = _fig_missing_nos(conn, values)
+        for row in rows:
+            if row["label"] == "缺图":
+                row["nos"] = fig["nos"]
+                row["nos_total"] = fig["total"]
+    return {"total": total, "rows": rows}
 
 
 def _connect_rw(db_path: str) -> sqlite3.Connection:
@@ -1366,7 +1661,8 @@ def _merge_pdfs(sources: list[str], target: str) -> None:
 def _defaults(stats: list[dict]) -> dict:
     mix = {s["qtype"]: s["default"] for s in stats}
     return {
-        "title": "七年级数学 · 训练卷 A",
+        # t72：兜底标题也按学科来（真正渲染前 _index_context 会换成当前学科的自动标题）
+        "title": "",
         "seed": None,
         "seed_text": "",
         "need_answer": True,
@@ -1380,6 +1676,102 @@ def _defaults(stats: list[dict]) -> dict:
     }
 
 
+#: 标题长度上限（卷面/答题卡页眉都是一行，太长会挤掉卷号）
+TITLE_LIMIT = 60
+
+
+def _truncate_title(text: str, limit: int = TITLE_LIMIT) -> str:
+    """超长截断，并去掉尾部的半个括号/分隔符（不许出现「（人教」这种残句）。"""
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    # 括号没闭合：把最后一个「（」连同后面一起砍掉
+    for opener, closer in (("（", "）"), ("(", ")")):
+        if cut.count(opener) > cut.count(closer):
+            pos = cut.rfind(opener)
+            if pos > 0:
+                cut = cut[:pos]
+    # 去掉尾部分隔符/标点/孤单的左括号
+    cut = cut.rstrip(" ·・,，、;；:：-—_/|（(")
+    return cut.strip()
+
+
+def _auto_title(subject_row: dict, chapters=None, limit: int = TITLE_LIMIT) -> str:
+    """按学科自动生成试卷标题：
+
+    * 基础：``{学科} {年级}``；有版本 → ``{学科} {年级}（{版本}）``
+      例：``英语 九年级上（人教版）``
+    * 只勾了 1 个单元 → 追加 `` · {单元名}``
+      例：``数学 七年级上（沪科版） · 第1章 有理数``
+    * 超过 ``limit`` 字截断且不留半个括号
+    """
+    row = dict(subject_row or {})
+    name = str(row.get("name") or row.get("subject_pk") or "").strip() or "试题"
+    grade = str(row.get("grade") or "").strip()
+    version = str(row.get("version") or "").strip()
+    base = name + ((" " + grade) if grade else "")
+    if version:
+        base += "（%s）" % version
+    picked = [str(c).strip() for c in (chapters or []) if str(c).strip()]
+    if len(picked) == 1:
+        base += " · " + picked[0]
+    return _truncate_title(base, limit)
+
+
+def _subject_row_of(conn, subject_pk: str) -> dict:
+    """按 subject_pk 取学科行（取不到就给一个能出人话的兜底，绝不抛）。"""
+    pk = str(subject_pk or "").strip()
+    if pk:
+        try:
+            row = conn.execute("SELECT subject_pk, name, grade, version FROM subjects"
+                               " WHERE subject_pk=?", (pk,)).fetchone()
+            if row is not None:
+                return dict(row)
+        except sqlite3.Error:
+            pass
+    return {"subject_pk": pk, "name": "数学", "grade": "七年级上", "version": "沪科版"}
+
+
+def _auto_title_for(conn, values: dict) -> str:
+    """表单值 → 自动标题（学科取 subject_pk，单元取 chapters 里勾的那些）。
+
+    用户要求「标题默认自动、序号自动递增」：同名标题已存在的，自动加 ``· 第 N 套``，
+    这样连出多张卷不会重名（第一张不带序号）。
+    """
+    base = _auto_title(_subject_row_of(conn, (values or {}).get("subject_pk")),
+                       (values or {}).get("chapters") or [])
+    used = 0
+    try:
+        used = conn.execute("SELECT COUNT(*) FROM papers WHERE title LIKE ?",
+                            (base + "%",)).fetchone()[0]
+    except sqlite3.Error:
+        used = 0
+    if not used:
+        return base
+    return _truncate_title("%s · 第 %d 套" % (base, used + 1))
+
+
+def _subject_groups(subject_rows: list) -> list:
+    """学科 → 年级/册次 的级联数据（组卷页两个下拉用）。"""
+    groups = {}
+    for row in subject_rows:
+        name = row.get("name") or row.get("subject_pk") or ""
+        groups.setdefault(name, []).append({
+            "subject_pk": row["subject_pk"],
+            "grade": row.get("grade") or "",
+            "version": row.get("version") or "",
+            "label": subject_label(row),
+            "n_questions": int(row.get("n_questions") or 0),
+        })
+    out = []
+    # t69：保持传入顺序（read_subjects 已按 sort_order 排好），不能按题量/字母重排
+    for name, grades in groups.items():
+        out.append({"name": name, "grades": grades,
+                    "n_questions": sum(g["n_questions"] for g in grades)})
+    return out
+
+
 def _index_context(dbp: str, values: dict | None = None) -> dict:
     """打开只读库，取选择器数据 + 各题型「可出多少题」；失败时抛给调用方翻成 banner。"""
     values = dict(values or _values_from_pairs([]))
@@ -1387,9 +1779,27 @@ def _index_context(dbp: str, values: dict | None = None) -> dict:
     warnings: list[dict] = []
     try:
         subject_rows = [{**s, "label": subject_label(s)} for s in read_subjects(conn)]
+        subject_groups = _subject_groups(subject_rows)
         # t11：学科下拉默认必选一个 —— 15 万题是 7 科混库，不选学科就会跨学科混卷
         if not values.get("subject_pk") and not values.get("subjects") and subject_rows:
-            values["subject_pk"] = subject_rows[0]["subject_pk"]
+            # t69：默认仍是数学（不因为老师调整了学科顺序就换默认卷别）
+            values["subject_pk"] = next(
+                (s["subject_pk"] for s in subject_rows if s["subject_pk"] == "math7a"),
+                subject_rows[0]["subject_pk"])
+        # t72：标题留空 → 按当前学科/单元自动填好（页面上直接能看见；提交时后端还会再兜一次）
+        if not str(values.get("title") or "").strip():
+            try:
+                row = conn.execute(
+                    "SELECT subject_pk, name, grade, version FROM subjects WHERE subject_pk=?",
+                    (values.get("subject_pk") or "",)).fetchone()
+                subject_row = dict(row) if row is not None else {}
+            except sqlite3.Error:
+                subject_row = {}
+            values["title"] = _auto_title(subject_row or
+                                          {"subject_pk": values.get("subject_pk") or "",
+                                           "name": "数学", "grade": "七年级上",
+                                           "version": "沪科版"},
+                                          values.get("chapters") or [])
         kps = read_kps(conn, values.get("subject_pk") or "")
         stats = read_qtype_stats(conn)
         n_questions = int(conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0])
@@ -1423,6 +1833,12 @@ def _index_context(dbp: str, values: dict | None = None) -> dict:
                     "算不出可出题量",
                     f"{exc.__class__.__name__}: {exc}",
                     ["先看自检页 /health：数据库是否正常、表是否齐"], code="count_failed"))
+        # t87：必须在 conn 关掉之前算（_index_context 是先 close 再 return 的）
+        try:
+            excluded_detail = _excluded_detail(conn, values)
+        except Exception:  # noqa: BLE001 - 算不出明细不该挡住组卷页，给个空壳
+            traceback.print_exc()
+            excluded_detail = {"total": 0, "rows": []}
         if not subject_rows:
             items_n = int(conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0])
             if items_n:
@@ -1449,7 +1865,16 @@ def _index_context(dbp: str, values: dict | None = None) -> dict:
         "defaults": _defaults(stats),
         "values": values,
         "subjects": subject_rows,
+        "subject_groups": subject_groups,
+        # t72：前端算「自动标题」要的学科元数据（pk → 学科/年级/版本）
+        "subject_meta_json": json.dumps(
+            {row["subject_pk"]: {"name": row.get("name") or "",
+                                 "grade": row.get("grade") or "",
+                                 "version": row.get("version") or ""}
+             for row in subject_rows}, ensure_ascii=False),
         "available": available,
+        # t87：被排除题的中文明细（缺图/体检不合格/答案不匹配…），组卷页要能解释「23 题只剩 6 题」
+        "excluded_detail": excluded_detail,
         "db_summary": {"questions": n_questions,
                        "kps": len(kps), "families": n_families},
         "warnings": warnings,
@@ -1582,23 +2007,29 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
     app.state.out_dir = out_root
     app.state.paper_renderer = paper_renderer
 
-    # 局域网模式：host 不是 loopback（或 MATHAPP_LAN=1）就算对外开放 —— 必须带访问码。
-    # 本地 127.0.0.1 永远免 pin，免得自己用着麻烦。
+    # t75：一套程序 —— 绑定地址只看 config.server.host；能不能从局域网进来由**运行时开关**决定。
+    # 设置页改开关/PIN 立即生效（改 app.state，写回 config.json），不用重启。
     server_cfg = load_server_config(cfp)
-    lan_on = bool(server_cfg.get("lan"))
-    lan_pin = ensure_lan_pin(cfp) if lan_on else ""
+    lan_on = bool(server_cfg.get("lan_enabled") or server_cfg.get("lan"))
+    lan_pin = str(server_cfg.get("pin") or "")
+    if lan_on and not valid_pin(lan_pin):
+        # 配置里 PIN 缺失/不是 4-6 位数字（手改坏了）→ 启动时重新生成并写回，别让局域网裸奔
+        lan_pin = ensure_lan_pin(cfp)
     ip = lan_ip() if lan_on else None
     app.state.lan = lan_on
+    app.state.lan_enabled = lan_on
     app.state.lan_pin = lan_pin
+    app.state.server_host = str(server_cfg.get("host") or HOST)
     app.state.lan_port = int(server_cfg.get("port") or PORT)
     app.state.lan_ip = ip
     app.state.lan_url = ("http://%s:%d/" % (ip, app.state.lan_port)) if (lan_on and ip) else None
+    app.state.firewall_hint = firewall_hint(app.state.lan_port)
     if lan_on:
         print("[局域网] 监听 %s:%d —— 手机访问 %s（访问码见下）"
-              % (server_cfg.get("host"), app.state.lan_port,
+              % (app.state.server_host, app.state.lan_port,
                  app.state.lan_url or "（探测不到局域网 IP）"))
         if lan_pin:
-            print("[局域网] 4 位访问码：%s（config.json 的 server.pin；127.0.0.1 不需要）" % lan_pin)
+            print("[局域网] 访问码：%s（config.json 的 server.pin；127.0.0.1 不需要）" % lan_pin)
 
     PIN_COOKIE = "mathapp_pin"
     PIN_MAX_AGE = 30 * 24 * 3600
@@ -1612,20 +2043,45 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
 
     @app.middleware("http")
     async def _pin_gate(request: Request, call_next):  # noqa: ANN001, ANN202
-        """LAN 模式下，非 loopback 请求必须带访问码（?pin= 一次，之后 30 天 cookie）。"""
-        if not app.state.lan_pin:
-            return await call_next(request)
+        """非回环请求的准入（运行时读 app.state，设置页改完立即生效）：
+
+        1. 回环（127.0.0.1 / localhost）**永远放行** —— 本机不用输访问码；
+        2. 「局域网访问」关着 → **403** + 中文提示（不泄漏任何页面内容）；
+        3. 开着 → 要访问码：``?pin=xxxx`` 一次，之后 30 天 cookie；不对就 401。
+        """
         if _is_loopback_client(request):
             return await call_next(request)
         path = request.url.path
-        if path.startswith("/static") or path == "/favicon.ico" or path == "/healthz":
+        if path.startswith("/static") or path in ("/favicon.ico", "/healthz"):
             return await call_next(request)
+        if not getattr(app.state, "lan_enabled", False):
+            return render("error.html", status_code=403, page_title="局域网访问已关闭",
+                          nav_active="",
+                          error=_banner(
+                              "这台电脑没开「局域网访问」",
+                              "服务只允许本机（127.0.0.1）使用；手机/别的电脑访问会被拒绝。",
+                              ["在本机打开 设置 → 局域网访问，打开开关（立即生效，不用重启）",
+                               "打开后会显示手机地址与二维码，扫码即可判卷上传",
+                               "只想自己用：继续在本机浏览器打开 http://127.0.0.1:%d/"
+                               % int(getattr(app.state, "lan_port", PORT) or PORT)]),
+                          warnings=[], links=[{"href": "/settings", "label": "打开设置"}])
+        pin = str(getattr(app.state, "lan_pin", "") or "")
+        if not valid_pin(pin):
+            # 开关开着却没有合法访问码（配置被手改坏）：宁可拒绝，也不能让局域网裸奔
+            return render("error.html", status_code=403, page_title="访问码没设好",
+                          nav_active="",
+                          error=_banner(
+                              "这台电脑的访问码没设好",
+                              "「局域网访问」开着，但访问码不是 4-6 位数字。为安全起见，局域网请求先拒绝。",
+                              ["在本机打开 设置 → 局域网访问，点「重新生成」或填一个 4-6 位数字",
+                               "本机 127.0.0.1 不受影响，照常使用"]),
+                          warnings=[], links=[{"href": "/settings", "label": "打开设置"}])
         given = (request.query_params.get("pin") or "").strip()
         cookie = request.cookies.get(PIN_COOKIE) or ""
-        if given == app.state.lan_pin or cookie == app.state.lan_pin:
+        if given == pin or cookie == pin:
             response = await call_next(request)
-            if given == app.state.lan_pin and cookie != app.state.lan_pin:
-                response.set_cookie(PIN_COOKIE, app.state.lan_pin, max_age=PIN_MAX_AGE,
+            if given == pin and cookie != pin:
+                response.set_cookie(PIN_COOKIE, pin, max_age=PIN_MAX_AGE,
                                     httponly=True, samesite="lax")
             return response
         # 未通过：极简输入页，**不含任何卷子/答案/题库信息**
@@ -1638,6 +2094,8 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
 
     # 判卷路由由 grade_routes 提供（t22）：这里只接线，绝不再定义 /submissions*
     app.state.recognizer = None          # 缺省 None = 让 grade 按 config.json 选后端
+    # t79：打印校准页开关（改设置页立即生效，不用重启）
+    app.state.print_include_calibration = load_print_config(cfp)["include_calibration"]
     try:
         from grade_routes import router as grade_router
         app.include_router(grade_router)
@@ -1646,6 +2104,16 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
         traceback.print_exc()
         app.state.grade_routes_ok = False
         app.state.grade_routes_error = f"{type(exc).__name__}: {exc}"
+
+    # 题库导入路由由 import_routes 提供（t53）：同样缺模块也能起服务
+    try:
+        from import_routes import router as import_router
+        app.include_router(import_router)
+        app.state.import_routes_ok = True
+    except Exception as exc:  # noqa: BLE001 - 导入模块缺了不影响组卷/判卷
+        traceback.print_exc()
+        app.state.import_routes_ok = False
+        app.state.import_routes_error = f"{type(exc).__name__}: {exc}"
 
     def _not_found(title: str, detail: str, status_code: int = 404, links=None):
         return render("error.html", status_code=status_code, page_title=title,
@@ -1672,15 +2140,27 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
                             % info.get("backend_label", backend)}
         return {"show": False, "backend": backend, "level": "", "text": ""}
 
-    def _lan_ctx() -> dict:
-        """模板用的局域网信息：开没开、手机地址、二维码开关。"""
-        return {"on": bool(app.state.lan), "pin_required": bool(app.state.lan_pin),
-                "url": app.state.lan_url, "ip": app.state.lan_ip,
-                "port": app.state.lan_port,
-                "qr": "/qr.png?target=judge" if (app.state.lan and app.state.lan_url) else "",
-                "pin": app.state.lan_pin}
+    def _lan_ctx(with_pin: bool = False) -> dict:
+        """模板/JSON 用的局域网信息（t75）。
 
-    def _render_index(values=None, error=None, status_code: int = 200):
+        * ``on`` 开关、``url`` 手机地址、``pin_required`` 要不要访问码、``pin_tail`` 掩码（只露尾 2 位）；
+        * ``pin`` 明文**只在 with_pin=True（回环请求）时给**；
+        * ``firewall`` 是 Windows 防火墙放行命令，设置页一键复制。
+        """
+        on = bool(getattr(app.state, "lan_enabled", False))
+        pin = str(getattr(app.state, "lan_pin", "") or "")
+        url = app.state.lan_url if on else None
+        ctx = {"on": on, "url": url, "ip": app.state.lan_ip,
+               "port": app.state.lan_port, "host": getattr(app.state, "server_host", HOST),
+               "pin_required": bool(on and valid_pin(pin)), "pin_tail": pin_tail(pin),
+               "pin_valid": valid_pin(pin),
+               "qr": "/qr.png?target=judge" if (on and url) else "",
+               "firewall": getattr(app.state, "firewall_hint", firewall_hint())}
+        if with_pin:
+            ctx["pin"] = pin
+        return ctx
+
+    def _render_index(values=None, error=None, status_code: int = 200, check: str = ""):
         values = values or _values_from_pairs([])
         try:
             ctx = _index_context(dbp, values)
@@ -1689,9 +2169,18 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
                           nav_active="compose", error=_db_error(exc, dbp),
                           chapters=[], stats=[], defaults=_defaults([]),
                           values=values, available=None, db_summary=None, warnings=[],
+                          excluded_detail={"total": 0, "rows": []},
                           lan=_lan_ctx())
         if error:
             ctx["error"] = error
+        # 组卷页「本范围剩余 N 题」：服务端算一份（JS 会再用 /api/available 覆盖）
+        avail = ctx.get("available") or {}
+        qtypes = ("选择", "填空", "解答", "判断", "其他")
+        ctx["avail_rows"] = [(q, int(avail.get(q) or 0)) for q in qtypes
+                             if int(avail.get(q) or 0) > 0]
+        ctx["avail_total"] = sum(int(avail.get(q) or 0) for q in qtypes)
+        ctx.setdefault("excluded_detail", {"total": 0, "rows": []})
+        ctx["check"] = str(check or "").strip() in ("1", "true", "on", "yes")
         ctx["lan"] = _lan_ctx()
         ctx["ocr_notice"] = _ocr_notice_ctx()
         ctx["pdf_backend"] = probe_pdf_backend()
@@ -1700,11 +2189,169 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
                       nav_active="compose", **ctx)
 
     # ---------------------------------------------------------------- 组卷表单
+    # ---------------------------------------------------------------- 顺序管理（t69）
+    def _order_context(conn, subject_pk: str = "", flash: str = "", notice_tone: str = "ok"):
+        subjects = [{**dict(s), "label": subject_label(dict(s))}
+                    for s in dbmod.list_subjects_ordered(conn)]
+        # 只列「有题」的学科，避免把空学科摆给老师看
+        try:
+            have = {r[0] for r in conn.execute(
+                "SELECT DISTINCT subject_pk FROM questions")}
+            subjects = [s for s in subjects if s["subject_pk"] in have] or subjects
+        except sqlite3.Error:
+            pass
+        # 默认先看数学（老师最常用），没有数学才看第一个
+        default_pk = next((x["subject_pk"] for x in subjects
+                           if x["subject_pk"] == "math7a"), "")
+        current = subject_pk or default_pk or (subjects[0]["subject_pk"] if subjects else "")
+        chapters = dbmod.list_chapters_ordered(conn, current) if current else []
+        return {"subjects": subjects, "current": current, "chapters": chapters,
+                "flash": flash, "notice_tone": notice_tone}
+
+    @app.get("/manage/order", response_class=HTMLResponse)
+    def manage_order(request: Request, subject_pk: str = "", saved: int = 0,
+                     reset: int = 0, error: str = ""):  # noqa: ANN202
+        try:
+            conn = _open_ro(dbp)
+        except (DbMissing, sqlite3.Error) as exc:
+            return render("error.html", status_code=503, page_title="顺序管理",
+                          nav_active="order", error=_db_error(exc, dbp))
+        try:
+            flash = ""
+            tone = "ok"
+            if error:
+                flash, tone = error, "fail"
+            elif saved:
+                flash = "顺序已保存：组卷页的下拉与单元列表现已按这个顺序显示。"
+            elif reset:
+                flash = "已恢复默认顺序（按题库原始顺序）。"
+            ctx = _order_context(conn, (subject_pk or "").strip(), flash, tone)
+        finally:
+            conn.close()
+        return render("manage_order.html", page_title="顺序管理", nav_active="order", **ctx)
+
+    @app.post("/manage/order")
+    async def manage_order_save(request: Request):  # noqa: ANN202
+        form = await request.form()
+        action = str(form.get("action") or "save").strip()
+        subject_pk = str(form.get("subject_pk") or "").strip()
+        if action not in ("save", "reset"):
+            return RedirectResponse("/manage/order?error=%s"
+                                    % quote_plus("未知操作：%s" % action), status_code=303)
+        conn = None
+        try:
+            conn = _connect_rw(dbp)
+            if action == "reset":
+                dbmod.reset_order(conn, subject_pk or None)
+                return RedirectResponse("/manage/order?reset=1&subject_pk=%s"
+                                        % quote_plus(subject_pk), status_code=303)
+            pks = [str(v).strip() for v in form.getlist("subjects") if str(v).strip()]
+            chapters = [str(v).strip() for v in form.getlist("chapters") if str(v).strip()]
+            if pks:
+                dbmod.save_subject_order(conn, pks)
+            if chapters:
+                dbmod.save_chapter_order(conn, subject_pk, chapters)
+            if not pks and not chapters:
+                return RedirectResponse("/manage/order?error=%s"
+                                        % quote_plus("没有收到要保存的顺序（列表是空的？）"),
+                                        status_code=303)
+        except ValueError as exc:
+            # 非法输入给人话 + 400（不 500、也不静默跳走）
+            msg = str(exc)
+            try:
+                conn2 = _open_ro(dbp)
+            except (DbMissing, sqlite3.Error):
+                return render("error.html", status_code=503, page_title="顺序管理",
+                              nav_active="order", error=_db_error(exc, dbp))
+            try:
+                ctx = _order_context(conn2, subject_pk, "保存失败：%s" % msg, "fail")
+            finally:
+                conn2.close()
+            return render("manage_order.html", status_code=400, page_title="顺序管理",
+                          nav_active="order", **ctx)
+        except (DbMissing, sqlite3.Error) as exc:
+            return render("error.html", status_code=503, page_title="顺序管理",
+                          nav_active="order", error=_db_error(exc, dbp))
+        finally:
+            if conn is not None:
+                conn.close()
+        return RedirectResponse("/manage/order?saved=1&subject_pk=%s" % quote_plus(subject_pk),
+                                status_code=303)
+
+    def _availability_payload(conn, values: dict) -> dict:
+        """某范围还剩多少题（按题型）—— 组卷页的实时提示与 /api/available 共用。"""
+        params = _params_from_values(values)
+        raw = _count_available(conn, values) or {}
+        qtypes = ("选择", "填空", "解答", "判断", "其他")
+        by_qtype = {q: int(raw.get(q) or 0) for q in qtypes}
+        return {
+            "subject_pk": (params["scope"].get("subject_pk") or ""),
+            "chapters": list(params["scope"].get("chapters") or []),
+            "kps": list(params["scope"].get("kps") or []),
+            "total": sum(by_qtype.values()),
+            "by_qtype": by_qtype,
+        }
+
+    def _subject_exists(conn, subject_pk: str) -> bool:
+        try:
+            row = conn.execute("SELECT 1 FROM questions WHERE subject_pk=? LIMIT 1",
+                               (subject_pk,)).fetchone()
+        except sqlite3.Error:
+            return True                     # 老库没有 subject_pk 列时别误杀
+        return row is not None
+
+    @app.get("/api/available")
+    def api_available(request: Request):  # noqa: ANN202
+        """GET /api/available?subject_pk=math7a&chapters=…&kps=…
+
+        组卷页选学科/单元时用它实时显示「本范围剩余 N 题」。
+        非法输入一律 400 + 中文（不 500）；查不到题就是 200 + 全 0。
+        """
+        started = time.time()
+        values = _values_from_pairs(request.query_params.multi_items())
+        subject_pk = (values.get("subject_pk") or "").strip()
+        if not subject_pk and not values.get("subjects"):
+            return JSONResponse({"ok": False, "error": "缺少参数 subject_pk（学科）"},
+                                status_code=400)
+        subject_pk = subject_pk or values["subjects"][0]
+        try:
+            conn = _open_ro(dbp)
+        except (DbMissing, sqlite3.Error) as exc:
+            return JSONResponse({"ok": False, "error": _db_error(exc, dbp)["title"]},
+                                status_code=400)
+        try:
+            if not _subject_exists(conn, subject_pk):
+                return JSONResponse(
+                    {"ok": False, "error": "没有这个学科：%s（题库里查不到）" % subject_pk},
+                    status_code=400)
+            picker = _load_module("picker")
+            try:
+                payload = _availability_payload(conn, values)
+            except picker.ScopeError as exc:
+                return JSONResponse({"ok": False, "error": "范围不在题库里：%s" % exc},
+                                    status_code=400)
+            except (ValueError, KeyError) as exc:
+                return JSONResponse({"ok": False, "error": "参数不对：%s" % exc},
+                                    status_code=400)
+            payload["excluded"] = _excluded_detail(conn, values)
+            payload["ok"] = True
+            payload["elapsed_ms"] = int((time.time() - started) * 1000)
+            return JSONResponse(payload)
+        except sqlite3.Error as exc:
+            return JSONResponse({"ok": False, "error": "数据库出错：%s" % exc},
+                                status_code=400)
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request):  # noqa: ANN202
         # 查询串用来「试算可出题量」：/?kps=1.1&kps=1.2&need_answer=on
+        # check=1：无 JS 退化，服务端把「本范围剩余 N 题」算好渲染出来
         values = _values_from_pairs(request.query_params.multi_items())
-        return _render_index(values)
+        return _render_index(values, check=str(request.query_params.get("check") or ""))
 
     # ---------------------------------------------------------------- 建卷
     def _persist_manifest(conn, manifest: dict, fallback_title: str = "") -> str:
@@ -1723,7 +2370,10 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
         renderer = paper_renderer
         try:
             if renderer is None:
-                renderer = lambda m, o: _load_module("paper").render_paper(m, o)  # noqa: E731
+                # t79：校准页按设置页开关（config.print.include_calibration，默认关）
+                renderer = lambda m, o: _load_module("paper").render_paper(  # noqa: E731
+                    m, o, calibration=bool(getattr(app.state, "print_include_calibration",
+                                                   PRINT_DEFAULTS["include_calibration"])))
             rendered = _render_paper_anywhere(renderer, manifest, folder)
             meta.update({
                 "docx": rendered.get("docx") or "",
@@ -1765,6 +2415,10 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
         conn = None
         try:
             conn = _connect_rw(dbp)
+            # t72：标题留空 → 按学科/单元自动生成；手填的照旧尊重
+            if not str(values.get("title") or "").strip():
+                values = dict(values)
+                values["title"] = _auto_title_for(conn, values)
             manifest = _load_module("picker").build(_params_from_values(values), conn)
             return _persist_manifest(conn, manifest, values["title"])
         finally:
@@ -1870,8 +2524,12 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
         conn = None
         try:
             conn = _connect_rw(dbp)
+            subject_pk = _subject_of_nos(conn, payload["wrong_nos"]) \
+                or payload.get("subject_pk") or "math7a"
             params = _load_module("train").plan(conn, payload["wrong_nos"],
                                                 n_per=payload["n_per"])
+            params.setdefault("scope", {})["subject_pk"] = subject_pk
+            params["scope"]["subjects"] = [subject_pk]
             # train.plan 默认按错题集合派生 seed（同一批错题永远同一份训练卷）；
             # 用户没指定 seed 时改成随机 —— 和组卷页「留空=每次换一套」同一套语义。
             if payload.get("seed") is None:
@@ -1882,10 +2540,12 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
             # picker.build 会用 quality_flags 硬挡，所以这里先按同一口径滤一遍，
             # 剔掉被挡的替代题（宁可卷子少两道，也不印缺图的废题）。
             nos = list(params.get("nos") or [])
+            # t62：训练卷同样按学科过滤，不允许跨科（错题属于哪科就用哪科）
+            nos, dropped_cross = _filter_nos_by_subject(conn, nos, subject_pk)
             if nos:
                 ok_nos, blocked = _load_module("quality").filter_printable(
                     conn, nos, need_answer=True)
-                if blocked:
+                if blocked or dropped_cross:
                     params["nos"] = ok_nos
                     params["mix"] = {}          # 让 picker 按过滤后的 nos 重算题型数量
                     info = params.setdefault("train", {})
@@ -2136,6 +2796,34 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
         return FileResponse(paths["card"], media_type="application/pdf",
                             filename=f"{pid}-card.pdf")
 
+    @app.get("/papers/{pid}/calibration.pdf")
+    def calibration_pdf(pid: str):  # noqa: ANN202
+        """单独下载校准页（按需生成）：只在换打印机/调边距时才需要打一张量 100mm。"""
+        if not _safe_pid(pid):
+            return _not_found("卷号不合法", f"{pid!r} 不是合法卷号。")
+        if _is_deleted(pid):
+            return _deleted_page(pid)
+        paths = _pdf_paths(pid)
+        title = ""
+        try:
+            row = _paper_row(dbp, pid)
+            title = str(row["title"] or "") if row is not None else ""
+        except Exception:  # noqa: BLE001 - 标题取不到不影响校准页
+            title = ""
+        target = os.path.join(paths["folder"], "calibration.pdf")
+        try:
+            os.makedirs(paths["folder"], exist_ok=True)
+            if not os.path.isfile(target):
+                _load_module("paper").build_calibration_pdf(target, title=title, pid=pid)
+        except Exception as exc:  # noqa: BLE001
+            traceback.print_exc()
+            return render("error.html", status_code=500, page_title="校准页生成失败",
+                          error=_banner_from_explain(
+                              "internal_error", {"message": f"{type(exc).__name__}: {exc}"}),
+                          links=[{"href": f"/papers/{pid}", "label": "回预览页"}])
+        return FileResponse(target, media_type="application/pdf",
+                            filename=f"{pid}-calibration.pdf")
+
     @app.get("/papers/{pid}/print.pdf")
     def print_pdf(pid: str):  # noqa: ANN202
         if not _safe_pid(pid):
@@ -2228,6 +2916,15 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
             fh.write("\n")
         return backup
 
+    def print_ctx() -> dict:
+        """设置页「打印」区块的上下文（开关当前值 + 运行时生效值）。"""
+        cfg = load_print_config(cfp)
+        return {
+            "include_calibration": bool(app.state.print_include_calibration),
+            "from_config": bool(cfg["include_calibration"]),
+            "config_path": cfp,
+        }
+
     def _settings_ctx(status_code: int = 200, notice=None, test_result=None):
         info = load_ocr_config(cfp)
         cfg = _read_cfg_json()
@@ -2252,6 +2949,8 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
             paths=app_paths.describe(cfp),
             env_override=bool(os.environ.get("OCR_BACKEND") or os.environ.get("OCR_TOKEN")
                               or os.environ.get("OCR_KEY")),
+            lan=_lan_ctx(with_pin=True),
+            print_cfg=print_ctx(),
         )
 
     @app.get("/settings", response_class=HTMLResponse)
@@ -2360,6 +3059,78 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
             return RedirectResponse("/settings?cleared=1", status_code=303)
         return RedirectResponse("/settings?saved=1", status_code=303)
 
+    @app.post("/settings/print", response_class=HTMLResponse)
+    async def settings_print_save(request: Request):  # noqa: ANN202
+        """保存「打印时附带校准页」开关：写 config.print.include_calibration + 立即生效。"""
+        form = await request.form()
+        # 复选框：勾了才有值；未勾 = 关。认不出的值一律当关（别把脏值写进配置）
+        raw = form.get("include_calibration")
+        value = _as_bool(raw, False) if raw is not None else False
+        cfg = _read_cfg_json()
+        sect = cfg.get("print") if isinstance(cfg.get("print"), dict) else {}
+        sect["include_calibration"] = bool(value)
+        cfg["print"] = sect
+        _write_cfg_json(cfg)
+        app.state.print_include_calibration = bool(value)
+        print("[打印] 校准页：%s（config.print.include_calibration）"
+              % ("打印时附带" if value else "不打印"))
+        return RedirectResponse("/settings?saved=1", status_code=303)
+
+    def _apply_lan(enabled: bool | None = None, pin: str | None = None) -> dict:
+        """改局域网开关/访问码：**立即生效**（app.state）+ 写回 config.json。"""
+        if enabled is not None:
+            app.state.lan_enabled = bool(enabled)
+            app.state.lan = bool(enabled)
+        if pin is not None:
+            app.state.lan_pin = str(pin)
+        enabled_now = bool(getattr(app.state, "lan_enabled", False))
+        pin_now = str(getattr(app.state, "lan_pin", "") or "")
+        ip = lan_ip() if enabled_now else None
+        app.state.lan_ip = ip
+        app.state.lan_url = ("http://%s:%d/" % (ip, app.state.lan_port)) if (enabled_now and ip) else None
+        save_server_settings(cfp, lan_enabled=enabled_now, pin=pin_now or None)
+        print("[局域网] 设置页已更新：%s，访问码 %s"
+              % ("已允许局域网访问" if enabled_now else "已禁止局域网访问",
+                 pin_tail(pin_now) or "（未设置）"))
+        return _lan_ctx(with_pin=True)
+
+    @app.post("/settings/lan", response_class=HTMLResponse)
+    async def settings_lan(request: Request):  # noqa: ANN202
+        """设置页「局域网访问」：开关 / 改访问码 / 重新生成，都是运行时生效。"""
+        form = await request.form()
+        action = str(form.get("action") or "save").strip()
+        want_on = str(form.get("enabled") or "").strip().lower() in ("1", "true", "on", "yes")
+        pin_in = str(form.get("pin") or "").strip()
+        notice = None
+        status = 200
+
+        if action == "regen":
+            pin_in = "%04d" % secrets.randbelow(10000)
+            notice = {"kind": "ok", "text": "已重新生成访问码：%s（已写回 config.json，旧码立即失效）" % pin_in}
+            _apply_lan(enabled=want_on or bool(getattr(app.state, "lan_enabled", False)),
+                       pin=pin_in)
+        elif pin_in and not valid_pin(pin_in):
+            status = 400
+            notice = {"kind": "bad",
+                      "text": "访问码要是 4-6 位数字，没保存（当前仍是 %s）"
+                              % (pin_tail(getattr(app.state, "lan_pin", "")) or "未设置")}
+        else:
+            if want_on and not (pin_in or getattr(app.state, "lan_pin", "")):
+                pin_in = "%04d" % secrets.randbelow(10000)
+            new_pin = pin_in or str(getattr(app.state, "lan_pin", "") or "")
+            _apply_lan(enabled=want_on, pin=new_pin)
+            if want_on:
+                notice = {"kind": "ok",
+                          "text": "局域网访问已打开（立即生效，不用重启）；手机地址见下方，访问码 %s"
+                                  % pin_tail(new_pin)}
+            else:
+                notice = {"kind": "ok",
+                          "text": "局域网访问已关闭（立即生效）：非本机请求会收到 403，本机 127.0.0.1 照常用。"}
+        ctx = _settings_ctx(status_code=status, notice=notice)
+        ctx.pop("status_code", None)
+        return render("settings.html", status_code=status, page_title="设置",
+                      nav_active="settings", **ctx)
+
     @app.post("/settings/test", response_class=HTMLResponse)
     async def settings_test(request: Request):  # noqa: ANN202
         form = await request.form()
@@ -2450,11 +3221,13 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
     def _health_payload(request: Request) -> dict:
         payload = collect_health(
             dbp, cfp, out_root, grade_ok=getattr(app.state, "grade_routes_ok", None))
-        lan = dict(_lan_ctx())
-        # 访问码只给本机：/healthz 是诊断口（不拦 pin），LAN 上的设备不该从 JSON 里读到它
-        if not _is_loopback_client(request):
-            lan.pop("pin", None)
-        payload["lan"] = lan
+        # 访问码明文只给本机：/healthz 是诊断口（不拦 pin），别的设备不该从 JSON 里读到它
+        lan = dict(_lan_ctx(with_pin=_is_loopback_client(request)))
+        # t75 必需四项 {on,url,pin_required,pin_tail}；ip/port/qr 保留给老脚本（t40 起的字段）
+        payload["lan"] = {"on": lan["on"], "url": lan["url"],
+                          "pin_required": lan["pin_required"], "pin_tail": lan["pin_tail"],
+                          "ip": lan["ip"], "port": lan["port"], "qr": lan["qr"],
+                          **({"pin": lan["pin"]} if "pin" in lan else {})}
         payload["lan_url"] = app.state.lan_url      # 兼容只读这个字段的老脚本
         payload["code"] = _code_freshness()        # 代码是否比进程新（改了代码没重启）
         return payload

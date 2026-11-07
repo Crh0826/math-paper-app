@@ -11,7 +11,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from taxonomy import CHAPTER_ORDER, all_kps, classify  # noqa: E402
 
-JSONL = r"E:\OCR\dedup\data\questions.jsonl"
+try:
+    import build_db as _bdb
+    JSONL = _bdb.JSONL          # 跟着 paths 走（题库搬进 qbank 后不再写死 E:\OCR\dedup）
+except Exception:               # noqa: BLE001
+    JSONL = r"E:\OCR\dedup\data\questions.jsonl"
 
 
 class TestRules(unittest.TestCase):
@@ -75,9 +79,12 @@ class TestCorpusCoverage(unittest.TestCase):
     def test_chapter_distribution(self):
         c = Counter(t["chapter"] for t in self.tags)
         print("\n章节分布:", dict(c))
+        # 阈值口径：2026-11-01 起语料是 answered-only 的 12,280 道（用户决定删掉无答案题），
+        # 不再是 22,898 份 docx 全量；第 5 章「数据的收集与整理」实测 298 道，
+        # 所以门槛从 300 下调到 250 —— 仍然能抓住「某一章整个没标上」这种真问题。
         for ch in ("第1章 有理数", "第2章 整式及其加减", "第3章 一次方程与方程组",
                    "第4章 几何图形初步", "第5章 数据的收集与整理"):
-            self.assertGreater(c[ch], 300, f"{ch} 题量过少: {c[ch]}")
+            self.assertGreater(c[ch], 250, f"{ch} 题量过少: {c[ch]}")
         self.assertLess(c["综合"] / len(self.tags), 0.30, "综合类占比过高，按知识点组卷会缺题")
 
     def test_specific_kp_ratio(self):

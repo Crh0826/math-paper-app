@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -188,7 +189,11 @@ def _read_gray(image_path: str):
 
 
 def detect_markers(gray) -> dict:
-    """检出四角 ArUco → {id: (cx, cy)}（只认 0..3）。"""
+    """检出所有 ArUco → {marker_id: (cx, cy)}。
+
+    v4 起 id 不再固定 0..3：第 p 页（0 基）= ``4p..4p+3``。这里返回**全部**检出的 id，
+    由 :func:`pick_page_markers` 分组挑出「同一页的四角」。
+    """
     try:
         det = cv2.aruco.ArucoDetector(
             cv2.aruco.getPredefinedDictionary(card.ARUCO_DICT_ID),
@@ -201,11 +206,58 @@ def detect_markers(gray) -> dict:
         return out
     for c, i in zip(corners, ids.ravel()):
         mid = int(i)
-        if mid not in card.ARUCO_POS:
+        if not (0 <= mid < card.ARUCO_MAX_PAGES * card.ARUCO_PER_PAGE):
             continue
         pts = c.reshape(-1, 2)
         out[mid] = (float(pts[:, 0].mean()), float(pts[:, 1].mean()))
     return out
+
+
+def detect_marker_edges(gray) -> dict:
+    """检出 ArUco 并量出每块的实际边长（照片像素）→ {id: edge_px}。
+
+    用来做**尺度自校准**：不同版本卡的标记 18mm/14mm 不等，照片分辨率也各不相同，
+    量出来的边长除以「照片像素/规范像素」就是规范页上的真实尺寸。
+    """
+    try:
+        det = cv2.aruco.ArucoDetector(
+            cv2.aruco.getPredefinedDictionary(card.ARUCO_DICT_ID),
+            cv2.aruco.DetectorParameters())
+        corners, ids, _ = det.detectMarkers(gray)
+    except Exception:
+        return {}
+    out = {}
+    if ids is None:
+        return out
+    for c, i in zip(corners, ids.ravel()):
+        pts = c.reshape(-1, 2).astype("float32")
+        edges = [float(np.linalg.norm(pts[k] - pts[(k + 1) % 4])) for k in range(4)]
+        out[int(i)] = sum(edges) / 4.0
+    return out
+
+
+def pick_page_markers(centers: dict):
+    """把检出的 ArUco 按「同一页的四角」分组 → (page_no, corners, ids)。
+
+    * v4：id = 4p + 角号 → 分组即页序（p+1）；
+    * 旧卡：每页都是 0..3 → 恒为第 1 页（页序只能靠 QR，调用方自己处理）；
+    * 优先选「四角齐全」的组；多组都齐时取检到标记最多的那组；
+    * 都不齐 → 返回 (None, 最好的那组角, ids)，交给上层出 warp_failed 诊断。
+    """
+    if not centers:
+        return None, {}, []
+    groups = {}
+    for mid, pt in centers.items():
+        groups.setdefault(int(mid) // card.ARUCO_PER_PAGE, {})[int(mid) % card.ARUCO_PER_PAGE] = pt
+
+    def _score(item):
+        idx, corners = item
+        return (len(corners), -idx)
+
+    best_idx, best_corners = max(groups.items(), key=_score)
+    if len(best_corners) >= 4:
+        return best_idx + 1, best_corners, sorted(centers)
+    return None, best_corners, sorted(centers)
 
 
 def detect_markers_with_mirror(work):
@@ -214,27 +266,39 @@ def detect_markers_with_mirror(work):
     → (centers, mirrored)；镜像时把坐标翻回原图坐标系，单应会顺带把内容“反镜像”。
     """
     centers = detect_markers(work)
-    if len(centers) >= 4:
+    if pick_page_markers(centers)[0] is not None:
         return centers, False
     try:
         flipped = np.ascontiguousarray(work[:, ::-1])
         c2 = detect_markers(flipped)
     except Exception:
         return centers, False
-    if len(c2) < 4:
+    if pick_page_markers(c2)[0] is None:
         return centers, False
     w = work.shape[1]
     return {k: (float(w - 1 - v[0]), float(v[1])) for k, v in c2.items()}, True
 
 
-def homography_from_markers(centers: dict):
-    """四角中心 → 单应矩阵（照片坐标 → 规范页坐标）。"""
+def homography_from_markers(centers: dict, marker_size: float = None, targets: dict = None):
+    """角号(0..3) → 中心 → 单应矩阵（照片坐标 → 规范页坐标）。
+
+    * ``marker_size``：manifest 里的实际边长（旧卡 18mm、v4 14mm）；
+    * ``targets``：``{角号: (x, y)}`` 标记左上角在规范页上的位置 —— **优先用 manifest 的**
+      （旧卡四角在 2125/3153，v4 在 2173/3201，用当前常量去标定旧卡会把整页挤偏）；
+    * 都不传才退回常量。
+    """
+    size = float(marker_size or card.ARUCO_SIZE)
     if not centers or len(centers) < 4:
         return None
     src, dst = [], []
     for mid, (cx, cy) in centers.items():
-        px, py = card.ARUCO_POS[mid]
-        half = card.ARUCO_SIZE / 2.0
+        if mid not in card.ARUCO_POS:
+            continue
+        if targets and mid in targets:
+            px, py = targets[mid]
+        else:
+            px, py = card.ARUCO_POS[mid]
+        half = size / 2.0
         src.append([cx, cy])
         dst.append([px + half, py + half])
     src = np.float32(src)
@@ -662,6 +726,19 @@ def _frame_corner_dark(gray, x: int, y: int, size: int) -> bool:
     return bool(top.size and left.size and float(top.mean()) < 150 and float(left.mean()) < 150)
 
 
+def _has_frame_band(gray, x: int, y: int, size: int, tol: int = 4) -> bool:
+    """标识块左上那圈黑框在不在（对 ±tol 的偏移免疫，用来便宜地筛列扫的 y）。
+
+    比逐格统计便宜得多：只看两条 10px 宽的带子。
+    """
+    h, w = gray.shape[:2]
+    if x - tol - 2 < 0 or y - tol - 2 < 0 or x + size > w or y + size > h:
+        return False
+    top = gray[max(0, y - tol - 2):y + tol, x:x + size]
+    left = gray[y:y + size, max(0, x - tol - 2):x + tol]
+    return bool(top.size and left.size and float(top.mean()) < 170 and float(left.mean()) < 170)
+
+
 def _candidate_rects(gray):
     """标识块候选 (x, y, size)：轮廓法 + 列扫黑框兜底（粘连时轮廓不是方的）。"""
     h = gray.shape[0]
@@ -700,6 +777,56 @@ def _sweep_column(*_a, **_kw):      # 兼容旧名（不再使用）
     return None
 
 
+def _column_probe_xs(gray, base_x: int, y_from: int, y_to: int):
+    """标识块所在列的可能 x：用「竖直黑线」投影找，容忍 ±40px 的列偏移。
+
+    标识块的左右边框是两条 ~120px 高的竖线；把列带里每列的暗像素数出来，
+    连续暗列的第一个就是候选左边框。命不中时退回标称位置。
+    """
+    lo = max(0, int(base_x) - 44)
+    hi = min(gray.shape[1], int(base_x) + card.ID_SIZE + 44)
+    if hi - lo < card.ID_SIZE:
+        return [int(base_x)]
+    band = gray[max(0, y_from):max(0, y_to), lo:hi]
+    if band.size == 0:
+        return [int(base_x)]
+    dark = (band < 100).sum(axis=0)
+    thr = max(24, int(0.4 * min(card.ID_SIZE, band.shape[0])))
+    xs, run = [], None
+    for i, v in enumerate(dark):
+        if v >= thr:
+            if run is None:
+                run = i
+        elif run is not None:
+            xs.append(lo + run)
+            run = None
+    if run is not None:
+        xs.append(lo + run)
+    if not xs:
+        return [int(base_x)]
+    # 一条边框可能被拆成两段 → 合并靠得近的
+    merged = []
+    for x in sorted(xs):
+        if merged and x - merged[-1] <= 3:
+            continue
+        merged.append(x)
+    out = []
+    for x in merged:
+        for delta in (0, 3, 5):     # 块原点在黑色边框内约 3px
+            if abs(x + delta - base_x) <= 48:
+                out.append(x + delta)
+        # 右边框 = 左边框 + 块宽，也探一探（有时左边框被内容粘住）
+        if abs(x + card.ID_SIZE - base_x) <= 48:
+            out.append(x + card.ID_SIZE)
+    # 离标称位置越近越可能是真块 → 按距离排序后再限流
+    uniq = []
+    for x in sorted({int(x) for x in out if 0 <= x <= gray.shape[1] - card.ID_SIZE}):
+        if uniq and x - uniq[-1][0] < 4:
+            continue
+        uniq.append((x, abs(x - base_x)))
+    return [x for x, _d in sorted(uniq, key=lambda t: t[1])][:8] or [int(base_x)]
+
+
 def scan_id_blocks(gray) -> dict:
     """扫页面上的标识块：候选（轮廓/黑框）→ 按实测块宽自适应 5×5 或 4×4 → ±6px 对齐解码。
 
@@ -728,21 +855,30 @@ def scan_id_blocks(gray) -> dict:
     y_from = max(0, card.BODY_RECT[1] - 40)
     y_to = min(gray.shape[0], card.BODY_RECT[1] + card.BODY_RECT[3])
     for col, base_x in enumerate(card.ID_ORIGIN_X):
-        y = y_from
-        while y + card.ID_SIZE <= y_to:
-            if any(abs(base_x - b["x"]) < 60 and abs(y - b["y"]) < 130 for b in out["blocks"]):
-                y += 8
-                continue
-            kind, _bits = _classify_block(gray, base_x, y, card.ID_GRID, card.ID_CELL)
-            if kind == "bits":          # 先便宜地筛一遍，只有像网格才做对齐搜索
-                got = _align_decode(gray, base_x, y, card.ID_GRID, card.ID_CELL, span=4)
-                if got:
-                    dx, dy, no = got
-                    out["blocks"].append({"x": base_x + dx, "y": y + dy, "no": no,
-                                          "col": col, "grid": card.ID_GRID})
-                    y += card.ID_SIZE + 4
+        # 列位置会偏：打印缩放/拍照透视能让第二列差 20+px（实测 1275→1302）。
+        # 先用「竖直黑线投影」把候选列精确定位（几毫秒），再逐列逐 y 扫。
+        for x_hit in _column_probe_xs(gray, base_x, y_from, y_to):
+            y = y_from
+            while y + card.ID_SIZE <= y_to:
+                if any(abs(x_hit - b["x"]) < 40 and abs(y - b["y"]) < 130 for b in out["blocks"]):
+                    y += 8
                     continue
-            y += 8
+                if not _has_frame_band(gray, x_hit, y, card.ID_SIZE):
+                    y += 10
+                    continue
+                # 黑框在 → 直接做 ±5px 对齐搜索（classify 只是 align_decode 内部的第一层）
+                if True:
+                    got = _align_decode(gray, x_hit, y, card.ID_GRID, card.ID_CELL, span=5)
+                    if got:
+                        dx, dy, no = got
+                        bx, by = x_hit + dx, y + dy
+                        # 只有「外面真有黑框」才算数：25 位 CRC 偶发碰撞会造出假题号
+                        if _frame_corner_dark(gray, bx, by, card.ID_SIZE):
+                            out["blocks"].append({"x": bx, "y": by, "no": no,
+                                                  "col": col, "grid": card.ID_GRID})
+                            y += card.ID_SIZE + 4
+                            continue
+                y += 8
 
     def _dedupe(items, gap=110):
         keep = []
@@ -908,8 +1044,10 @@ def _grade_by_ids(conn, image_path, out_root):
               "identified_by": "question_id", "qr": qr_payload, "qr_ok": qr_ok,
               "page": None, "score": score, "full": full, "backend": "manual",
               "photo": photo_meta, "items": units,
+              "student": {"no": "", "name": ""},      # 无 manifest 拿不到学生区几何
               "unreadable_ids": len(unreadable_units), "unknown_nos": unknown[:20]}
-    _save_submission(conn, sid, pid_hint or "", image_path, True, qr_ok, score, full, detail)
+    _save_submission(conn, sid, pid_hint or "", image_path, True, qr_ok, score, full, detail,
+                     student_no="")
     return {"sid": sid, "pid": pid_hint, "warp_ok": True, "qr_ok": qr_ok,
             "score": score, "full": full, "error": None, "detail": "",
             "identified_by": "question_id",
@@ -1150,8 +1288,41 @@ def diag_image(image_path, diag: dict, out_path: str):
         return None
 
 
-def _warp_photo(image_path):
-    """读图 → ArUco 标定 → 复原到 2480×3508。→ (norm|None, photo_meta, err_code, err_msg)"""
+def _estimate_marker_size(work, corners: dict, scale: float = 1.0) -> float:
+    """从照片实测标记边长 → 规范页上的标记边长（px）。
+
+    做法：量出标记在照片上的平均边长，再除以「照片像素 / 规范像素」
+    （用左右两角的水平跨度估）。估不出来就退回常量。
+    """
+    try:
+        edges = detect_marker_edges(work)
+        if not edges:
+            return float(card.ARUCO_SIZE)
+        edge = float(np.median(list(edges.values()))) / (scale or 1.0)
+        left = corners.get(0)        # 左上
+        right = corners.get(1)       # 右上
+        if not left or not right:
+            return float(card.ARUCO_SIZE)
+        span = abs(float(right[0]) - float(left[0]))
+        if span <= 0:
+            return float(card.ARUCO_SIZE)
+        # 注意：两个**角中心**之间的规范距离 = 页宽 − 2×边距 − 边长（不是整页宽）。
+        # 设 k = 边长(照片) / 中心距(照片)，则 边长(规范) = k·(W−2M−边长) ⇒ 解一元一次：
+        #   size = k·(W − 2M) / (1 + k)
+        k = edge / span
+        size = k * (float(PAGE_W) - 2.0 * card.ARUCO_MARGIN) / (1.0 + k) if k > 0 else 0.0
+        # 只接受可信区间（8..30mm），离谱就用常量
+        lo, hi = float(card.mm(8)), float(card.mm(30))
+        return float(size) if lo <= size <= hi else float(card.ARUCO_SIZE)
+    except Exception:
+        return float(card.ARUCO_SIZE)
+
+
+def _warp_photo(image_path, marker_size: float = None, targets: dict = None):
+    """读图 → ArUco 标定 → 复原到 2480×3508。→ (norm, photo_meta, err_code, err_msg, diag)
+
+    ``marker_size`` = 这张卡上标记的实际边长（px，来自 manifest）；旧卡 212、v4 165。
+    """
     full_img, photo_meta, code, why = _read_photo(image_path)
     if full_img is None:
         return None, photo_meta, code or "warp_failed", (
@@ -1162,12 +1333,20 @@ def _warp_photo(image_path):
         photo_meta["mirror_fixed"] = True
     if scale and scale != 1.0:
         centers = {k: (v[0] / scale, v[1] / scale) for k, v in centers.items()}
-    diag = _diag_from_centers(full_img, centers)
+    page_no, corners, found_ids = pick_page_markers(centers)
+    if marker_size is None:
+        marker_size = _estimate_marker_size(work, corners, scale)
+    photo_meta["marker_size"] = round(float(marker_size or 0), 1)
+    photo_meta["card_page"] = page_no              # v4：页序从 ArUco id 组反推；旧卡=1 或 None
+    photo_meta["aruco_ids"] = found_ids
+    diag = _diag_from_centers(full_img, corners)
     diag["mirrored"] = mirrored
-    if len(centers) < 4:
-        txt = "%s（只检出 %d/4 个）" % (diag.get("suggest_text") or WARP_HINT, len(centers))
+    diag["page_no"] = page_no
+    diag["aruco_ids"] = found_ids
+    if page_no is None or len(corners) < 4:
+        txt = "%s（只检出 %d/4 个）" % (diag.get("suggest_text") or WARP_HINT, len(corners))
         return None, photo_meta, "warp_failed", txt, diag
-    M = homography_from_markers(centers)
+    M = homography_from_markers(corners, marker_size, targets)
     if M is None:
         return None, photo_meta, "warp_failed", "四角单应矩阵求解失败。%s" % WARP_HINT, diag
     try:
@@ -1255,13 +1434,24 @@ def _grade_image(conn, pid, image_path, ocr, out_root):
     if not pages:
         return _err("no_card", "该卷没有 card 几何（还没生成答题卡？）", pid)
 
-    norm, photo_meta, code, why, diag = _warp_photo(image_path)
+    _marks = ((pages[0].get("marks") or {}).get("aruco") or [])
+    _mk = (_marks[0].get("size") if _marks else None)
+    # 角点目标也要按这张卡自己的几何（旧卡与新版的四角位置不同）
+    _targets = {}
+    for a in _marks:
+        corner = a.get("corner", int(a.get("id", 0)) % card.ARUCO_PER_PAGE)
+        _targets[int(corner)] = (int(a["x"]), int(a["y"]))
+    norm, photo_meta, code, why, diag = _warp_photo(image_path, marker_size=_mk,
+                                                    targets=_targets or None)
     if norm is None:
         return _err(code or "warp_failed", why, pid, diag=diag)
 
-    # ---- 卷号 QR：防串卷
+    # ---- 定页：v4 看 ArUco id 组（页序在标记里）；旧卡看每页 QR 的 p
+    grouped = bool(card_info.get("aruco_groups")) or int(card_info.get("version") or 0) >= 4
     qr_payload, qr_page = None, None
     for page in pages:
+        if not page.get("qr"):
+            continue
         payload = card.read_qr(norm, page["qr"])
         if payload:
             qr_payload, qr_page = payload, page
@@ -1270,15 +1460,25 @@ def _grade_image(conn, pid, image_path, ocr, out_root):
         return _err("pid_mismatch",
                     "QR 卷号 %s ≠ 传入 %s（拍错卷子？）" % (qr_payload.get("pid"), pid), pid)
     qr_ok = qr_payload is not None
-    page = qr_page
-    if page is None:
-        # QR 失效：按传入 pid 继续，用第一页几何（结果里 qr_ok=false）
-        page = pages[0]
-    elif qr_payload.get("p") is not None:
+
+    page = None
+    photo_page = (photo_meta or {}).get("card_page")
+    if grouped and photo_page:
+        # 新卡：页序 = ArUco 组号；QR 只用来校验 pid/版本（首页才有）
         for p in pages:
-            if p.get("page") == qr_payload.get("p"):
+            if p.get("page") == photo_page:
                 page = p
                 break
+    if page is None and qr_page is not None and not grouped:
+        page = qr_page
+        if qr_payload.get("p") is not None:
+            for p in pages:
+                if p.get("page") == qr_payload.get("p"):
+                    page = p
+                    break
+    if page is None:
+        # ArUco 组不可用 / 旧卡 QR 失效：按传入 pid 继续，用第一页几何（结果里 qr_ok=false）
+        page = pages[0]
 
     # ---- 版本/串卷校验：看 manifest 每题 id_box.bits 的长度（自描述，不靠全局常量）
     id_check = _check_manifest_ids(norm, page)
@@ -1304,29 +1504,46 @@ def _grade_image(conn, pid, image_path, ocr, out_root):
         backend = _apply_recognition(pending_units, got) or "manual"
 
     score, full = _score(units)
+    student_no = _read_student_no(card_info, norm)      # t58：v3 卡上的学号
     detail = {
         "version": 1, "pid": pid, "sid": sid,
         "qr": qr_payload, "qr_ok": qr_ok, "page": page.get("page"),
+        "page_by": ("aruco_group" if (grouped and photo_page) else "qr" if qr_page else "fallback"),
+        "aruco_ids": (photo_meta or {}).get("aruco_ids") or [],
         "score": score, "full": full, "backend": backend,
         "photo": photo_meta,          # t27：EXIF 方向/机型/拍摄时间/原始尺寸/是否clamp
+        "student": {"no": student_no, "name": ""},      # 姓名手写，读不出留空
         "items": units,
     }
-    _save_submission(conn, sid, pid, image_path, True, qr_ok, score, full, detail)
+    _save_submission(conn, sid, pid, image_path, True, qr_ok, score, full, detail,
+                     student_no=student_no)
     return {"sid": sid, "pid": pid, "warp_ok": True, "qr_ok": qr_ok,
             "score": score, "full": full, "error": None, "detail": "",
             "pending": len([u for u in units if u["verdict"] == "pending"]),
             "items": units}
 
 
-def _save_submission(conn, sid, pid, image_path, warp_ok, qr_ok, score, full, detail):
+def _save_submission(conn, sid, pid, image_path, warp_ok, qr_ok, score, full, detail,
+                     student_no: str = "", student_name: str = ""):
+    detail_json = json.dumps(detail, ensure_ascii=False)
+    image_abs = os.path.abspath(image_path) if image_path else ""
     try:
-        conn.execute(
-            "INSERT OR REPLACE INTO submissions"
-            "(sid,pid,created_at,image_path,warp_ok,qr_ok,score,full,detail_json)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
-            (sid, pid, _now_iso(), os.path.abspath(image_path) if image_path else "",
-             1 if warp_ok else 0, 1 if qr_ok else 0, score, full,
-             json.dumps(detail, ensure_ascii=False)))
+        _ensure_student_columns(conn)
+        if _has_student_columns(conn):
+            conn.execute(
+                "INSERT OR REPLACE INTO submissions"
+                "(sid,pid,created_at,image_path,warp_ok,qr_ok,score,full,detail_json,"
+                "student_no,student_name)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (sid, pid, _now_iso(), image_abs, 1 if warp_ok else 0, 1 if qr_ok else 0,
+                 score, full, detail_json, str(student_no or ""), str(student_name or "")))
+        else:                                   # 极端情况：迁移失败也别丢判卷结果
+            conn.execute(
+                "INSERT OR REPLACE INTO submissions"
+                "(sid,pid,created_at,image_path,warp_ok,qr_ok,score,full,detail_json)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (sid, pid, _now_iso(), image_abs, 1 if warp_ok else 0, 1 if qr_ok else 0,
+                 score, full, detail_json))
         conn.commit()
     except Exception:
         pass
@@ -1472,10 +1689,224 @@ def _fill_pending(conn, sid, recognizer):
 
 
 # ---------------------------------------------------------------- 人工确认（t17）
-def apply_confirm(conn, sid: str, corrections: dict) -> dict:
-    """人工确认/改判：{idx: {"verdict": "correct|wrong", "text": "..."}} → 重算并落库（幂等）。"""
+# ---------------------------------------------------------------- 改卷留痕（t55）
+EDITS_DDL = """
+CREATE TABLE IF NOT EXISTS grading_edits(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sid TEXT NOT NULL, idx INTEGER NOT NULL, blank INTEGER NOT NULL,
+  qtype TEXT, before_verdict TEXT, after_verdict TEXT,
+  before_text TEXT, after_text TEXT,
+  operator TEXT, batch_id TEXT, source TEXT DEFAULT 'confirm',
+  note TEXT, created_at TEXT NOT NULL,
+  UNIQUE(batch_id, idx, blank)
+);
+CREATE INDEX IF NOT EXISTS ix_edits_sid ON grading_edits(sid, created_at);
+"""
+
+#: 导出的 CSV 列（顺序即给人看的口径）
+EDITS_CSV_HEADER = ("时间", "题号", "空", "改前", "改后", "改前文本", "改后文本",
+                    "操作者", "批次", "来源", "备注")
+
+
+def _ensure_edits_table(conn) -> None:
+    """幂等建表：旧库（没有这张表）打开时也能用；不动 db.py（那个归 t53）。"""
+    conn.executescript(EDITS_DDL)
     try:
-        return _apply_confirm(conn, sid, corrections)
+        conn.commit()
+    except Exception:       # noqa: BLE001 - 只读连接就算了，写入时自然会报
+        pass
+
+
+def _edits_ready(conn) -> bool:
+    try:
+        conn.execute("SELECT 1 FROM grading_edits LIMIT 1")
+        return True
+    except Exception:       # noqa: BLE001 - 表不存在
+        try:
+            _ensure_edits_table(conn)
+            return True
+        except Exception:   # noqa: BLE001
+            return False
+
+
+def _unit_key(u) -> tuple:
+    """unit → (idx, blank)：留痕和回滚都按这个键对位。"""
+    idx = u.get("idx")
+    try:
+        idx_i = int(idx)
+    except (TypeError, ValueError):
+        idx_i = idx
+    try:
+        blank = int(u.get("blank", 1) or 1)
+    except (TypeError, ValueError):
+        blank = 1
+    return idx_i, blank
+
+
+def _snapshot(units) -> dict:
+    """改判前的快照：{(idx, blank): (verdict, picked, qtype)}。"""
+    snap = {}
+    for u in units or []:
+        key = _unit_key(u)
+        snap[key] = (u.get("verdict"), u.get("picked"), u.get("qtype"))
+    return snap
+
+
+def _record_edits(conn, sid: str, before: dict, units, *, batch_id: str,
+                  operator: str = "teacher", source: str = "confirm",
+                  note: str = "") -> int:
+    """把「快照 → 现在」的差异写进 grading_edits（只记真正变了的空）。
+
+    ``INSERT OR IGNORE``：同一次提交重复落（双击 / 重试）靠 UNIQUE(batch_id, idx, blank) 兜底，
+    不会产生重复行。
+    """
+    if not _edits_ready(conn):
+        return 0
+    now = _now_iso()
+    written = 0
+    for u in units or []:
+        key = _unit_key(u)
+        old = before.get(key)
+        if old is None:
+            old_verdict, old_text, qtype = None, None, u.get("qtype")
+        else:
+            old_verdict, old_text, qtype = old
+        new_verdict, new_text = u.get("verdict"), u.get("picked")
+        if old_verdict == new_verdict and (old_text or "") == (new_text or ""):
+            continue                         # 没变 → 不留痕
+        try:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO grading_edits"
+                "(sid,idx,blank,qtype,before_verdict,after_verdict,before_text,after_text,"
+                " operator,batch_id,source,note,created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sid, int(key[0]) if str(key[0]).lstrip("+-").isdigit() else key[0],
+                 int(key[1]), qtype, old_verdict, new_verdict,
+                 None if old_text is None else str(old_text),
+                 None if new_text is None else str(new_text),
+                 operator or "teacher", batch_id, source, note, now))
+            written += int(cur.rowcount or 0)
+        except Exception:       # noqa: BLE001 - 留痕失败不能拖死改判
+            return written
+    try:
+        conn.commit()
+    except Exception:           # noqa: BLE001
+        pass
+    return written
+
+
+def list_edits(conn, sid: str) -> list:
+    """某份卷的改卷记录（时间倒序，同刻按 id 倒序）。"""
+    if not _edits_ready(conn):
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT id,sid,idx,blank,qtype,before_verdict,after_verdict,before_text,"
+            "after_text,operator,batch_id,source,note,created_at"
+            " FROM grading_edits WHERE sid=? ORDER BY created_at DESC, id DESC", (sid,)
+        ).fetchall()
+    except Exception:           # noqa: BLE001
+        return []
+    out = []
+    for r in rows:
+        try:
+            out.append(dict(r))
+        except Exception:       # noqa: BLE001 - 裸连接（tuple 行）
+            out.append(dict(zip(("id", "sid", "idx", "blank", "qtype", "before_verdict",
+                                 "after_verdict", "before_text", "after_text", "operator",
+                                 "batch_id", "source", "note", "created_at"), r)))
+    return out
+
+
+def _find_unit(units, idx, blank):
+    for u in units or []:
+        key = _unit_key(u)
+        if str(key[0]) == str(idx) and key[1] == int(blank):
+            return u
+    return None
+
+
+def undo_batch(conn, sid: str, batch_id: str) -> dict:
+    """整批撤销：把该批次改过的空恢复成「改前」，重算分数，并写 source='undo' 的留痕。"""
+    if not _edits_ready(conn):
+        return {"error": "edits_unavailable", "sid": sid, "batch_id": batch_id}
+    all_edits = list_edits(conn, sid)
+    rows = [e for e in all_edits if e.get("batch_id") == batch_id]
+    if not rows:
+        return {"error": "batch_not_found", "sid": sid, "batch_id": batch_id}
+    # 撤销过没有？撤销留痕记在 note='撤销批次 <原 batch>' 里（撤销行自己的 batch_id 是新的）
+    undone = {m.group(1) for m in
+              (re.search(r"撤销批次\s+(\S+)", e.get("note") or "") for e in all_edits
+               if e.get("source") == "undo") if m}
+    if batch_id in undone or any(e.get("source") == "undo" for e in rows):
+        return {"error": "already_undone", "sid": sid, "batch_id": batch_id}
+
+    row = conn.execute("SELECT sid,pid,detail_json FROM submissions WHERE sid=?",
+                       (sid,)).fetchone()
+    if row is None:
+        return {"error": "submission_not_found", "sid": sid}
+    detail = _json_loads(row["detail_json"]) or {}
+    units = detail.get("items") or []
+
+    before = _snapshot(units)
+    restored = 0
+    for e in rows:
+        if e.get("source") == "undo":
+            continue
+        u = _find_unit(units, e.get("idx"), e.get("blank"))
+        if u is None:
+            continue
+        if e.get("before_verdict") is not None:
+            u["verdict"] = e["before_verdict"]
+        u["picked"] = e.get("before_text")
+        u.pop("confirmed", None)
+        u.pop("mastery_verdict", None)
+        u["reason"] = "撤销改判（batch %s）" % batch_id
+        restored += 1
+
+    score, full = _score(units)
+    detail["score"], detail["full"] = score, full
+    detail["item_verdicts"] = _item_verdicts(units)
+    detail["undone_at"] = _now_iso()
+    _update_submission(conn, sid, score, full, detail)
+
+    undo_batch_id = uuid.uuid4().hex
+    _record_edits(conn, sid, before, units, batch_id=undo_batch_id,
+                  operator=(rows[0].get("operator") or "teacher"), source="undo",
+                  note="撤销批次 %s" % batch_id)
+    return {"sid": sid, "pid": row["pid"], "batch_id": batch_id,
+            "undo_batch_id": undo_batch_id, "restored": restored,
+            "score": score, "full": full, "error": None}
+
+
+def export_edits_csv(conn, sid: str) -> str:
+    """改卷记录 → CSV 文本（带 UTF-8 BOM，Excel 直接打开不乱码）。"""
+    import csv
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(EDITS_CSV_HEADER)
+    for e in list_edits(conn, sid):
+        writer.writerow([e.get("created_at") or "", e.get("idx"), e.get("blank"),
+                         e.get("before_verdict") or "", e.get("after_verdict") or "",
+                         e.get("before_text") or "", e.get("after_text") or "",
+                         e.get("operator") or "", e.get("batch_id") or "",
+                         e.get("source") or "", e.get("note") or ""])
+    return "\ufeff" + buf.getvalue()
+
+
+def apply_confirm(conn, sid: str, corrections: dict, *, batch_id: str = None,
+                  operator: str = "teacher", source: str = "confirm") -> dict:
+    """人工确认/改判：{idx: {"verdict": "correct|wrong", "text": "..."}} → 重算并落库（幂等）。
+
+    ``batch_id``：同一次 HTTP 提交的所有改动共用一个（缺省自动生成）；重复提交同一个
+    batch_id 不会在 grading_edits 里产生重复行（UNIQUE(batch_id, idx, blank)）。
+    ``operator``：谁改的（表单里的 operator，缺省 'teacher'）。
+    """
+    batch_id = batch_id or uuid.uuid4().hex
+    try:
+        return _apply_confirm(conn, sid, corrections, batch_id=batch_id,
+                              operator=operator, source=source)
     except Exception as e:
         return {"error": "internal_error", "detail": "%s: %s" % (type(e).__name__, e),
                 "sid": sid}
@@ -1533,13 +1964,15 @@ def _apply_one_correction(u, corr) -> int:
     return changed
 
 
-def _apply_confirm(conn, sid, corrections):
+def _apply_confirm(conn, sid, corrections, *, batch_id=None, operator="teacher",
+                   source="confirm"):
     row = conn.execute("SELECT sid,pid,detail_json FROM submissions WHERE sid=?", (sid,)).fetchone()
     if row is None:
         return {"error": "submission_not_found", "sid": sid}
     detail = _json_loads(row["detail_json"]) or {}
     units = detail.get("items") or []
     wide, narrow = _parse_corrections(corrections)
+    before = _snapshot(units)               # 留痕用：改判前的判定/文本
 
     changed = 0
     for u in units:
@@ -1564,8 +1997,11 @@ def _apply_confirm(conn, sid, corrections):
     detail["confirmed_at"] = _now_iso()
     detail["item_verdicts"] = _item_verdicts(units)   # 聚合判定（一空错算整题错）
     _update_submission(conn, sid, score, full, detail)
+    edits = _record_edits(conn, sid, before, units, batch_id=batch_id,
+                          operator=operator, source=source)
     return {"sid": sid, "pid": row["pid"], "score": score, "full": full,
-            "changed": changed, "recorded": recorded,
+            "changed": changed, "recorded": recorded, "edits": edits,
+            "batch_id": batch_id,
             "item_verdicts": detail["item_verdicts"], "error": None}
 
 
@@ -1588,6 +2024,86 @@ def _item_verdicts(units) -> dict:
         else:
             out[idx] = vs[0] if vs else "ungraded"
     return out
+
+
+# ---------------------------------------------------------------- 学生信息（t58）
+STUDENT_COLUMNS = ("student_no", "student_name")
+
+
+def _ensure_student_columns(conn) -> bool:
+    """submissions 补 student_no / student_name 两列（幂等；不改 db.py）。"""
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(submissions)")}
+    except Exception:
+        return False
+    if not cols:
+        return False
+    added = False
+    for col in STUDENT_COLUMNS:
+        if col not in cols:
+            try:
+                conn.execute("ALTER TABLE submissions ADD COLUMN %s TEXT DEFAULT ''" % col)
+                added = True
+            except Exception:
+                return False
+    if added:
+        try:
+            conn.commit()
+        except Exception:
+            pass
+    return True
+
+
+def _has_student_columns(conn) -> bool:
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(submissions)")}
+    except Exception:
+        return False
+    return all(c in cols for c in STUDENT_COLUMNS)
+
+
+def _read_student_no(card_info, image) -> str:
+    """从 v3 卡读学号；v1/v2 卡、读不出、任何异常 → ""（绝不抛）。"""
+    try:
+        import card as _card
+
+        return _card.read_student_no(card_info or {}, image) or ""
+    except Exception:
+        return ""
+
+
+def set_student(conn, sid: str, no: str = "", name: str = "") -> dict:
+    """老师手工补录/修改学生信息（学号或姓名）。同步写 detail_json.student。"""
+    sid = str(sid or "").strip()
+    if not sid:
+        return {"error": "bad_sid"}
+    no, name = str(no or "").strip(), str(name or "").strip()
+    _ensure_student_columns(conn)
+    try:
+        row = conn.execute("SELECT detail_json FROM submissions WHERE sid=?", (sid,)).fetchone()
+    except Exception as e:
+        return {"error": "db_error", "detail": "%s: %s" % (type(e).__name__, e)}
+    if row is None:
+        return {"error": "submission_not_found", "sid": sid}
+    detail = _json_loads(row["detail_json"])
+    if not isinstance(detail, dict):
+        detail = {}
+    student = detail.get("student") or {}
+    if not isinstance(student, dict):
+        student = {}
+    student.update({"no": no, "name": name})
+    detail["student"] = student
+    try:
+        if _has_student_columns(conn):
+            conn.execute("UPDATE submissions SET student_no=?, student_name=?, detail_json=?"
+                         " WHERE sid=?", (no, name, json.dumps(detail, ensure_ascii=False), sid))
+        else:
+            conn.execute("UPDATE submissions SET detail_json=? WHERE sid=?",
+                         (json.dumps(detail, ensure_ascii=False), sid))
+        conn.commit()
+    except Exception as e:
+        return {"error": "db_error", "detail": "%s: %s" % (type(e).__name__, e)}
+    return {"ok": True, "sid": sid, "student_no": no, "student_name": name}
 
 
 def _update_submission(conn, sid, score, full, detail):
@@ -1694,8 +2210,9 @@ def _restore_canonical(image_path):
         return None, why or code or ("读图失败: %s" % image_path)
     work, scale = _work_image(full_img)
     centers, _mirrored = detect_markers_with_mirror(work)
-    if len(centers) < 4:
-        return None, "只检出 %d/4 个 ArUco。%s" % (len(centers), WARP_HINT)
+    _page_no, corners, _ids = pick_page_markers(centers)
+    if _page_no is None or len(corners) < 4:
+        return None, "只检出 %d/4 个 ArUco。%s" % (len(corners), WARP_HINT)
     if scale and scale != 1.0:
         centers = {k: (v[0] / scale, v[1] / scale) for k, v in centers.items()}
     M = homography_from_markers(centers)

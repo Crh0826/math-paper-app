@@ -17,7 +17,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from docx_rich import extract_tokens  # noqa: E402
 from compose import build_paper  # noqa: E402
 
-ROOT = r"E:\OCR"
+# 题库目录不再写死 E:\OCR（2026-11-01 题库搬进 E:\OCR\qbank）：走 paths 解析
+try:
+    import paths as _paths
+    ROOT = _paths.resolve_qbank(legacy=_paths.LEGACY_QBANK)
+except Exception:  # noqa: BLE001
+    ROOT = r"E:\OCR"
 Q_OMML = os.path.join(ROOT, "00001.docx")
 Q_OLE = os.path.join(ROOT, "01000.docx")
 

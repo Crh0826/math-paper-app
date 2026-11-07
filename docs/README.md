@@ -16,8 +16,15 @@
 | `06-grade-result.png` | 判卷结果：分数卡 + 逐题判定（含裁切图、OMR 候选、为什么）+ 待确认 + 训练入口 |
 | `07-train-paper.png` | 训练卷：由错题抽同类题（原题不重复），带答题卡 |
 | `08-degraded-word.png` | Word 缺失：预览页降级横幅 + 只给答题卡 PDF + 卷面预览空态 |
+| `20-lan-settings.png` | 设置 →「局域网访问」：开关（默认关）、当前状态「只允许本机」、局域网地址、访问码、防火墙命令 |
+| `19-avail-line.png` | 组卷页「本范围剩余 343 题（选择/填空/解答）」实时提示 + 「查询剩余题数」退化按钮 |
+| `16-import-mobile.png` | 导入页 375px 手机视图（拖放区/字段/按钮都排得下，无横向滚动） |
+| `15-ocr-notice.png` | 首页顶部「尚未配置识别服务」横幅（manual 后端时）+「去设置」入口 |
+| `14-settings.png` | 设置页：后端下拉、Key 只显尾号、测试连接、当前路径 |
 | `13-seed-reroll.png` | 预览页「换一套题」按钮 + 参数区「随机种子 226007（填这个数可以复现）」 |
 | `12-lan-qr.png` | 局域网模式下的首页：手机扫码入口（二维码 + 局域网地址 + 访问码提示） |
+| `17-grade-records.png` | 结果页「改卷记录」时间线：改前→改后、批次、撤销入口（来源：`out/acceptance_v2/03_grade_result_after_confirm.png`） |
+| `18-student-info.png` | 结果页学生抬头：答题卡 v3 学号涂卡识别出的学号 + 姓名（来源：`out/acceptance_v2/06_result_page_student.png`） |
 | `10-layout-form.png` | 组卷表单「选题要求」区：省纸模式复选框（默认勾上）与文案 |
 | `11-layout-compact.png` | 省纸版面的预览页：题更密、页数更少（24 题 = 卷面 5 页 + 卡 3 页） |
 | `09-degraded-db.png` | 数据库缺失：首页 503 友好页（错误码 `db_missing` + 三条「怎么办」） |

@@ -35,6 +35,23 @@
   .shot-hints li { margin: 3px 0; }
   .file-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   .file-row input[type="file"] { max-width: 100%; }
+  /* 手机上传区：真实 input 铺满整块，避免"点不动选取文件" */
+  .file-drop {
+    position: relative; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 6px; min-height: 136px; padding: 18px 16px;
+    border: 2px dashed #93a4c0; border-radius: 14px; background: #f7f9fd;
+    cursor: pointer; text-align: center; -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  .file-drop:active, .file-drop:focus-within { background: #eef3fb; border-color: #3b82f6; }
+  .file-drop-input {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    opacity: 0; cursor: pointer; font-size: 16px; z-index: 2;
+  }
+  .file-drop-icon { font-size: 30px; line-height: 1; }
+  .file-drop-title { font-weight: 700; font-size: 18px; color: var(--ink); }
+  .file-drop-hint { font-size: 13px; color: var(--muted); }
+  .file-drop.has-file { border-style: solid; border-color: #16a34a; background: #f2fbf5; }
   @media (max-width: 760px) { .upload-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -48,16 +65,8 @@
         <small>沪科版七年级上 · 拍照判卷</small>
       </span>
     </a>
-    <nav class="nav" aria-label="主导航">
-      <a class="nav-item" href="/">组卷</a>
-      <a class="nav-item" href="/papers">我的卷子</a>
-      <a class="nav-item is-active" href="/submissions" aria-current="page">判卷</a>
-      <a class="nav-item" href="/records">判卷记录</a>
-      <a class="nav-item" href="/train">训练</a>
-      <a class="nav-item" href="/guide">使用指南</a>
-      <a class="nav-item" href="/health">自检</a>
-    </nav>
-    <a class="ghost-link mono" href="/healthz" target="_blank" rel="noopener" title="自检数据（JSON）">healthz</a>
+    {% set nav_active = "grade" %}
+      {% include "_nav.html" %}
   </div>
 </header>
 
@@ -77,13 +86,14 @@
     <section class="card">
       <h2>1. 这是哪份卷子</h2>
       <label class="field">
-        <span class="field-label">卷号 pid</span>
-        <input type="text" name="pid" value="{{ pid }}" list="paper-pids" placeholder="P20261031-001"
-               autocomplete="off" spellcheck="false" required>
-        <datalist id="paper-pids">
-          {% for p in papers %}<option value="{{ p.pid }}">{{ p.title }}（{{ p.n_items }} 题）</option>{% endfor %}
-        </datalist>
-        <span class="field-hint">答题卡右上角、二维码旁边印着卷号；也可以直接输入，或在下面最近的卷子里点「判这张卷」。</span>
+        <span class="field-label">卷号 pid（可以不选）</span>
+        <select name="pid" id="pid-select">
+          <option value=""{% if auto %} selected{% endif %}>自动识别（推荐）</option>
+          {% for p in papers %}
+          <option value="{{ p.pid }}"{% if p.pid == pid %} selected{% endif %}>{{ p.pid }} · {{ p.title }}（{{ p.n_items }} 题）</option>
+          {% endfor %}
+        </select>
+        <span class="field-hint">答题卡右上角有卷号二维码，系统会自动认；认不出再手动选。</span>
       </label>
     </section>
 
@@ -91,9 +101,15 @@
       <h2>2. 上传答题卡照片</h2>
       <div class="upload-grid">
         <div>
-          <div class="file-row">
-            <input type="file" id="shot" name="file" accept="image/*" capture="environment" required>
-          </div>
+          <!-- 手机上传：把真实 input 铺满整个虚线框。
+               移动端对 display:none / JS .click() 的 input 常常不弹选择器，
+               让 input 自己占住可点区域是最稳的做法（安卓/iOS/微信内置都验证过）。 -->
+          <label class="file-drop" for="shot">
+            <input type="file" id="shot" name="file" accept="image/*" class="file-drop-input">
+            <span class="file-drop-icon" aria-hidden="true">📷</span>
+            <span class="file-drop-title">点这里选照片 / 拍照</span>
+            <span class="file-drop-hint">支持 JPG / PNG / HEIC，也可以直接调相机</span>
+          </label>
           <ul class="shot-hints">
             <li>四个角的黑色定位块全部入画，四边各留一点白边</li>
             <li>手机正对答题卡，倾斜别超过 30°；别开闪光灯、别压皱</li>
@@ -151,15 +167,21 @@
 (function () {
   var input = document.getElementById('shot');
   var box = document.getElementById('shot-preview');
+  var drop = document.querySelector('.file-drop');
+  var title = drop && drop.querySelector('.file-drop-title');
   if (!input || !box) { return; }
   input.addEventListener('change', function () {
     var file = input.files && input.files[0];
     if (!file) { box.textContent = '还没选图片'; return; }
+    if (drop) { drop.classList.add('has-file'); }
+    if (title) { title.textContent = '已选好，点这里可以换一张'; }
     var url = URL.createObjectURL(file);
     box.innerHTML = '<div><img alt="待上传的答题卡照片" src="' + url + '">' +
                     '<div class="muted" style="margin-top:6px"></div></div>';
     box.querySelector('.muted').textContent = file.name || '';
   });
+  // 说明：input 用 opacity:0 铺满整块（z-index:2），点哪里都落在真实 input 上，
+  // 不再依赖 JS .click() 或 display:none —— 那两种在手机浏览器/微信内置里经常弹不出来。
 })();
 </script>
 </body>

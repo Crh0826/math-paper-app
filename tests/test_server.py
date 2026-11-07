@@ -519,5 +519,202 @@ class TestRealLibrary(unittest.TestCase):
         self.assertTrue(p["ok"], [c for c in p["checks"] if c["status"] != "ok"])
 
 
+class TestSubjectPicker(unittest.TestCase):
+    """t11 · 组卷页的学科下拉：默认必选一个，且「可出题量」跟着学科走（避免跨学科混卷）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="srv_subject_")
+        cls.db_path = os.path.join(cls.tmp, "data", "app.db")
+        os.makedirs(os.path.dirname(cls.db_path), exist_ok=True)
+        conn = dbmod.connect(cls.db_path)
+        try:
+            dbmod.ensure_subject(conn, "math7a", "数学", "七年级上", "沪科版")
+            dbmod.ensure_subject(conn, "chinese7a", "语文", "七年级上", "人教版")
+            conn.executemany(
+                "INSERT INTO questions(no, subject_pk, qtype, answer_raw, is_empty,"
+                " chapter, kp_id, text_plain, fmt, option_count) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                [("100001", "math7a", "选择", "A", 0, "第1章 有理数", "1.1", "数学选择题1", "plain", 4),
+                 ("100002", "math7a", "选择", "B", 0, "第1章 有理数", "1.2", "数学选择题2", "plain", 4),
+                 ("100003", "math7a", "填空", "3", 0, "第1章 有理数", "1.1", "数学填空题", "plain", 0),
+                 ("200001", "chinese7a", "选择", "C", 0, "第一单元 春", "CN1.1", "语文选择题", "plain", 4)])
+            conn.executemany(
+                "INSERT INTO kps(kp_id, subject_pk, chapter, kp, n_questions) VALUES(?,?,?,?,?)",
+                [("1.1", "math7a", "第1章 有理数", "正数与负数", 2),
+                 ("1.2", "math7a", "第1章 有理数", "数轴", 1),
+                 # kps.kp_id 是主键：跨学科必须用不同 kp_id（语文侧加 CN 前缀）
+                 ("CN1.1", "chinese7a", "第一单元 春", "春", 1)])
+            conn.commit()
+        finally:
+            conn.close()
+        cls.cfg_path = write_config(
+            os.path.join(cls.tmp, "config.json"),
+            {"ocr": {"backend": "manual", "timeout_s": 5, "poll_s": 1},
+             "server": {"host": "127.0.0.1", "port": 8710}},
+        )
+        cls.app = server.create_app(db_path=cls.db_path, config_path=cls.cfg_path)
+        cls.client = TestClient(cls.app)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _select_html(self, html: str) -> str:
+        m = re.search(r'<select[^>]*name="subject_pk"[^>]*>.*?</select>', html, re.S)
+        self.assertIsNotNone(m, "组卷页缺学科下拉 name=subject_pk")
+        return m.group(0)
+
+    def _available_choice(self, html: str) -> int:
+        counts = re.findall(r"可出\s*<strong>(\d+)</strong>\s*题", html)
+        self.assertTrue(counts, "页面没显示「可出 N 题」")
+        return int(counts[0])          # stats 顺序：选择题在前
+
+    def test_subject_select_present(self):
+        """t62 · 学科 + 年级两个下拉（级联），年级下拉的 value 就是 subject_pk。"""
+        html = self.client.get("/").text
+        sel = self._select_html(html)
+        self.assertIn('id="subject-name"', html, "缺学科下拉")
+        self.assertIn('value="math7a"', sel, "年级下拉里要有 subject_pk")
+        self.assertIn('value="chinese7a"', sel)
+        self.assertIn("数学", html)
+        self.assertIn("语文", html)
+        self.assertIn("学科", text_of(html))
+
+    def test_subject_select_defaults_to_one(self):
+        """默认必选一个：下拉里恰好一个 option 带 selected（默认数学）。"""
+        sel = self._select_html(self.client.get("/").text)
+        self.assertEqual(1, len(re.findall(r"\bselected\b", sel)),
+                         "学科下拉必须默认选中一个（不许空着）")
+        conn = dbmod.connect(self.db_path)
+        try:
+            subjects = server.read_subjects(conn)
+        finally:
+            conn.close()
+        self.assertEqual("数学", subjects[0]["name"], "read_subjects 应按 subject_pk 排序")
+        self.assertRegex(sel, r'value="%s"[^>]*selected' % subjects[0]["subject_pk"])
+
+    def test_counts_follow_subject(self):
+        math_n = self._available_choice(self.client.get("/?subject_pk=math7a").text)
+        cn_n = self._available_choice(self.client.get("/?subject_pk=chinese7a").text)
+        self.assertEqual(2, math_n, "数学有 2 道可选选择题")
+        self.assertEqual(1, cn_n, "语文只有 1 道可选选择题（不许把数学题算进来）")
+
+    def test_default_subject_equals_first_subject(self):
+        """不传 subject_pk 的首页 = 第一个学科的题量（默认必选一个，不是「全库不限」）。"""
+        html = self.client.get("/").text
+        self.assertEqual(2, self._available_choice(html))
+
+    def test_chapters_follow_subject(self):
+        t = text_of(self.client.get("/?subject_pk=chinese7a").text)
+        self.assertIn("第一单元 春", t)
+        self.assertNotIn("第1章 有理数", t, "选了语文不该还列数学的章节")
+
+    def test_unknown_subject_shows_friendly_banner(self):
+        r = self.client.get("/?subject_pk=physics9x")
+        self.assertEqual(200, r.status_code, "脏学科参数不该 500")
+        self.assertIn("physics9x", text_of(r.text))
+
+    def test_params_carry_subject(self):
+        values = server._values_from_pairs([("subject_pk", "chinese7a"), ("n_choice", "2")])
+        self.assertEqual("chinese7a", values["subject_pk"])
+        params = server._params_from_values(values)
+        self.assertEqual("chinese7a", params["scope"]["subject_pk"])
+        self.assertEqual(["chinese7a"], params["scope"]["subjects"])
+
+    def test_params_multiple_subjects(self):
+        values = server._values_from_pairs([("subjects", "math7a"), ("subjects", "chinese7a")])
+        params = server._params_from_values(values)
+        self.assertEqual(["math7a", "chinese7a"], params["scope"]["subjects"])
+
+    def test_read_subjects_reports_counts(self):
+        conn = dbmod.connect(self.db_path)
+        try:
+            subs = {s["subject_pk"]: s for s in server.read_subjects(conn)}
+        finally:
+            conn.close()
+        self.assertEqual(3, subs["math7a"]["n_questions"])
+        self.assertEqual(1, subs["chinese7a"]["n_questions"])
+        self.assertEqual("沪科版", subs["math7a"]["version"])
+
+
+class TestSubjectUI(unittest.TestCase):
+    """t62 · 组卷页有「学科 + 年级」级联；知识点只列所选学科。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="subjui_")
+        cls.db_path = os.path.join(cls.tmp, "data", "app.db")
+        os.makedirs(os.path.dirname(cls.db_path), exist_ok=True)
+        seed_db(cls.db_path)
+        conn = dbmod.connect(cls.db_path)
+        conn.execute("UPDATE questions SET subject_pk='math7a'")
+        conn.execute("INSERT OR REPLACE INTO subjects(subject_pk,name,grade,version) VALUES"
+                     "('math7a','数学','七年级上','沪科版'),"
+                     "('chinese7a','语文','七年级上','人教版')")
+        conn.execute("INSERT INTO kps(kp_id,subject_pk,chapter,kp,n_questions)"
+                     " VALUES('9.9','chinese7a','语文·识字','识字',1)")
+        conn.execute("INSERT INTO questions(no,qtype,subject_pk,chapter,kp_id,text_plain,"
+                     "answer_raw,is_empty) VALUES('Z001','填空','chinese7a','语文·识字',"
+                     "'9.9','语文题','x',0)")
+        conn.commit()
+        conn.close()
+        cls.cfg_path = write_config(
+            os.path.join(cls.tmp, "config.json"),
+            {"ocr": {"backend": "manual", "timeout_s": 5, "poll_s": 1},
+             "server": {"host": "127.0.0.1", "port": 8710}})
+        cls.app = server.create_app(db_path=cls.db_path, config_path=cls.cfg_path)
+        cls.client = TestClient(cls.app)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_index_has_subject_and_grade_selects(self):
+        html = self.client.get("/").text
+        self.assertIn('id="subject-name"', html, "缺学科下拉")
+        self.assertIn('id="subject-grade"', html, "缺年级下拉")
+        self.assertIn('name="subject_pk"', html)
+        self.assertIn("数学", html)
+        self.assertIn("语文", html)
+
+    def test_default_subject_is_math7a(self):
+        html = self.client.get("/").text
+        self.assertIn("math7a", html)
+        ctx = server._index_context(self.db_path)
+        self.assertEqual("math7a", ctx["values"].get("subject_pk"))
+
+    def test_kps_only_selected_subject(self):
+        ctx = server._index_context(self.db_path, {"subject_pk": "chinese7a"})
+        chapters = [c["chapter"] for c in ctx["chapters"]]
+        self.assertIn("语文·识字", chapters, "选语文时应列出语文章节")
+        self.assertFalse([c for c in chapters if c.startswith("数学")],
+                         "选语文时不该混进数学章节：%s" % chapters)
+        ctx2 = server._index_context(self.db_path, {"subject_pk": "math7a"})
+        ch2 = [c["chapter"] for c in ctx2["chapters"]]
+        self.assertFalse([c for c in ch2 if c.startswith("语文")], ch2)
+
+
+    def test_train_nos_filtered_by_subject(self):
+        """训练卷：跨科题号会被剔掉（/train 走同一套过滤）。"""
+        conn = dbmod.connect(self.db_path)
+        try:
+            nos = [r[0] for r in conn.execute(
+                "SELECT no FROM questions WHERE subject_pk='math7a' LIMIT 3")]
+            mixed = nos + ["Z001"]
+            kept, dropped = server._filter_nos_by_subject(conn, mixed, "math7a")
+        finally:
+            conn.close()
+        self.assertEqual(nos, kept)
+        self.assertEqual(["Z001"], dropped, "语文题必须被剔出数学训练卷")
+
+    def test_params_default_and_explicit_subject(self):
+        v = server._values_from_pairs([("n_choice", "3")])
+        self.assertEqual("math7a", server._params_from_values(v)["scope"]["subject_pk"])
+        v2 = server._values_from_pairs([("n_choice", "3"), ("subject_pk", "chinese7a")])
+        self.assertEqual(["chinese7a"], server._params_from_values(v2)["scope"]["subjects"])
+
+
 if __name__ == "__main__":
     unittest.main()

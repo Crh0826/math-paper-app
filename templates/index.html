@@ -18,6 +18,27 @@
 </div>
 {% else %}
 
+{% if ocr_notice and ocr_notice.show %}
+<div class="banner banner-warn" role="status">
+  <div class="banner-head"><span class="banner-dot" aria-hidden="true"></span>尚未配置识别服务</div>
+  <p class="banner-text">{{ ocr_notice.text }}</p>
+  <p class="banner-text"><a class="btn btn-xs" href="/settings">去设置填 Key / 换后端</a>
+    <span class="muted">也可以继续用：选择题照常自动判，填空/解答在判卷页人工确认。</span></p>
+</div>
+{% endif %}
+
+<style>
+  /* t87 · 被排除题目的说明行 */
+  .excluded-nos { margin: 6px 0 0; font-size: 12.5px; overflow-wrap: anywhere; line-height: 1.7; }
+</style>
+
+{% if pdf_note %}
+<div class="banner banner-warn" role="status">
+  <div class="banner-head"><span class="banner-dot" aria-hidden="true"></span>PDF 后端提示</div>
+  <p class="banner-text">{{ pdf_note }}</p>
+</div>
+{% endif %}
+
 {% if lan and lan.on %}
 <section class="card lan-card">
   <h2>手机拍照判卷</h2>
@@ -32,13 +53,14 @@
   </div>
 </section>
 {% else %}
-<p class="field-hint">想让手机直接拍答题卡上传？双击 <code>start_lan.bat</code>（电脑和手机连同一个 WiFi），首页会出现二维码。</p>
 {% endif %}
 
 {#
   字段 → 契约 §2 参数映射（server._params_from_values 负责真正的转换）：
     title                              → params.title
     n_choice / n_fill / n_solution     → params.mix {"选择","填空","解答"}
+    subject_pk（单选，默认必选一个）   → params.scope.subject_pk（t11：7 科混库，防跨学科混卷）
+    subjects（多选，接口用）           → params.scope.subjects
     chapters（多选，空=不限）          → params.scope.chapters
     kps（多选，空=不限）               → params.scope.kps（勾章会自动联带勾上该章知识点）
     kp_mode                            → params.scope.kp_mode（any/all）
@@ -47,25 +69,101 @@
 #}
 <form class="form" id="paper-form" method="post" action="/papers" novalidate>
 
-  <section class="card">
-    <h2>卷面</h2>
+  <section class="card" id="subject">
+    <h2>学科</h2>
+    {% if subjects %}
     <div class="grid grid-2">
       <label class="field">
-        <span class="field-label">试卷标题</span>
-        <input type="text" name="title" value="{{ values.title }}" maxlength="80" autocomplete="off">
-        <span class="field-hint">印在卷面与答题卡顶部，同时写入 papers.title。</span>
+        <span class="field-label">学科</span>
+        <select id="subject-name" autocomplete="off">
+          {% for g in subject_groups %}
+          <option value="{{ g.name }}"{% if values.subject_pk in (g.grades | map(attribute='subject_pk') | list) %} selected{% endif %}>{{ g.name }}（{{ g.n_questions | num }} 题）</option>
+          {% endfor %}
+        </select>
       </label>
       <label class="field">
-        <span class="field-label">随机种子 seed（可留空）</span>
-        <input type="number" name="seed" value="{{ values.seed_text or '' }}" min="0" max="999999"
-               step="1" placeholder="自动（每份卷不同）" autocomplete="off">
-        <span class="field-hint">留空 = 每次自动换一套题（每份卷不同）；填数字 = 用这个种子，可精确复现同一份卷。</span>
+        <span class="field-label">年级 / 册次</span>
+        <select id="subject-grade" name="subject_pk" autocomplete="off">
+          {% for g in subject_groups %}{% for gr in g.grades %}
+          <option value="{{ gr.subject_pk }}" data-subject="{{ g.name }}"{% if gr.subject_pk == values.subject_pk %} selected{% endif %}>{{ gr.grade or gr.subject_pk }} · {{ gr.version }}</option>
+          {% endfor %}{% endfor %}
+        </select>
       </label>
     </div>
+    {# 真正提交给后端的是 subject_pk：年级下拉的 value 就是它（学科+年级唯一确定一本书） #}
+    {# t77：隐藏域也带 name=subject_pk —— 万一学科下拉被禁用/换掉，GET 退化提交仍能带上学科。
+       DOM 顺序上「年级下拉」在前，服务端 _values_from_pairs 取第一个值，所以以用户选的为准。 #}
+    <input type="hidden" id="subject-pk" name="subject_pk" value="{{ values.subject_pk }}">
+    <p class="field-hint" id="subject-note">
+      <span id="subject-current"></span>
+      <span class="muted">· 章节、知识点、可出题量都按这个学科算</span>
+    </p>
+    <p class="avail-line" id="subject-switch-note" hidden aria-live="polite"></p>
+    <script>
+    (function () {
+      var nameSel = document.getElementById('subject-name');
+      var gradeSel = document.getElementById('subject-grade');
+      var hidden = document.getElementById('subject-pk');
+      var note = document.getElementById('subject-current');
+      if (!nameSel || !gradeSel || !hidden) { return; }
+      function syncNameFromGrade() {
+        var opt = gradeSel.options[gradeSel.selectedIndex];
+        if (opt && opt.dataset.subject) { nameSel.value = opt.dataset.subject; }
+      }
+      function filterGrades() {
+        var want = nameSel.value;
+        var first = null;
+        for (var i = 0; i < gradeSel.options.length; i++) {
+          var o = gradeSel.options[i];
+          var show = !o.dataset.subject || o.dataset.subject === want;
+          o.hidden = !show;
+          o.disabled = !show;
+          if (show && !first) { first = o; }
+        }
+        if (first && gradeSel.selectedOptions[0] && gradeSel.selectedOptions[0].disabled) {
+          first.selected = true;
+        }
+        if (first && !gradeSel.value) { first.selected = true; }
+        hidden.value = gradeSel.value;
+        if (note) {
+          var o = gradeSel.options[gradeSel.selectedIndex];
+          note.textContent = o ? ('当前：' + want + ' · ' + o.textContent.trim()) : '';
+        }
+      }
+      nameSel.addEventListener('change', filterGrades);
+      gradeSel.addEventListener('change', function () { hidden.value = gradeSel.value; syncNameFromGrade(); });
+      // 换学科已经自动生效（t98 之后自动刷新），不再需要「应用学科」按钮
+      filterGrades();
+      syncNameFromGrade();
+    })();
+    </script>
+    {% else %}
+    {# 没有学科信息的老库：保持老行为（全库范围），但把参数显式带上，别让表单字段消失 #}
+    <input type="hidden" name="subject_pk" value="">
+    <p class="muted">题库里还没有学科信息（questions.subject_pk 为空），本次按全库范围组卷。</p>
+    {% endif %}
   </section>
 
-  <section class="card">
+
+  <section class="card" id="mix">
     <h2>题量配比</h2>
+    {# 实时剩余题量：JS 会按当前学科/单元调 /api/available 覆盖；check=1 时服务端已算好 #}
+    <p class="avail-line" id="avail-line" aria-live="polite"{% if not check %} hidden{% endif %}>
+      <span id="avail-text"><strong>{{ avail_total | num }}</strong> 题可选</span>
+      <span class="muted" id="avail-note">· 未勾单元按整册算，改选自动刷新</span>
+    </p>
+    <p class="shortage" id="chapter-zero" hidden>
+      你勾的章节可能不属于当前学科（<span data-count>0</span> 个章节，本范围 0 题）。
+      切学科后旧勾选会自动清掉；如果还留着，点这里
+      <button type="button" class="btn btn-small" id="clear-chapters">清空章节</button>
+    </p>
+    {% set ex = excluded_detail or {} %}
+    {# 被排除：一行灰字，不占黄底；题号少就直接写在行内，多则悬停看 #}
+    <p class="excluded-line muted excl-mini" id="excluded-line"{% if not check or not ex.total %} hidden{% endif %}>
+      <span id="excluded-text">{% if ex.total %}已排除 {{ ex.total | num }} 题：{% for row in ex.rows | selectattr("count") %}{{ row.label }} {{ row.count | num }}{% if not loop.last %} / {% endif %}{% endfor %}{% endif %}</span>
+      {% set fig = (ex.rows or []) | selectattr("label", "equalto", "缺图") | first %}
+      {% if fig and fig.nos %}<span class="muted">{% if (ex.total or 0) <= 3 %}· 题号 {{ fig.nos | join("、") }}{% else %}<span id="excluded-hint" title="缺图 = 题干说「如图」但题面没有图，印出来学生做不了；点开看题号">为什么排除？</span>{% endif %}</span>{% endif %}
+    </p>
     <div class="grid grid-3">
       {% for s in stats %}
       <label class="field">
@@ -73,25 +171,39 @@
         <input type="number" name="{{ s.field }}" value="{{ values[s.field] }}" min="0" max="99" step="1" data-qtype="{{ s.qtype }}">
         <span class="field-hint">
           {% if available is not none and s.qtype in available %}
-          可出 <strong>{{ available[s.qtype] }}</strong> 题
+          可出 <strong>{{ available[s.qtype] | num }}</strong> 题
           {% else %}
-          可出题量暂时算不出来（见自检页）
+          暂时算不出来（见自检页）
           {% endif %}
         </span>
+        <span class="shortage" data-shortage="{{ s.qtype }}" hidden></span>
       </label>
       {% endfor %}
     </div>
-    <p class="field-hint">
-      填 0 表示不放这类题。「可出 N 题」按下面勾选的范围算；改完勾选点一下
-      <button class="btn btn-small" type="button" id="refresh-counts" title="按当前勾选范围重新算可出题量">刷新可出题量</button>
-    </p>
+    <p class="field-hint">填 0 表示不放这类题；数字随勾选自动刷新。</p>
+    {# t98：只有「没有 JS」时才需要手动查一次；有 JS 的浏览器完全看不到这两个元素 #}
+    <noscript>
+      <p class="field-hint">
+        没开 JS：选好学科与单元后点这里
+        <button class="btn btn-small" type="submit" formaction="/" formmethod="get"
+                name="check" value="1" id="check-avail"
+                title="不用 JavaScript 也能算：把当前学科与勾选的单元交给服务端数一遍">查询剩余题数</button>
+        ，页面会重新加载并显示本范围剩余题量。
+      </p>
+    </noscript>
   </section>
 
   <section class="card" id="range">
     <h2>范围</h2>
+    {# UI 落地：默认折叠，只有想限范围时才点开（原来 34 个知识点全铺开，页面 3000px+） #}
+    <details class="fold" id="range-fold">
+      <summary>
+        <span id="range-state">全册（不限范围）</span>
+        <span class="muted">· 点开选择单元 / 知识点</span>
+      </summary>
     {% if chapters %}
     <p class="field-hint">
-      勾选章节 = 勾上该章全部知识点（两者会一起提交，章节非空时以章节为准）；都不勾 = 全库不限制。
+      勾选章节 = 勾上该章全部知识点（两者会一起提交，章节非空时以章节为准）；都不勾 = 该学科下不限制。
       标「仅 N 题」的知识点题量很少（少于 20），填的数量别超过这个数，否则会抽不满。
     </p>
     <div class="chapter-list">
@@ -132,10 +244,42 @@
     {% else %}
     <p class="muted">题库里还没有知识点数据，修好数据库后这里会出现章节／知识点选择器。</p>
     {% endif %}
+    </details>
   </section>
 
-  <section class="card">
-    <h2>选题要求</h2>
+
+  <section class="card" id="advanced">
+    <h2>高级</h2>
+
+    {# UI 落地：标题与 seed 不是每次都要改，默认折叠 #}
+    <details class="fold" id="advanced-fold">
+      <summary>
+        <span>试卷标题 / 随机种子</span>
+        <span class="muted">· 一般不用改</span>
+      </summary>
+    <div class="grid grid-2">
+      <label class="field">
+        <span class="field-label">试卷标题</span>
+        <input type="text" name="title" id="paper-title" value="{{ values.title }}" maxlength="80"
+               autocomplete="off" data-auto-title="1">
+        <span class="field-hint">
+          默认按「学科 + 年级（+ 版本）」自动生成；只勾一个单元时自动加「· 单元名」。
+          <button type="button" class="btn btn-small btn-ghost" id="title-reset">恢复自动标题</button>
+        </span>
+        <script id="subject-meta" type="application/json">{{ subject_meta_json | safe }}</script>
+      </label>
+      <label class="field">
+        <span class="field-label">随机种子 seed（可留空）</span>
+        <input type="number" name="seed" value="{{ values.seed_text or '' }}" min="0" max="999999"
+               step="1" placeholder="自动（每份卷不同）" autocomplete="off">
+        <span class="field-hint">留空 = 每次自动换一套题（每份卷不同）；填数字 = 用这个种子，可精确复现同一份卷。</span>
+      </label>
+    </div>
+    </details>
+
+    {# UI 落地：默认折叠，勾选项本来就不常改 #}
+    <details class="fold" id="req-fold">
+      <summary><span>版面与选题规则</span><span class="muted">· 需要时再改</span></summary>
     <div class="check-list">
       <label class="check">
         <input type="checkbox" name="need_answer" {% if values.need_answer %}checked{% endif %}>
@@ -156,10 +300,9 @@
     <p class="field-hint">空题（原始 docx 里题干为空）已固定排除，不需也不允许选。</p>
     <p class="field-hint">卷面不留书写区（答案写在答题卡上，卷面只印题）；确实需要草稿区，可在接口里显式给
       <code>space_解答</code> 等参数（单位：段）。</p>
+    </details>
   </section>
-
   <div class="form-actions">
-    <span class="muted">多人同时组卷会排队（每组约 10~40 秒），不是卡死。</span>
     <span class="total">合计 <strong id="total-count">{{ values.n_choice + values.n_fill + values.n_solution }}</strong> 题</span>
     <span class="muted" id="form-note">生成卷面 PDF 与答题卡要十几秒（排版要走 Word），请稍等。</span>
     <button class="btn btn-primary" type="submit" id="compose-submit">生成试卷</button>
@@ -176,4 +319,345 @@
   </div>
 </div>
 {% endif %}
+
+<script>
+function fmt(n) { return Number(n || 0).toLocaleString('zh-CN'); }
+/* 组卷页实时「本范围剩余 N 题」：学科/单元变化 300ms 防抖 → /api/available。
+   不阻提交：数量超了只给红字，允许老师先试着组（后端会给人话错误）。
+   没 fetch（老浏览器）时靠上面的「查询剩余题数」按钮走服务端。 */
+(function () {
+  var form = document.getElementById('paper-form');
+  var line = document.getElementById('avail-line');
+  var text = document.getElementById('avail-text');
+  var note = document.getElementById('avail-note');
+  if (!form || !line || !text || typeof window.fetch !== 'function') { return; }
+
+  var ORDER = ['选择', '填空', '解答', '判断', '其他'];
+  var DEBOUNCE_MS = 300;
+  var timer = null, seq = 0, latest = null;
+
+  function checked(sel) {
+    var out = [], list = form.querySelectorAll(sel);
+    for (var i = 0; i < list.length; i++) { if (list[i].checked) { out.push(list[i].value); } }
+    return out;
+  }
+
+  function queryString() {
+    var parts = [];
+    var sub = form.querySelector('[name="subject_pk"]');
+    if (sub && sub.value) { parts.push('subject_pk=' + encodeURIComponent(sub.value)); }
+    checked('input[name="chapters"]').forEach(function (v) {
+      parts.push('chapters=' + encodeURIComponent(v));
+    });
+    checked('input[name="kps"]').forEach(function (v) {
+      parts.push('kps=' + encodeURIComponent(v));
+    });
+    return parts.join('&');
+  }
+
+  function renderExcluded(ex) {
+    var box = document.getElementById('excluded-line');
+    var txt = document.getElementById('excluded-text');
+    var hint = document.getElementById('excluded-hint');
+    if (!box || !txt) { return; }
+    var total = (ex && ex.total) || 0;
+    if (!total) { box.hidden = true; if (hint) { hint.title = ''; } return; }
+    var rows = (ex && ex.rows) || [];
+    var parts = [];
+    rows.forEach(function (r) { if (r.count > 0) { parts.push(r.label + ' ' + fmt(r.count)); } });
+    var fig = null;
+    rows.forEach(function (r) { if (r.label === '缺图') { fig = r; } });
+    var nosList = (fig && fig.nos) || [];
+    var nosAll = (fig && fig.nos_total) || nosList.length;
+    var inlineNos = (total <= 3 && nosList.length) ? ' · 题号 ' + nosList.join('、') : '';
+    txt.textContent = '已排除 ' + fmt(total) + ' 题：' + parts.join(' / ') + inlineNos;
+    if (hint) {
+      hint.title = '缺图 = 题干说「如图」但题面没有图，印出来学生做不了' +
+        (nosList.length ? '；缺图题号：' + nosList.join('、') : '');
+    }
+    box.hidden = false;
+    return;
+
+    /* 下面这段（大块展开）已弃用，保留位置以免 JS 结构变动过大 */
+    var det = document.getElementById('excluded-details');
+    var fig = null;
+    rows.forEach(function (r) { if (r.label === '缺图') { fig = r; } });
+    if (fig && fig.nos && fig.nos.length && det && sum && nosEl) {
+      var all = fig.nos_total || fig.nos.length;
+      var more = all - fig.nos.length;
+      nosEl.textContent = fig.nos.join('、') + (more > 0 ? ' …还有 ' + fmt(more) + ' 题' : '');
+      sum.textContent = '缺图的是这 ' + fmt(all) + ' 道';
+      det.hidden = false;
+    } else if (det) {
+      det.hidden = true;
+    }
+  }
+
+  /* t97：勾了章节却 0 题 → 多半是残留了别的学科的章节；给红字 + 一键清空 */
+  function chapterZeroHint(data) {
+    var box = document.getElementById('chapter-zero');
+    if (!box) { return; }
+    var picked = form.querySelectorAll('input[name="chapters"]:checked').length;
+    var total = parseInt((data && data.total) || 0, 10);
+    var show = picked > 0 && total === 0;
+    box.hidden = !show;
+    if (show) {
+      box.querySelector('[data-count]').textContent = String(picked);
+    }
+  }
+
+  function clearChapters() {
+    var boxes = form.querySelectorAll('input[name="chapters"]');
+    for (var i = 0; i < boxes.length; i++) { boxes[i].checked = false; }
+    var box = document.getElementById('chapter-zero');
+    if (box) { box.hidden = true; }
+    schedule();                            // 立刻重算题量
+  }
+
+  function shortfall(data) {
+    var by = (data && data.by_qtype) || {};
+    var inputs = form.querySelectorAll('input[data-qtype]');
+    for (var i = 0; i < inputs.length; i++) {
+      var el = inputs[i], qt = el.dataset.qtype;
+      var want = parseInt(el.value, 10);
+      var have = parseInt(by[qt] || 0, 10);
+      var hint = form.querySelector('[data-shortage="' + qt + '"]');
+      if (!hint) { continue; }
+      if (!isNaN(want) && want > 0 && want > have) {
+        hint.textContent = qt + '要 ' + want + ' 道，本范围只剩 ' + fmt(have) + ' 道';
+        hint.hidden = false;
+      } else {
+        hint.textContent = '';
+        hint.hidden = true;
+      }
+    }
+  }
+
+  function render(data) {
+    latest = data;
+    line.hidden = false;
+    if (!data || data.ok === false) {
+      text.textContent = '算不出剩余题量：' + ((data && data.error) || '未知原因');
+      if (note) { note.textContent = '可以先组卷，后端会再校验一次。'; }
+      return;
+    }
+    var by = data.by_qtype || {};
+    var parts = [];
+    ORDER.forEach(function (qt) {
+      var n = parseInt(by[qt] || 0, 10);
+      if (n > 0) { parts.push(qt + ' ' + n); }
+    });
+    var total = parseInt(data.total || 0, 10);
+    text.innerHTML = '<strong>' + fmt(total) + '</strong> 题可选' +
+      (total ? '' : '（这一类范围的题都出不了，换个单元看看）');
+    if (note) {
+      note.textContent = data.chapters && data.chapters.length
+        ? '· 按已选的 ' + data.chapters.length + ' 个单元算'
+        : '· 未勾单元按整册算，改选自动刷新';
+    }
+    shortfall(data);
+    renderExcluded(data.excluded);
+  }
+
+  function refresh() {
+    var url = '/api/available?' + queryString();
+    var mine = ++seq;
+    if (line.hidden) {                 // 冷启动要 1 秒左右，先给个「正在数」别让人干等
+      line.hidden = false;
+      text.textContent = '正在数剩余题量…';
+    }
+    fetch(url, { headers: { 'Accept': 'application/json' } })
+      .then(function (r) { return r.json(); })
+      .then(function (data) { if (mine === seq) { render(data); } })
+      .catch(function () {
+        // 服务端已经渲染过数字（check=1）就别把它擦成错误提示，只有本来没数字时才报错
+        if (mine === seq && line.hidden) {
+          line.hidden = false;
+          text.textContent = '算不出剩余题量（网络或服务没响应）';
+        }
+      });
+  }
+
+  function schedule() {
+    clearTimeout(timer);
+    timer = setTimeout(refresh, DEBOUNCE_MS);
+  }
+
+  form.addEventListener('change', function (ev) {
+    var el = ev.target;
+    if (!el || !el.name) { return; }
+    if (el.name === 'subject_pk' || el.name === 'chapters' || el.name === 'kps') {
+      schedule();
+    }
+  });
+
+  // 进页面先算一次：否则「可选 N 题」要等用户改了勾选才出现
+  schedule();
+  form.addEventListener('input', function (ev) {
+    var el = ev.target;
+    if (el && el.dataset && el.dataset.qtype) { shortfall(latest); }
+  });
+
+  /* t98：手动刷新按钮已删除 —— t70 之后勾选/换学科会自动（300ms 防抖）刷新，
+     它属于自动刷新时代之前的遗留物；无 JS 回退只剩 <noscript> 里的「查询剩余题数」。 */
+  var clearChaptersBtn = document.getElementById('clear-chapters');
+  if (clearChaptersBtn) {
+    clearChaptersBtn.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      clearChapters();
+    });
+  }
+
+  /* t77：学科/年级切换后，隐藏域与下拉保持一致；同时留 data-subject-pk 方便排查「跳回数学」 */
+  var subSelect = form.querySelector('select[name="subject_pk"]');
+  var subHidden = document.getElementById('subject-pk');
+  /* t97：切学科后，上一门课的章节/知识点勾选必须清掉（否则组卷会报「0 题」） */
+  function clearScopeChecks(why) {
+    var boxes = form.querySelectorAll('input[name="chapters"], input[name="kps"]');
+    var cleared = 0;
+    for (var i = 0; i < boxes.length; i++) {
+      if (boxes[i].checked) { boxes[i].checked = false; cleared += 1; }
+    }
+    if (cleared && why) {
+      showSubjectNotice('已切换学科，清空了 ' + cleared + ' 个原来勾的章节/知识点（它们属于上一门课）。');
+    }
+    return cleared;
+  }
+
+  function showSubjectNotice(text) {
+    var note = document.getElementById('subject-switch-note');
+    if (!note) { return; }
+    note.textContent = text;
+    note.hidden = false;
+    window.setTimeout(function () { note.hidden = true; }, 8000);
+  }
+
+  function syncSubject() {
+    if (!subSelect) { return; }
+    var value = subSelect.value || '';
+    if (subHidden && subHidden.value !== value) { subHidden.value = value; }
+    form.setAttribute('data-subject-pk', value);
+    if (window.console && console.debug) {
+      console.debug('[组卷] 当前学科 subject_pk =', value);
+    }
+  }
+  if (subSelect) {
+    var lastSubject = subSelect.value;
+    subSelect.addEventListener('change', function () {
+      if (subSelect.value !== lastSubject) {
+        lastSubject = subSelect.value;
+        clearScopeChecks(true);           // t97：换学科 → 先清章节/知识点
+      }
+      syncSubject();
+    });
+    syncSubject();
+  }
+  form.addEventListener('submit', syncSubject);
+
+  schedule();   // 进页面先按当前勾选算一次
+})();
+</script>
+<script>
+/* t72：试卷标题按学科自动生成
+   - 学科/年级/单元变化 → 自动填（用户手改过就不再覆盖）
+   - 「恢复自动标题」→ 清掉手改标记并重算
+   - 规则与后端 server._auto_title 一致：{学科} {年级}（{版本}）[ · 单元名]，上限 60 字 */
+(function () {
+  var input = document.getElementById('paper-title');
+  if (!input) return;
+  var meta = {};
+  try {
+    var node = document.getElementById('subject-meta');
+    meta = JSON.parse((node && node.textContent) || '{}');
+  } catch (e) { meta = {}; }
+  var dirty = false;                       // 用户手改过 → 不再自动覆盖
+
+  function pickedChapters() {
+    return Array.prototype.map.call(
+      document.querySelectorAll('input[name="chapters"]:checked'),
+      function (el) { return (el.value || '').trim(); }
+    ).filter(Boolean);
+  }
+
+  function trimTitle(text) {
+    var limit = 60;
+    if (text.length <= limit) return text;
+    var cut = text.slice(0, limit);
+    var pairs = [['（', '）'], ['(', ')']];
+    for (var i = 0; i < pairs.length; i++) {
+      var open = pairs[i][0], close = pairs[i][1];
+      var nOpen = cut.split(open).length - 1, nClose = cut.split(close).length - 1;
+      if (nOpen > nClose) {
+        var pos = cut.lastIndexOf(open);
+        if (pos > 0) cut = cut.slice(0, pos);
+      }
+    }
+    return cut.replace(/[ ·・,，、;；:：\-—_/|（(]+$/, '').trim();
+  }
+
+  function compute() {
+    var sel = document.getElementById('subject-grade')
+      || document.querySelector('select[name="subject_pk"]');
+    var pk = sel ? sel.value : '';
+    var m = meta[pk];
+    if (!m) return input.value;
+    var title = (m.name || '') + (m.grade ? ' ' + m.grade : '');
+    if (m.version) title += '（' + m.version + '）';
+    var chs = pickedChapters();
+    if (chs.length === 1) title += ' · ' + chs[0];
+    return trimTitle(title);
+  }
+
+  function refresh(force) {
+    if (dirty && !force) return;
+    var next = compute();
+    if (next && input.value !== next) input.value = next;
+  }
+
+  input.addEventListener('input', function () { dirty = true; });
+  var reset = document.getElementById('title-reset');
+  if (reset) {
+    reset.addEventListener('click', function () {
+      dirty = false;
+      refresh(true);
+      input.focus();
+    });
+  }
+  var gradeSel = document.getElementById('subject-grade');
+  if (gradeSel) {
+    gradeSel.addEventListener('change', function () { window.setTimeout(function () { refresh(false); }, 0); });
+  }
+  document.addEventListener('change', function (ev) {
+    var t = ev.target;
+    if (!t) return;
+    if (t.name === 'chapters' || t.name === 'subject_pk') refresh(false);
+  });
+  if (!input.value.trim()) refresh(true);   // 首屏为空才自动填，别覆盖服务端/手填的值
+})();
+</script>
+
+<script>
+/* UI 落地：范围折叠块的标题跟着勾选变（不用展开就能看出选了哪些） */
+(function () {
+  var fold = document.getElementById("range-fold");
+  var state = document.getElementById("range-state");
+  if (!fold || !state) { return; }
+  function sync() {
+    var chs = Array.prototype.map.call(
+      document.querySelectorAll('input[name="chapters"]:checked'),
+      function (el) { return el.value; });
+    var kps = document.querySelectorAll('input[name="kps"]:checked').length;
+    if (chs.length === 1) { state.textContent = chs[0]; }
+    else if (chs.length > 1) { state.textContent = "已选 " + chs.length + " 个单元"; }
+    else if (kps) { state.textContent = "已选 " + kps + " 个知识点"; }
+    else { state.textContent = "全册（不限范围）"; }
+  }
+  document.addEventListener("change", function (ev) {
+    var t = ev.target;
+    if (t && (t.name === "chapters" || t.name === "kps")) { sync(); }
+  });
+  sync();
+})();
+</script>
+
 {% endblock %}

@@ -755,9 +755,46 @@ async def create_submission(request: Request, pid: str = Form(""),
 
 
 # --------------------------------------------------------------------------- 结果页
+def _verdict_text(verdict, text) -> str:
+    """改卷记录里的「改前／改后」：判定中文 + （作答文本）。"""
+    label = VERDICT_LABELS.get(str(verdict or ""), str(verdict or "") or "—")
+    body = str(text or "").strip()
+    return "%s（%s）" % (label, body) if body else label
+
+
+def _group_edits(edits) -> list:
+    """改卷记录 → 时间线批次（按 batch_id 归组，最近一批在前，t56 页面用）。"""
+    groups = {}
+    order = []
+    for e in edits or []:
+        batch_id = str(e.get("batch_id") or "")
+        if batch_id not in groups:
+            groups[batch_id] = {
+                "batch_id": batch_id, "short": batch_id[:8] or "—",
+                "when": _fmt_when(e.get("created_at")),
+                "operator": str(e.get("operator") or "teacher"),
+                "source": str(e.get("source") or "confirm"),
+                "changes": [],
+            }
+            order.append(batch_id)
+        group = groups[batch_id]
+        if str(e.get("source") or "") == "undo":
+            group["source"] = "undo"
+        group["changes"].append({
+            "idx": e.get("idx"), "blank": e.get("blank"),
+            "qtype": str(e.get("qtype") or ""),
+            "before": _verdict_text(e.get("before_verdict"), e.get("before_text")),
+            "after": _verdict_text(e.get("after_verdict"), e.get("after_text")),
+            "note": str(e.get("note") or ""),
+        })
+    return [groups[b] for b in order]
+
+
 def _render_result(conn, sid: str, reocr: bool = False, filled: int = 0, left: int = 0,
                    empty_batch: bool = False, changed=None, status_code: int = 200,
-                   by_ids: bool = False, qr_pid: str = ""):
+                   by_ids: bool = False, qr_pid: str = "",
+                   saved: int = None, undone: int = None, batch: str = "",
+                   student_saved: bool = False):
     row, detail = _load_submission(conn, sid)
     if row is None:
         return _render_error("submission_not_found", {"sid": sid}, status_code=404,
@@ -795,8 +832,31 @@ def _render_result(conn, sid: str, reocr: bool = False, filled: int = 0, left: i
     else:
         by_ids_note = ""
 
+    student = _student_of_row(row, detail)
+
     notice = None
-    if changed is not None:
+    if student_saved:
+        notice = {"tone": "ok", "title": "已保存学生信息",
+                  "detail": "学号 %s%s。这份卷的记录页与导出 CSV 都会带上它。"
+                            % (student["no"] or "（空）",
+                               (" · 姓名 " + student["name"]) if student["name"] else "")}
+    elif saved is not None:
+        # t56：保存改判后的明确反馈（不静默跳转）
+        if saved > 0:
+            notice = {"tone": "ok",
+                      "title": "已保存 %d 项改判" % saved,
+                      "detail": "批次 %s · 分数已重算：%s / %s。这次改动已记进「改卷记录」，"
+                                "可以整批撤销；重复提交是幂等的，不会重复计分。"
+                                % (batch or "—", score, full)}
+        else:
+            notice = {"tone": "warn", "title": "没有改动，未提交",
+                      "detail": "改判框里的值和现在一样，所以这次没有写入记录，分数也没变。"}
+    elif undone is not None:
+        notice = {"tone": "ok",
+                  "title": "已撤销这批改判（%s 处）" % undone,
+                  "detail": "判定已恢复成改前的样子，分数按撤销后重算：%s / %s。"
+                            "撤销本身也记在「改卷记录」里。" % (score, full)}
+    elif changed is not None:
         # 人工改判是用户刚做的事，优先级最高（哪怕上一批识别是空的）
         if changed:
             text = "分数已重算：%s / %s。重复提交是幂等的，不会重复计分。" % (score, full)
@@ -830,18 +890,59 @@ def _render_result(conn, sid: str, reocr: bool = False, filled: int = 0, left: i
                   confirmed_at=detail.get("confirmed_at") or "",
                   show_blank=any(r["blank"] != 1 for r in rows),
                   n_units=len(rows),
+                  edits=grade.list_edits(conn, sid),
+                  edit_batches=_group_edits(grade.list_edits(conn, sid)),
+                  saved=saved, undone=undone, batch=batch,
+                  student_no=student["no"], student_name=student["name"],
+                  student_saved=student_saved,
                   pending_items=pending_items, first_pending=first_pending)
 
 
 @router.get("/submissions/{sid}", response_class=HTMLResponse)
 @router.get("/submissions/{sid}/", response_class=HTMLResponse)
 def result_page(request: Request, sid: str, reocr: int = 0, filled: int = 0, left: int = 0,
-                empty_batch: int = 0, changed: int = None, by_ids: int = 0, qr: str = ""):
-    """结果页：总分 + 逐题表 + 待确认裁切图 + 识别中轮询。"""
+                empty_batch: int = 0, changed: int = None, by_ids: int = 0, qr: str = "",
+                saved: int = None, undone: int = None, batch: str = "",
+                student_saved: int = 0):
+    """结果页：总分 + 逐题表 + 待确认裁切图 + 改卷记录 + 学生信息 + 识别中轮询。"""
     return _guard(request, lambda conn: _render_result(
         conn, sid, reocr=bool(reocr), filled=filled, left=left,
         empty_batch=bool(empty_batch), changed=changed,
-        by_ids=bool(by_ids), qr_pid=(qr or "").strip()))
+        by_ids=bool(by_ids), qr_pid=(qr or "").strip(),
+        saved=saved, undone=undone, batch=(batch or "").strip(),
+        student_saved=bool(student_saved)))
+
+
+# --------------------------------------------------------------------------- 学生信息（t60）
+def _student_of_row(row, detail: dict) -> dict:
+    """submissions.student_no/name（t58 加的列）+ detail.student 兜底。"""
+    keys = row.keys() if hasattr(row, "keys") else []
+    info = detail.get("student") if isinstance(detail.get("student"), dict) else {}
+    no = str(row["student_no"] or "") if "student_no" in keys else ""
+    name = str(row["student_name"] or "") if "student_name" in keys else ""
+    return {"no": (no or str(info.get("no") or "")).strip(),
+            "name": (name or str(info.get("name") or "")).strip()}
+
+
+@router.post("/submissions/{sid}/student")
+async def set_student(request: Request, sid: str):
+    """老师补录/修改学生信息（学号/姓名）→ 303 回结果页并提示已保存。"""
+    form = await request.form()
+    no = str(form.get("student_no") or "").strip()[:32]
+    name = str(form.get("student_name") or "").strip()[:32]
+
+    def run(conn):
+        if _load_submission(conn, sid)[0] is None:
+            return _render_error("submission_not_found", {"sid": sid}, status_code=404,
+                                 retry_href="/records")
+        res = grade.set_student(conn, sid, no, name)
+        if res.get("error"):
+            return _render_error("internal_error",
+                                 {"message": res.get("detail") or res.get("error") or ""},
+                                 status_code=400, retry_href="/submissions/%s" % sid)
+        return RedirectResponse("/submissions/%s?student_saved=1" % sid, status_code=303)
+
+    return _guard(request, run)
 
 
 # --------------------------------------------------------------------------- 重新识别
@@ -1009,9 +1110,14 @@ async def confirm(request: Request, sid: str, fmt: str = Query("", alias="format
                                  retry_href="/submissions")
         units = detail.get("items") or []
         question_level, per_unit = _parse_confirm(form, units)
+        # t55：一次 HTTP 提交共用一个 batch_id（整题改判 + 逐空改判算同一次），
+        # operator 从表单取（改卷页会带上），缺省 'teacher'
+        batch_id = uuid.uuid4().hex
+        operator = str(form.get("operator") or "").strip() or "teacher"
         changed = 0
         if question_level:
-            res = grade.apply_confirm(conn, sid, question_level)
+            res = grade.apply_confirm(conn, sid, question_level, batch_id=batch_id,
+                                      operator=operator)
             if res.get("error"):
                 if wants_json:
                     return _json_error(res["error"], _error_detail(res), status_code=422,
@@ -1024,7 +1130,8 @@ async def confirm(request: Request, sid: str, fmt: str = Query("", alias="format
             # 老版本没有 _parse_corrections → 用本地 _apply_per_unit 兜底（队长要求先留着）
             if _GRADE_NARROW_OK:
                 narrow = {"%s-%s" % (k[0], k[1]): v for k, v in per_unit.items()}
-                res = grade.apply_confirm(conn, sid, narrow)
+                res = grade.apply_confirm(conn, sid, narrow, batch_id=batch_id,
+                                          operator=operator)
             else:
                 res = _apply_per_unit(conn, sid, per_unit)
             if res.get("error"):
@@ -1038,9 +1145,56 @@ async def confirm(request: Request, sid: str, fmt: str = Query("", alias="format
             _drop_annotation(_out_root(request), row["pid"], sid)   # 改判了 → 批注图过期
         if wants_json:
             return JSONResponse(_confirm_payload(conn, sid, changed))
-        return RedirectResponse("/submissions/%s?changed=%d" % (sid, changed), status_code=303)
+        return RedirectResponse(
+            "/submissions/%s?saved=%d&changed=%d&batch=%s"
+            % (sid, changed, changed, batch_id[:8]), status_code=303)
 
     return _guard(request, run, json_errors=wants_json)
+
+
+# --------------------------------------------------------------------------- 改卷留痕（t55）
+@router.get("/submissions/{sid}/edits")
+def submission_edits(request: Request, sid: str):
+    """改卷记录（JSON，时间倒序）：谁、什么时候、把哪一空从什么改成什么。"""
+    def run(conn):
+        if _load_submission(conn, sid)[0] is None:
+            return _json_error("submission_not_found", {"sid": sid}, status_code=404, sid=sid)
+        return JSONResponse({"sid": sid, "edits": grade.list_edits(conn, sid)})
+
+    return _guard(request, run, json_errors=True)
+
+
+@router.get("/submissions/{sid}/edits.csv")
+def submission_edits_csv(request: Request, sid: str):
+    """改卷记录导出（UTF-8 BOM，Excel 直接打开不乱码）。"""
+    def run(conn):
+        if _load_submission(conn, sid)[0] is None:
+            return _json_error("submission_not_found", {"sid": sid}, status_code=404, sid=sid)
+        text = grade.export_edits_csv(conn, sid)
+        return Response(content=text.encode("utf-8"),
+                        media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition":
+                                 'attachment; filename="%s-edits.csv"' % sid})
+
+    return _guard(request, run, json_errors=True)
+
+
+@router.post("/submissions/{sid}/edits/{batch_id}/undo")
+def submission_undo_batch(request: Request, sid: str, batch_id: str):
+    """整批撤销：恢复改前判定/文本并重算分数，回滚本身也留一条 source='undo' 的记录。"""
+    def run(conn):
+        res = grade.undo_batch(conn, sid, batch_id)
+        if res.get("error"):
+            code = res["error"]
+            status = 404 if code in ("batch_not_found", "submission_not_found") else 400
+            return _render_error(code, {"sid": sid, "batch_id": batch_id},
+                                 status_code=status,
+                                 retry_href="/submissions/%s" % sid)
+        return RedirectResponse("/submissions/%s?undone=%d&batch=%s"
+                                % (sid, int(res.get("restored") or 0), batch_id[:8]),
+                                status_code=303)
+
+    return _guard(request, run)
 
 
 # --------------------------------------------------------------------------- 状态 / 裁切图
@@ -1444,8 +1598,14 @@ def _record_row(row) -> dict:
     empty = bool(detail.get("empty_batch"))
     score, full = _as_int(row["score"]), _as_int(row["full"])
     status = _record_status(pending_units, unsure_units, empty)
+    keys = row.keys() if hasattr(row, "keys") else []
+    student = detail.get("student") if isinstance(detail.get("student"), dict) else {}
     return {
         "sid": row["sid"], "pid": row["pid"] or "",
+        # t58：学生信息（列名固定；空值给空串，模板/CSV 都不会出现 None）
+        "student_no": (row["student_no"] if "student_no" in keys else "") or "",
+        "student_name": (row["student_name"] if "student_name" in keys else "") or (
+            student.get("name") or ""),
         "title": (row["title"] or "") if "title" in row.keys() else "",
         "created_at": row["created_at"] or "",
         "when": _fmt_when(row["created_at"]),
@@ -1462,19 +1622,34 @@ def _record_row(row) -> dict:
     }
 
 
-def _render_records(conn, pid: str = "", q: str = "", only: str = "",
-                    deleted: bool = False, status_code: int = 200):
+def _records_have_student(conn) -> bool:
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(submissions)")}
+    except sqlite3.Error:
+        return False
+    return "student_no" in cols and "student_name" in cols
+
+
+def _records_items(conn, pid: str = "", q: str = "", only: str = "", student: str = ""):
+    """判卷记录的行（含学生信息）→ (items, total, papers)。"""
     where, params = [], []
     if pid:
         where.append("s.pid = ?")
         params.append(pid)
+    if student:
+        where.append("s.student_no LIKE ?")
+        params.append(student.replace("%", "").replace("_", "") + "%")
     if q:
         like = "%%%s%%" % q.replace("%", "").replace("_", "")
-        where.append("(s.sid LIKE ? OR s.pid LIKE ? OR COALESCE(p.title, '') LIKE ?)")
-        params += [like, like, like]
+        where.append("(s.sid LIKE ? OR s.pid LIKE ? OR COALESCE(p.title, '') LIKE ?"
+                     " OR COALESCE(s.student_no, '') LIKE ? OR COALESCE(s.student_name, '') LIKE ?)")
+        params += [like, like, like, like, like]
 
+    has_student = _records_have_student(conn)
+    student_cols = (", s.student_no, s.student_name," if has_student
+                    else ", '' AS student_no, '' AS student_name,")
     sql = ("SELECT s.sid, s.pid, s.created_at, s.score, s.full, s.warp_ok,"
-           " s.detail_json, COALESCE(p.title, '') AS title"
+           " s.detail_json" + student_cols + " COALESCE(p.title, '') AS title"
            " FROM submissions s LEFT JOIN papers p ON p.pid = s.pid")
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -1500,6 +1675,13 @@ def _render_records(conn, pid: str = "", q: str = "", only: str = "",
     except sqlite3.Error:
         papers = []
 
+    return items, total, papers
+
+
+def _render_records(conn, pid: str = "", q: str = "", only: str = "",
+                    deleted: bool = False, status_code: int = 200, student: str = ""):
+    items, total, papers = _records_items(conn, pid=pid, q=q, only=only, student=student)
+
     notice = None
     if deleted:
         notice = {"tone": "ok", "title": "已删除这条判卷记录",
@@ -1507,18 +1689,22 @@ def _render_records(conn, pid: str = "", q: str = "", only: str = "",
 
     return render("grade_records.html", status_code=status_code, page_title="判卷记录",
                   items=items, total=total, papers=papers, notice=notice,
-                  f_pid=pid, f_q=q, f_only=only,
+                  f_pid=pid, f_q=q, f_only=only, f_student=student,
                   n_pending=sum(1 for it in items if it["needs_human"]),
+                  # t60：按学号去重统计「涉及学生 N 人」（空学号不算一个人）
+                  n_students=len({str(it.get("student_no") or "") for it in items
+                                  if str(it.get("student_no") or "").strip()}),
                   limit=RECORDS_LIMIT)
 
 
 @router.get("/records", response_class=HTMLResponse)
 def records_page(request: Request, pid: str = "", q: str = "", only: str = "",
-                 deleted: int = 0):
-    """判卷记录列表（历史判过的卷子）。独立路径，不会被 /submissions/{sid} 吞掉。"""
+                 deleted: int = 0, student: str = ""):
+    """判卷记录列表（历史判过的卷子）。支持 ?student=学号前缀 过滤（t58）。"""
     return _guard(request, lambda conn: _render_records(
         conn, pid=(pid or "").strip(), q=(q or "").strip(),
-        only=(only or "").strip(), deleted=bool(deleted)))
+        only=(only or "").strip(), deleted=bool(deleted),
+        student=(student or "").strip()))
 
 
 def _path_within(path: str, root: str) -> bool:
@@ -1587,7 +1773,8 @@ def delete_record(request: Request, sid: str):
 CSV_DETAIL_HEAD = ("题号", "题型", "空号", "知识点ID", "知识点名称", "标准答案",
                    "识别值", "判定", "是否人工确认", "待确认原因")
 CSV_REPORT_HEAD = ("知识点ID", "名称", "题数", "答对", "答错", "待确认", "正确率")
-CSV_RECORDS_HEAD = ("时间", "卷号", "标题", "得分", "满分", "待确认", "提交号")
+CSV_RECORDS_HEAD = ("时间", "卷号", "标题", "得分", "满分", "待确认", "提交号",
+                    "student_no", "student_name")
 
 
 def _csv_response(rows, header, file_name: str, head_lines=()) -> Response:
@@ -1709,22 +1896,18 @@ def paper_report_csv(request: Request, pid: str):
 
 
 @router.get("/records.csv")
-def records_csv(request: Request):
-    """全部判卷记录汇总 CSV。"""
+def records_csv(request: Request, pid: str = "", q: str = "", only: str = "",
+                student: str = ""):
+    """全部判卷记录汇总 CSV（t58：带 student_no / student_name，支持 ?student= 前缀过滤）。"""
     def run(conn):
-        rows = []
-        try:
-            found = conn.execute(
-                "SELECT s.sid, s.pid, s.created_at, s.score, s.full, s.warp_ok,"
-                " s.detail_json, COALESCE(p.title, '') AS title"
-                " FROM submissions s LEFT JOIN papers p ON p.pid = s.pid"
-                " ORDER BY s.created_at DESC, s.sid DESC LIMIT %d" % RECORDS_LIMIT).fetchall()
-        except sqlite3.Error:
-            found = []
-        for r in found:
-            item = _record_row(r)
-            rows.append([item["when"], item["pid"], item["title"], item["score"], item["full"],
-                         item["pending_items"], item["sid"]])
+        items, _total, _papers = _records_items(
+            conn, pid=(pid or "").strip(), q=(q or "").strip(),
+            only=(only or "").strip(), student=(student or "").strip())
+        rows = [[item["when"], item["pid"], item["title"], item["score"], item["full"],
+                 item["pending_items"], item["sid"],
+                 "" if item.get("student_no") is None else item["student_no"],
+                 "" if item.get("student_name") is None else item["student_name"]]
+                for item in items]
         name = "判卷记录_%s.csv" % _dt.datetime.now().strftime("%Y%m%d-%H%M")
         return _csv_response(rows, CSV_RECORDS_HEAD, name)
 

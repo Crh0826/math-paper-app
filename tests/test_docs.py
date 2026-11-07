@@ -88,6 +88,97 @@ class TestReadme(unittest.TestCase):
         self.assertIn("已知限制", tail)
 
 
+class TestFeatureDocs(unittest.TestCase):
+    """t64：三项新功能（导入 / 改卷记录 / 学生信息）必须有文档入口，且模板文件名不能写错。"""
+
+    def setUp(self):
+        self.readme = read(README)
+        self.index = read(os.path.join(DOCS, "INDEX.md"))
+
+    def test_readme_lists_new_screenshots(self):
+        for name, kw in (("17-grade-records.png", "改卷记录"), ("18-student-info.png", "学生信息")):
+            with self.subTest(name=name):
+                self.assertIn("docs/%s" % name, self.readme, "README 没引用 %s" % name)
+                row = [ln for ln in self.readme.splitlines() if name in ln]
+                self.assertTrue(row and kw in row[0], "README 里 %s 那行没写清楚功能：%r" % (name, row))
+
+    def test_index_has_three_feature_sections(self):
+        for kw in ("导入题库", "改卷记录", "学生信息", "/import", "/records"):
+            with self.subTest(kw=kw):
+                self.assertIn(kw, self.index, "docs/INDEX.md 缺入口：%s" % kw)
+
+    def test_index_template_names_match_repo(self):
+        tpl = os.path.join(APP_DIR, "templates")
+        for name in ("grade_records.html", "import.html", "grade_result.html", "grade_upload.html"):
+            with self.subTest(name=name):
+                self.assertIn(name, self.index, "INDEX 没写模板文件名 %s" % name)
+                self.assertTrue(os.path.isfile(os.path.join(tpl, name)), "模板不存在：%s" % name)
+
+    def test_no_wrong_template_name(self):
+        """/records 的模板叫 grade_records.html，全文档不许出现裸 records.html。"""
+        wrong = re.compile(r"(?<!grade_)records\.html")
+        for path in [README, os.path.join(DOCS, "INDEX.md")]:
+            with self.subTest(path=os.path.basename(path)):
+                text = read(path)
+                bad = [m.group(0) for m in wrong.finditer(text)
+                       if not any(w in text[max(0, m.start() - 12):m.start()]
+                                  for w in ("不是", "没有", "不存在"))]
+                self.assertEqual([], bad, "写成了不存在的 records.html：%s" % bad)
+
+    def test_index_relative_links_resolve(self):
+        base = DOCS
+        for m in re.finditer(r"\]\((\.{0,2}/?[^)]+)\)", self.index):
+            ref = m.group(1).split("#")[0]
+            if not ref or ref.startswith(("http://", "https://", "mailto:")):
+                continue
+            with self.subTest(ref=ref):
+                self.assertTrue(os.path.exists(os.path.join(base, ref)),
+                                "docs/INDEX.md 链接指向不存在的路径：%s" % ref)
+
+
+class TestDesignTokens(unittest.TestCase):
+    """t100：全站视觉 token 必须真的落在 app.css 里，且旧类名有映射说明。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.css = read(os.path.join(APP_DIR, "static", "app.css"))
+        cls.readme = read(README)
+
+    def test_token_variables_present(self):
+        for var in ("--brand:", "--brand-soft:", "--brand-strong:",
+                    "--gray-900:", "--gray-700:", "--gray-500:", "--gray-200:", "--gray-50:",
+                    "--r-lg:", "--r-sm:", "--s1:", "--s2:", "--s3:", "--s4:",
+                    "--fs-h:", "--fs-body:", "--fs-small:"):
+            with self.subTest(var=var):
+                self.assertIn(var, self.css, "app.css 缺设计 token %s" % var)
+
+    def test_old_variables_map_to_tokens(self):
+        """旧变量名必须仍在（页面在用），且指向新 token。"""
+        for old, new in (("--accent:", "var(--brand)"), ("--accent-soft:", "var(--brand-soft)"),
+                         ("--ink:", "var(--gray-900)"), ("--ink-2:", "var(--gray-700)"),
+                         ("--muted:", "var(--gray-500)"), ("--line:", "var(--gray-200)"),
+                         ("--bg:", "var(--gray-50)"), ("--radius:", "var(--r-lg)")):
+            with self.subTest(var=old):
+                line = next((ln for ln in self.css.splitlines() if ln.strip().startswith(old)), "")
+                self.assertIn(new, line, "%s 没有映射到 %s" % (old, new))
+
+    def test_three_buttons_and_two_notices(self):
+        for sel in (".btn-primary", ".btn-secondary", ".btn-ghost",
+                    ".notice.ok", ".notice.warn", ".banner-ok"):
+            with self.subTest(sel=sel):
+                self.assertIn(sel, self.css, "app.css 缺组件 %s" % sel)
+
+    def test_mapping_documented(self):
+        """改页面的人要能一眼看到「旧类名 → 新 token」的对照。"""
+        blob = self.css[:4000]
+        for word in ("设计 token", "旧类名映射", "--accent", "--radius", ".btn-ghost"):
+            with self.subTest(word=word):
+                self.assertIn(word, blob, "app.css 开头缺映射说明：%s" % word)
+        for word in ("设计 token", "--brand", ".btn-secondary"):
+            with self.subTest(word=word):
+                self.assertIn(word, self.readme, "README 缺「设计 token 与旧类名映射」小节：%s" % word)
+
+
 class TestDocsArtifacts(unittest.TestCase):
     def test_screenshots_present_and_nonempty(self):
         expected = ("01-compose.png", "02-papers-list.png", "03-guide.png", "04-health.png",
@@ -95,7 +186,8 @@ class TestDocsArtifacts(unittest.TestCase):
                     "06-grade-result.png", "07-train-paper.png",
                     "08-degraded-word.png", "09-degraded-db.png",
                     "10-layout-form.png", "11-layout-compact.png", "12-lan-qr.png",
-                    "13-seed-reroll.png")
+                    "13-seed-reroll.png", "14-settings.png", "15-ocr-notice.png", "16-import-mobile.png",
+                    "17-grade-records.png", "18-student-info.png", "19-avail-line.png")
         for name in expected:
             with self.subTest(name=name):
                 path = os.path.join(DOCS, name)

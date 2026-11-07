@@ -52,8 +52,17 @@
     {% if has_paper_pdf and has_card_pdf %}
     <a class="btn btn-primary" href="/papers/{{ pid }}/print.pdf">合并打印 PDF（{{ total_n }} 页）</a>
     {% endif %}
+    <a class="btn" href="/papers/{{ pid }}/calibration.pdf"
+       title="单独打一张校准页：A4 上的 100mm 方框量出来若不是 100mm，说明打印缩放/边距要调">
+      单独下载校准页（1 页）
+    </a>
     <a class="btn" href="/">再组一份</a>
   </div>
+  <p class="field-hint">
+    校准页<strong>默认不跟着合并打印件走</strong>（省纸）。换打印机、调边距、或第一次用时，
+    点「单独下载校准页」打一张：用尺子量方框内边是不是 <strong>100mm</strong>，不是就说明打印被缩放了。
+    想每次都附带，可在 <a href="/settings#print">设置 · 打印</a> 里打开开关。
+  </p>
 </div>
 
 <section class="card">
@@ -126,6 +135,9 @@
     <input type="hidden" name="n_choice" value="{{ reroll.n_choice }}">
     <input type="hidden" name="n_fill" value="{{ reroll.n_fill }}">
     <input type="hidden" name="n_solution" value="{{ reroll.n_solution }}">
+    {# t11：同一学科内换题，不能跨学科 #}
+    {% if reroll.subject_pk %}<input type="hidden" name="subject_pk" value="{{ reroll.subject_pk }}">{% endif %}
+    {% for s in reroll.subjects %}<input type="hidden" name="subjects" value="{{ s }}">{% endfor %}
     {% for c in reroll.chapters %}<input type="hidden" name="chapters" value="{{ c }}">{% endfor %}
     {% for k in reroll.kps %}<input type="hidden" name="kps" value="{{ k }}">{% endfor %}
     <input type="hidden" name="kp_mode" value="{{ reroll.kp_mode }}">
@@ -144,11 +156,12 @@
     <dt>随机种子</dt>
     <dd><span class="mono" id="paper-seed">{{ params.seed }}</span>
       <span class="muted">（填这个数可以复现完全一样的卷）</span></dd>
+    <dt>学科</dt><dd>{{ reroll.subject_pk or (reroll.subjects | join("、")) or "不限（老卷）" }}</dd>
     <dt>题量</dt><dd>{% for q, n in (params.mix or {}).items() %}{{ q }} {{ n }}{% if not loop.last %} · {% endif %}{% endfor %}</dd>
     <dt>范围</dt><dd>
       {% if params.scope and params.scope.chapters %}{{ params.scope.chapters | join("、") }}
       {% elif params.scope and params.scope.kps %}{{ params.scope.kps | join("、") }}
-      {% else %}全库不限{% endif %}
+      {% else %}该学科下不限{% endif %}
     </dd>
     <dt>只选有答案</dt><dd>{% if params.requirements and params.requirements.need_answer %}是{% else %}否{% endif %}</dd>
     <dt>版面</dt><dd>{% if layout == "normal" %}宽裕（默认页边距与行距）{% else %}省纸（页边距与行距收紧）{% endif %}</dd>

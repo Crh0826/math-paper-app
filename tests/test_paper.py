@@ -93,10 +93,31 @@ def doc_root(docx_path):
 
 
 def body_tables(docx_path):
-    """body 级 w:tbl = 一题一框的外框（题目内容里的表格都在单元格内部，不算）。"""
+    """body 级的 **1×1** w:tbl = 一题一框的外框。
+
+    题目内容里的表格都在单元格内部（不算 body 级）；首页「班级/姓名/学号」学生栏是 1×3 的
+    装饰表（t59），也不该被当成题框 —— 所以这里按 1 行 1 列过滤。
+    """
+    W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
     root = doc_root(docx_path)
-    body = root.find("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}body")
-    return [el for el in body if etree.QName(el).localname == "tbl"]
+    body = root.find(W + "body")
+    out = []
+    for el in body:
+        if etree.QName(el).localname != "tbl":
+            continue
+        rows = [r for r in el if etree.QName(r).localname == "tr"]
+        cells = [c for c in rows[0] if etree.QName(c).localname == "tc"] if rows else []
+        if len(rows) == 1 and len(cells) == 1:
+            out.append(el)
+    return out
+
+
+def item_tables(docx_path):
+    """只取 1×1 的题框表（首页 1×3 学生信息栏是装饰表，不算题框）。"""
+    from docx import Document as _D
+
+    return [t for t in _D(docx_path).tables
+            if len(t.rows) == 1 and len(t.columns) == 1]
 
 
 def all_text(docx_path) -> str:
@@ -131,7 +152,7 @@ def box_paragraphs(docx_path, i):
     from docx import Document
 
     doc = Document(docx_path)
-    cell = doc.tables[i].cell(0, 0)
+    cell = item_tables(docx_path)[i].cell(0, 0)
     return cell.paragraphs
 
 
@@ -207,7 +228,7 @@ class PaperDocxTest(unittest.TestCase):
 
         doc = Document(self.docx)
         for i, it in enumerate(self.m["items"], 1):
-            runs = doc.tables[i - 1].cell(0, 0).paragraphs[0].runs
+            runs = item_tables(self.docx)[i - 1].cell(0, 0).paragraphs[0].runs
             first = next((r for r in runs if r.text.strip()), None)
             self.assertIsNotNone(first, "第 %d 题没有题号 run" % i)
             self.assertTrue(first.text.startswith("%d．" % i), first.text)
@@ -221,7 +242,7 @@ class PaperDocxTest(unittest.TestCase):
 
         doc = Document(self.docx)
         for i, frag in enumerate(STEM_FRAGS, 1):
-            cell_text = "\n".join(p.text for p in doc.tables[i - 1].cell(0, 0).paragraphs)
+            cell_text = "\n".join(p.text for p in item_tables(self.docx)[i - 1].cell(0, 0).paragraphs)
             self.assertIn(frag, cell_text, "第 %d 题的题干没进自己的题框" % i)
 
     def test_no_stem_text_outside_boxes(self):
@@ -262,8 +283,64 @@ class PaperDocxTest(unittest.TestCase):
         self.assertIn("七年级数学 · 训练卷 A", head)
         self.assertIn(FIXED_PID, head)
         body = all_text(self.docx)
-        for label in ("姓名", "班级", "日期"):
-            self.assertIn(label, body)
+        for label in ("班级", "姓名", "学号"):
+            self.assertIn(label, body, "卷面首页要有可手写的学生信息栏：%s" % label)
+
+    def test_student_line_has_class_name_id(self):
+        """卷面首页要有「班级／姓名／学号」三栏（与答题卡学生信息区对应）。"""
+        body = all_text(self.docx)
+        self.assertIn("班级：", body)
+        self.assertIn("姓名：", body)
+        self.assertIn("学号：", body)
+        self.assertLess(body.index("班级："), body.index("姓名："), "顺序应为 班级→姓名→学号")
+        self.assertLess(body.index("姓名："), body.index("学号："))
+        # 1×3 无框表格，不引入图片关系
+        doc = _Docx(self.docx)
+        student = [t for t in doc.tables
+                   if len(t.rows) == 1 and len(t.columns) == 3
+                   and "班级：" in t.rows[0].cells[0].text]
+        self.assertTrue(student, "没找到 1×3 的学生信息栏表格")
+        self.assertNotIn("rId", student[0]._tbl.xml.replace("rIdImg", ""),
+                         "学生栏不该引入图片关系")
+
+    def test_student_line_row_height_is_writable(self):
+        """行高 ≥8mm、字号 11pt、空白段带下划线 —— 学生要能直接写上去。"""
+        doc = _Docx(self.docx)
+        student = [t for t in doc.tables
+                   if len(t.rows) == 1 and len(t.columns) == 3
+                   and "班级：" in t.rows[0].cells[0].text][0]
+        trPr = student.rows[0]._tr.find(_qn("w:trPr"))
+        height = trPr.find(_qn("w:trHeight"))
+        self.assertIsNotNone(height, "学生栏没设行高")
+        mm = int(height.get(_qn("w:val"))) / 20.0 / 72 * 25.4
+        self.assertGreaterEqual(mm, 8.0, "行高只有 %.1fmm，手写太挤" % mm)
+        runs = student.rows[0].cells[0].paragraphs[0].runs
+        self.assertEqual(runs[0].font.size, _Pt(11))
+        # 手写线：单元格底框（字符下划线对行尾空白不生效，Word 不给尾随空格画线）
+        tcPr = student.rows[0].cells[0]._tc.find(_qn("w:tcPr"))
+        bottom = tcPr.find(_qn("w:tcBorders")).find(_qn("w:bottom"))
+        self.assertEqual(bottom.get(_qn("w:val")), "single", "学生栏要有一条可手写的底线")
+        self.assertNotIn("rId", student._tbl.xml, "手写线不能用图片关系")
+
+    def test_footer_keeps_pid_and_page_numbers(self):
+        """每页页脚都要有 卷面 · 第 N/M 页 · 卷号 Pxxx（compact 版式下也不能丢）。"""
+        xml = footer_xml(self.docx)
+        for need in ("卷面", "PAGE", "NUMPAGES", FIXED_PID):
+            self.assertIn(need, xml, "页脚缺 %s：%s" % (need, xml[:200]))
+        # compact 版式（默认）同样要有
+        d = os.path.join(self.tmp, "compactfooter")
+        os.makedirs(d, exist_ok=True)
+        built = paper.build_docx(self.m, d, name="cf", layout="compact")
+        xml2 = footer_xml(built["docx"])
+        for need in ("卷面", "PAGE", "NUMPAGES", FIXED_PID):
+            self.assertIn(need, xml2, "compact 页脚缺 %s" % need)
+
+    def test_decor_table_not_counted_as_item(self):
+        """学生栏是装饰表，不能被算成题框（保真闸门靠这个区分 1×1 题框 / 1×3 学生栏）。"""
+        health = paper.check_docx(self.docx, self.m, built_expected=None) \
+            if False else paper.check_docx(self.docx, self.m)
+        self.assertEqual(health["n_items_observed"], health["n_items"])
+        self.assertEqual(health["decor_tables"], 1)
 
     def test_footer_has_page_field(self):
         xml = footer_xml(self.docx)
@@ -304,7 +381,7 @@ class PaperDocxTest(unittest.TestCase):
         from docx import Document
 
         doc = Document(self.docx)
-        box = doc.tables[0].cell(0, 0)
+        box = item_tables(self.docx)[0].cell(0, 0)
         self.assertTrue(box.tables, "选择题的选项没有排成等宽列表格")
         opt_table = box.tables[0]
         self.assertEqual(len(opt_table.columns), 4)
@@ -319,7 +396,7 @@ class PaperDocxTest(unittest.TestCase):
         tmp = os.path.join(self.tmp, "imgopt")
         os.makedirs(tmp, exist_ok=True)
         built = paper.build_docx(manifest([Q_IMAGE_OPTIONS]), tmp, name="imgopt")
-        box = Document(built["docx"]).tables[0].cell(0, 0)
+        box = item_tables(built["docx"])[0].cell(0, 0)
         self.assertTrue(box.tables, "数轴选项图（155pt）应该能放进 2 列网格")
         grid = box.tables[0]
         self.assertEqual(len(grid.columns), 2)
@@ -336,7 +413,7 @@ class PaperDocxTest(unittest.TestCase):
         tmp = os.path.join(self.tmp, "longopt")
         os.makedirs(tmp, exist_ok=True)
         built = paper.build_docx(manifest([Q_LONG_OPTIONS]), tmp, name="longopt")
-        box = Document(built["docx"]).tables[0].cell(0, 0)
+        box = item_tables(built["docx"])[0].cell(0, 0)
         self.assertTrue(box.tables, "长选项也应该进网格（每个选项一行），不能流式拼在一起")
         grid = box.tables[0]
         self.assertEqual((len(grid.columns), len(grid.rows)), (1, 4))
@@ -350,7 +427,7 @@ class PaperDocxTest(unittest.TestCase):
         tmp = os.path.join(self.tmp, "fmlopt")
         os.makedirs(tmp, exist_ok=True)
         built = paper.build_docx(manifest([Q_FORMULA_OPTIONS]), tmp, name="fmlopt")
-        box = Document(built["docx"]).tables[0].cell(0, 0)
+        box = item_tables(built["docx"])[0].cell(0, 0)
         self.assertTrue(box.tables, "含小公式图的选项也应该对齐，不能被降级成一行四拼")
         grid = box.tables[0]
         cols = len(grid.columns)
@@ -369,7 +446,7 @@ class PaperDocxTest(unittest.TestCase):
         doc = Document(built["docx"])
         nums = []
         for i in range(4):
-            runs = doc.tables[i].cell(0, 0).paragraphs[0].runs
+            runs = item_tables(built["docx"])[i].cell(0, 0).paragraphs[0].runs
             nums.append(next(r.text for r in runs if r.text.strip()))
         self.assertEqual(nums, ["1．", "2．", "3．", "4．"], "卷面题号必须等于 manifest.idx")
         text = all_text(built["docx"])
@@ -811,8 +888,7 @@ class CompactLayoutTest(unittest.TestCase):
 
     def test_compact_paragraphs_are_tight(self):
         built = self._build("compact")
-        doc = _Docx(built["docx"])
-        cell = doc.tables[0].cell(0, 0)
+        cell = item_tables(built["docx"])[0].cell(0, 0)
         p = cell.paragraphs[0]
         self.assertEqual(p.paragraph_format.line_spacing, 1.0)
         self.assertEqual(p.paragraph_format.space_before, _Pt(1))
@@ -821,16 +897,14 @@ class CompactLayoutTest(unittest.TestCase):
         note = cell.paragraphs[1]
         self.assertEqual(note.paragraph_format.line_spacing, _Pt(9))
         # normal 保持原来的 1.15 / 2pt
-        doc_n = _Docx(self._build("normal")["docx"])
-        pn = doc_n.tables[0].cell(0, 0).paragraphs[0]
+        pn = item_tables(self._build("normal")["docx"])[0].cell(0, 0).paragraphs[0]
         self.assertEqual(pn.paragraph_format.space_after, _Pt(2))
 
     def test_compact_box_uses_wider_content_area(self):
         c = paper.layout_spec("compact")
         n = paper.layout_spec("normal")
         self.assertGreater(paper._content_w(c), paper._content_w(n))
-        doc = _Docx(self._build("compact")["docx"])
-        width = doc.tables[0].columns[0].width.pt
+        width = item_tables(self._build("compact")["docx"])[0].columns[0].width.pt
         self.assertAlmostEqual(width, paper._content_w(c), places=0)
 
     def test_both_layouts_pass_fidelity(self):
@@ -878,7 +952,9 @@ class CompactPageTargetTest(unittest.TestCase):
                       "space": {"选择": 0, "填空": 0, "解答": 0}}
             m = picker.build(params, cls.conn)
             out = os.path.join(cls.tmp, "c%d" % total)
-            cls.results[total] = paper.render_paper(m, out, name="c%d" % total)
+            # 版面目标只看内容页：关掉校准页（校准页另有专门测试）
+            cls.results[total] = paper.render_paper(m, out, name="c%d" % total,
+                                                    calibration=False)
 
     @classmethod
     def tearDownClass(cls):
@@ -899,6 +975,16 @@ class CompactPageTargetTest(unittest.TestCase):
                 self.assertGreaterEqual(ratio, 0.025,
                                         "%d 题卷第 %d 页墨迹 %.4f < 2.5%%（还是太空）"
                                         % (total, i, ratio))
+
+    def test_student_line_keeps_page_targets(self):
+        """加了学生信息栏后页数目标不退化：10 题仍 1 页、24 题仍 ≤3 页（用实际渲染页数+墨迹断言）。"""
+        ten, twenty_four = self.results[10], self.results[24]
+        self.assertEqual(ten["health"]["paper_pages"], 1,
+                         "10 题应该还是 1 页（现在 %d 页）" % ten["health"]["paper_pages"])
+        self.assertGreaterEqual(min(ten["health"]["ink_ratio"]), 0.025, "10 题那页墨迹偏低")
+        self.assertLessEqual(twenty_four["health"]["paper_pages"], 3,
+                             "24 题应该 ≤3 页（现在 %d 页）"
+                             % twenty_four["health"]["paper_pages"])
 
     def test_layout_reported_as_compact(self):
         self.assertEqual(self.results[10]["health"]["layout"], "compact")
@@ -937,6 +1023,152 @@ class BalanceWiringTest(unittest.TestCase):
         res = paper.render_paper(manifest(), tmp, name="nobal")
         self.assertEqual(len(res["health"]["balance"]["attempts"]), 1,
                          "末页不空就不该多跑一趟")
+
+
+# ---------------------------------------------------------------- 3e. 打印容错（t48）
+class CalibrationPageTest(unittest.TestCase):
+    """校准页：100mm 方框 + 10mm 刻度 + A4 外框；生成阶段还要自检 PDF 是 A4。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="paper_cal_")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _calibration(self, name="cal"):
+        import pymupdf
+
+        path = os.path.join(self.tmp, name + ".pdf")
+        paper.build_calibration_pdf(path, title="七年级数学 · 训练卷", pid="P20261031-001")
+        return path, pymupdf.open(path)
+
+    def test_calibration_page_is_a4_with_100mm_square(self):
+        path, doc = self._calibration()
+        try:
+            self.assertEqual(doc.page_count, 1)
+            page = doc[0]
+            self.assertAlmostEqual(page.rect.width, paper.A4_W_PT, places=1)
+            self.assertAlmostEqual(page.rect.height, paper.A4_H_PT, places=1)
+            # 100mm = 283.46pt（±1pt）
+            sides = [dr["rect"].width for dr in page.get_drawings()
+                     if dr["rect"].width > 200 and abs(dr["rect"].width - dr["rect"].height) < 3]
+            self.assertTrue(sides, "校准页里没找到方框（drawings 里没有近正方形）")
+            self.assertAlmostEqual(max(sides), 100 * paper.PT_PER_MM, delta=1.0)
+            text = page.get_text()
+            self.assertIn("100 mm", text)
+            self.assertIn("本页不判卷", text)
+            self.assertIn("100%", text, "要告诉老师去打印设置里选 实际大小/100%")
+        finally:
+            doc.close()
+
+    def test_check_pdf_a4_raises_on_letter(self):
+        import pymupdf
+
+        bad = os.path.join(self.tmp, "letter.pdf")
+        doc = pymupdf.open()
+        doc.new_page(width=612, height=792)          # US Letter
+        doc.save(bad)
+        doc.close()
+        with self.assertRaises(paper.FidelityError) as ctx:
+            paper.check_pdf_a4(bad)
+        self.assertEqual(getattr(ctx.exception, "code", ""), "pdf_not_a4")
+        self.assertIn("612", str(ctx.exception))
+        self.assertIn("A4", str(ctx.exception))
+
+    def test_check_pdf_a4_accepts_our_own_pdf(self):
+        path, doc = self._calibration("ok")
+        doc.close()
+        sizes = paper.check_pdf_a4(path)
+        self.assertEqual(len(sizes), 1)
+
+
+@unittest.skipUnless(os.path.exists(os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "data", "app.db")), "没有题库：跳过真实卷校准页测试")
+class CalibrationInPaperTest(unittest.TestCase):
+    """卷面 PDF 前加页：默认加；关掉就不加；print.pdf 页数 = 1 + 卷面 + 卡。"""
+
+    @classmethod
+    def setUpClass(cls):
+        if not paper.word_available():
+            raise unittest.SkipTest("没有 Word：卷面 PDF 出不来")
+        import sqlite3
+
+        import picker
+
+        cls.tmp = tempfile.mkdtemp(prefix="paper_calflow_")
+        db = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "data", "app.db")
+        cls.conn = sqlite3.connect("file:%s?mode=ro" % db.replace("\\", "/"), uri=True)
+        params = {"title": "七年级数学 · 训练卷（10 题）",
+                  "mix": {"选择": 5, "填空": 3, "解答": 2},
+                  "scope": {"chapters": [], "kps": []},
+                  "requirements": {"need_answer": True}, "seed": 20261031}
+        cls.manifest = picker.build(params, cls.conn)
+        cls.on = paper.render_paper(cls.manifest, os.path.join(cls.tmp, "on"), name="on")
+        cls.off = paper.render_paper(cls.manifest, os.path.join(cls.tmp, "off"), name="off",
+                                     calibration=False)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_calibration_on_by_default(self):
+        self.assertTrue(self.on["health"]["calibration"])
+        self.assertEqual(self.on["pages"], self.on["health"]["paper_pages"] + 1)
+        self.assertEqual(self.on["health"]["page_size_pt"],
+                         [round(paper.A4_W_PT, 2), round(paper.A4_H_PT, 2)])
+        self.assertEqual(self.manifest["paper"]["pages"], self.on["health"]["paper_pages"],
+                         "答题卡页码要用内容页数，不含校准页")
+
+    def test_first_page_is_the_calibration_sheet(self):
+        import pymupdf
+
+        doc = pymupdf.open(self.on["pdf"])
+        try:
+            self.assertIn("本页不判卷", doc[0].get_text(), "第 1 页不是校准页")
+            self.assertIn("100 mm", doc[0].get_text())
+        finally:
+            doc.close()
+
+    def test_calibration_can_be_switched_off(self):
+        self.assertFalse(self.off["health"]["calibration"])
+        self.assertEqual(self.off["pages"], self.off["health"]["paper_pages"],
+                         "关掉勾选就不该多一页")
+
+    def test_print_pdf_pages_equals_one_plus_paper_plus_card(self):
+        """打印件 = 1（校准页）+ 卷面 + 答题卡（/print.pdf 的合并规则）。"""
+        import pymupdf
+
+        import card
+
+        card_res = card.build_card(self.manifest, os.path.join(self.tmp, "card"))
+        card_pages = len(card_res["png"])
+        merged_path = os.path.join(self.tmp, "print.pdf")
+        out = pymupdf.open()
+        try:
+            for path in (self.on["pdf"], card_res["pdf"]):
+                src = pymupdf.open(path)
+                try:
+                    out.insert_pdf(src)
+                finally:
+                    src.close()
+            out.save(merged_path)
+        finally:
+            out.close()
+        doc = pymupdf.open(merged_path)
+        try:
+            self.assertEqual(doc.page_count,
+                             1 + self.on["health"]["paper_pages"] + card_pages,
+                             "print.pdf 页数 = 1(校准) + 卷面 + 卡")
+            self.assertIn("本页不判卷", doc[0].get_text())
+        finally:
+            doc.close()
+        # 答题卡侧也要报 A4
+        self.assertEqual(card_res["health"]["page_size_pt"],
+                         [round(paper.A4_W_PT, 2), round(paper.A4_H_PT, 2)])
 
 
 # ---------------------------------------------------------------- 4. 全流程
@@ -1006,13 +1238,238 @@ class RenderPaperTest(unittest.TestCase):
     def test_manifest_gets_paper_pages(self):
         """卷面页数写回 manifest.paper.pages —— card.py 用它算答题卡起始页码。"""
         self.assertIn("paper", self.m, "render_paper 没把卷面页数写回 manifest")
-        self.assertEqual(self.m["paper"]["pages"], self.res["pages"])
-        self.assertEqual(self.res["health"]["paper_pages"], self.res["pages"])
+        paper_pages = self.res["health"]["paper_pages"]
+        self.assertEqual(self.m["paper"]["pages"], paper_pages,
+                         "manifest.paper.pages 是内容页（答题卡页码接着它走）")
+        self.assertEqual(self.m["paper"]["calibration"], self.res["health"]["calibration"])
+        extra = 1 if self.res["health"]["calibration"] else 0
+        self.assertEqual(self.res["pages"], paper_pages + extra,
+                         "总页数 = 内容页 + 校准页")
 
     def test_docx_still_valid_after_render(self):
         with zipfile.ZipFile(self.res["docx"]) as z:
             self.assertIsNone(z.testzip())
 
+
+class TestTokensJsonFallback(unittest.TestCase):
+    """t11 · 15 万题绝大部分没有原始 docx：source_tokens 要回退查 questions.tokens_json。
+
+    口径（队长 2026-11-01 定）：
+      * 有 <no>.docx → 仍走 docx（保真，带媒体二进制），tokens_json 不参与；
+      * 没有 docx 但有 tokens_json 且**无图** → 用 tokens_json 排版（text / math / 无图表格）；
+      * 有图（embed / 带媒体表格）→ 报 PaperError（图在 docx 里，JSON 里没有二进制，印出来会缺图）；
+      * docx 和 tokens_json 都没有（或 tokens_json 是空/坏 JSON）→ 仍报 PaperError。
+    """
+
+    OMML = ('<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">'
+            '<m:r><m:t>x</m:t></m:r></m:oMath>')
+
+    @classmethod
+    def setUpClass(cls):
+        import db as dbmod
+
+        cls.tmp = tempfile.mkdtemp(prefix="paper_json_")
+        cls.src = os.path.join(cls.tmp, "qbank")
+        os.makedirs(cls.src, exist_ok=True)
+        cls.out = os.path.join(cls.tmp, "out")
+        cls.db_path = os.path.join(cls.tmp, "data", "app.db")
+
+        cls._old_src = paper.SRC_ROOT
+        cls._old_dbp = paper.tokens_db_path()
+        cls._real_src = cls._old_src
+
+        conn = dbmod.connect(cls.db_path)
+        try:
+            rows = [
+                # 无图选择：text + OMML 公式，能从 JSON 排出来
+                ("100001", "选择", 4,
+                 [{"kind": "text", "text": "1．化简：2x+3x 的结果是（　）"},
+                  {"kind": "math", "xml": cls.OMML},
+                  {"kind": "text", "text": "A．4x　B．5x　C．6x　D．8x"}],
+                 "B"),
+                # 含图：tokens_json 里只有 n_media 计数，没有二进制 → 不能回退
+                ("100003", "选择", 4,
+                 [{"kind": "text", "text": "3．如图所示，下列判断正确的是（　）"},
+                  {"kind": "embed", "name": "word/media/image1.wmf", "n_media": 1}],
+                 "A"),
+                ("100004", "填空", 0, [], "3"),
+                # 坏 JSON
+                ("100005", "填空", 0, "{这不是 JSON", "4"),
+            ]
+            for no, qtype, n_opt, tokens, answer in rows:
+                raw = tokens if isinstance(tokens, str) else json.dumps(tokens, ensure_ascii=False)
+                conn.execute(
+                    "INSERT INTO questions(no, qtype, option_count, is_empty, text_plain,"
+                    " tokens_json, fmt, answer_raw, kp_id, chapter, subject_pk)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (no, qtype, n_opt, 0, "题干" + no, raw,
+                     "plain" if qtype != "选择" or n_opt == 0 else "plain",
+                     answer, "1.1", "第1章 有理数", "math7a"))
+            # 「有 docx 时 docx 优先」用的题：库里 tokens_json 塞一段拍脑袋文本
+            conn.execute(
+                "INSERT INTO questions(no, qtype, option_count, is_empty, text_plain,"
+                " tokens_json, fmt, answer_raw, kp_id, chapter, subject_pk)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("999998", "选择", 4, 0, "库里版本",
+                 json.dumps([{"kind": "text", "text": "库里版本：不该被用到"}], ensure_ascii=False),
+                 "ole", "A", "9.2", "综合", "math7a"))
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 真库里的 00688.docx（OMML 题）复制成 999998.docx：验证「有 docx 就不看 JSON」
+        real = os.path.join(cls._real_src, "00688.docx")
+        if not os.path.isfile(real):
+            raise unittest.SkipTest("真库缺 00688.docx，跳过「docx 优先」用例")
+        shutil.copyfile(real, os.path.join(cls.src, "999998.docx"))
+
+        paper.SRC_ROOT = cls.src
+        paper.set_tokens_db_path(cls.db_path)
+        paper.clear_tokens_cache()
+
+    @classmethod
+    def tearDownClass(cls):
+        paper.SRC_ROOT = cls._old_src
+        paper.set_tokens_db_path(cls._old_dbp)
+        paper.clear_tokens_cache()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        paper.clear_tokens_cache()
+
+    # ---- 1. 有 docx：docx 优先
+    def test_docx_wins_when_present(self):
+        toks = paper.source_tokens("999998")
+        text = "".join(t.text or "" for t in toks if t.kind == "text")
+        self.assertNotIn("库里版本", text, "有 docx 时不该用 tokens_json")
+        self.assertTrue(any(t.kind == "math" for t in toks), "00688 的 OMML 公式没抽出来")
+
+    # ---- 2. 无 docx 有 tokens_json：能排版
+    def test_no_docx_falls_back_to_tokens_json(self):
+        self.assertFalse(os.path.exists(os.path.join(self.src, "100001.docx")))
+        toks = paper.source_tokens("100001")
+        self.assertEqual(["text", "math", "text"], [t.kind for t in toks])
+
+    def test_build_docx_from_tokens_json(self):
+        """整条排版链路：prepared_tokens → build_docx → 卷面有题干、公式计数对得上。"""
+        m = manifest([{"no": "100001", "qtype": "选择", "kp_id": "1.1",
+                       "chapter": "第1章 有理数",
+                       "answer_key": [{"blank": 1, "value": "B", "norm": "B"}]}])
+        res = paper.build_docx(m, self.out, name="json_paper")
+        text = all_text(res["docx"])
+        self.assertIn("2x+3x", text, "tokens_json 里的题干没印到卷面")
+        self.assertEqual(1, res["expected"]["n_items"])
+        self.assertEqual(1, res["expected"]["formula_tokens"], "OMML 公式 token 丢了")
+        self.assertIsNone(zipfile.ZipFile(res["docx"]).testzip())
+
+    def test_five_digit_no_also_falls_back(self):
+        """老库 5 位题号在 docx 缺失时走同一条回退（13 万条归档题靠它）。"""
+        import db as dbmod
+
+        conn = dbmod.connect(self.db_path)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO questions(no, qtype, option_count, is_empty, text_plain,"
+                " tokens_json, fmt, answer_raw, kp_id, chapter, subject_pk)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("30001", "填空", 0, 0, "填空 30001",
+                 json.dumps([{"kind": "text", "text": "若 a+b=3，则 2a+2b=（　）"}],
+                            ensure_ascii=False),
+                 "plain", "6", "1.2", "第1章 有理数", "math7a"))
+            conn.commit()
+        finally:
+            conn.close()
+        toks = paper.source_tokens("30001")
+        self.assertEqual(["text"], [t.kind for t in toks])
+        self.assertIn("2a+2b", toks[0].text)
+
+    # ---- 3. 有图 / 空 / 坏 / 都没有：一律报 PaperError
+    def test_figure_question_is_rejected(self):
+        with self.assertRaises(paper.PaperError) as ctx:
+            paper.source_tokens("100003")
+        self.assertIn("图", str(ctx.exception), "错误信息要说清「有图，回退不了」")
+
+    def test_empty_tokens_json_is_rejected(self):
+        with self.assertRaises(paper.PaperError):
+            paper.source_tokens("100004")
+
+    def test_broken_json_is_rejected(self):
+        with self.assertRaises(paper.PaperError):
+            paper.source_tokens("100005")
+
+    def test_missing_everywhere_is_rejected(self):
+        with self.assertRaises(paper.PaperError) as ctx:
+            paper.source_tokens("100009")
+        msg = str(ctx.exception)
+        self.assertIn("100009", msg)
+        self.assertIn("tokens_json", msg, "报错要告诉运维「缺 docx 也缺 tokens_json」")
+
+    def test_no_db_at_all_is_rejected(self):
+        """数据库文件都不在（别人的机器）：仍是 PaperError，不能抛 sqlite3 的原始异常。"""
+        paper.set_tokens_db_path(os.path.join(self.tmp, "no_such", "app.db"))
+        try:
+            with self.assertRaises(paper.PaperError):
+                paper.source_tokens("100001")
+        finally:
+            paper.set_tokens_db_path(self.db_path)
+
+
+
+
+class ImportedFigureTest(unittest.TestCase):
+    """t95：导入题的「卷面 token」必须与库里的 text_plain 一致，且图不成灾。"""
+
+    DB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      "data", "app.db")
+
+    def _physics(self):
+        import sqlite3
+
+        if not os.path.isfile(self.DB):
+            self.skipTest("没有真库")
+        conn = sqlite3.connect("file:%s?mode=ro" % self.DB.replace("\\", "/"), uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            return list(conn.execute(
+                "SELECT no, text_plain, tokens_json, media_count FROM questions"
+                " WHERE subject_pk='physics' ORDER BY CAST(no AS INTEGER)"))
+        finally:
+            conn.close()
+
+    def test_tokens_match_text_plain(self):
+        """19 道物理题：tokens 里的文字必须来自该题自己的 text_plain（防串题）。"""
+        rows = self._physics()
+        if not rows:
+            self.skipTest("库里没有物理题")
+        checked = 0
+        for row in rows:
+            toks = paper.source_tokens(row["no"], row["tokens_json"])
+            text = "".join(tk.text or "" for tk in toks if tk.kind == "text")
+            head = (row["text_plain"] or "").strip()[:20]
+            if not head:
+                continue
+            checked += 1
+            self.assertIn(head, text,
+                          "题 %s 的卷面文字不是它自己的 text_plain 前 20 字" % row["no"])
+        self.assertGreaterEqual(checked, 1)
+
+    def test_figure_height_capped(self):
+        """图高必须 ≤110pt、宽 ≤200pt（否则整题换页，卷面出现半页空白）。"""
+        rows = self._physics()
+        found = 0
+        for row in rows:
+            if not row["media_count"]:
+                continue
+            for tk in paper.source_tokens(row["no"], row["tokens_json"]):
+                if tk.kind != "embed":
+                    continue
+                found += 1
+                self.assertLessEqual(tk.width_pt, 200.0 + 0.5,
+                                     "题 %s 的图宽超过 200pt" % row["no"])
+                self.assertLessEqual(tk.height_pt, 110.0 + 0.5,
+                                     "题 %s 的图高超过 110pt" % row["no"])
+        if not found:
+            self.skipTest("没有带图题")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

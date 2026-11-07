@@ -225,6 +225,22 @@ class _Base(unittest.TestCase):
         finally:
             conn.close()
 
+    def seed_questions(self):
+        """by-ids 判卷（t46）靠 questions 表按题号查答案：给夹具那 5 道题塞上行。"""
+        rows = [("00001", "选择", 4, 1, "A"), ("00002", "选择", 4, 1, "B"),
+                ("00003", "选择", 4, 1, "C"), ("00004", "填空", 0, 2, "4"),
+                ("00005", "解答", 0, 2, "9")]
+        conn = dbmod.connect(self.db_path)
+        try:
+            for no, qtype, oc, sc, ans in rows:
+                conn.execute(
+                    "INSERT OR REPLACE INTO questions"
+                    "(no,qtype,option_count,sub_count,answer_raw,text_plain,is_empty)"
+                    " VALUES (?,?,?,?,?,'',0)", (no, qtype, oc, sc, ans))
+            conn.commit()
+        finally:
+            conn.close()
+
 
 # --------------------------------------------------------------------------- 路由表
 class TestRouteTable(unittest.TestCase):
@@ -325,9 +341,10 @@ class TestUpload(_Base):
         self.assertEqual(0, n, "标定失败不落库")
 
     def test_paper_not_found(self):
+        """t45 起：卷号不在库不再直接报错，而是降级按每题标识判（详见 TestNoPid）。"""
         res = self.upload(pid="P-NOT-EXIST")
-        self.assertEqual(422, res.status_code)
-        self.assertIn("找不到这份卷子", res.text)
+        self.assertNotEqual(500, res.status_code, "卷号不在库不许 500")
+        self.assertIn("已改用每题标识识别", res.text)
 
     def test_empty_file_returns_form(self):
         res = self.client.post("/submissions", data={"pid": PID},
@@ -336,13 +353,15 @@ class TestUpload(_Base):
         self.assertIn("没收到图片", res.text)
         self.assertIn("上传并判卷", res.text, "校验失败要回到上传表单，而不是白屏")
 
-    def test_missing_pid_returns_form(self):
+    def test_missing_pid_uploads_with_qr_pid(self):
+        """t45：不选卷号也能判 —— pid 交给答题卡二维码。"""
+        self.seed_questions()
         with open(self.photo, "rb") as fh:
             data = fh.read()
         res = self.client.post("/submissions", data={"pid": "  "},
-                               files={"file": ("photo.png", data, "image/png")})
-        self.assertEqual(400, res.status_code)
-        self.assertIn("先填卷号", res.text)
+                               files={"file": ("photo.png", data, "image/png")},
+                               follow_redirects=False)
+        self.assertEqual(302, res.status_code, res.text[:600])
 
     def test_unsafe_pid_rejected(self):
         """卷号会拼进产物目录名：../ 之类不许过（防写到 app/out 外面）。"""
@@ -1184,6 +1203,231 @@ class TestRecords(_Base):
         for url in ("/submissions", "/records"):
             html = self.client.get(url).text
             self.assertIn('href="/records"', html, "%s 的导航要有判卷记录" % url)
+
+
+# --------------------------------------------------------------------------- t45 免选卷号
+class TestNoPid(_Base):
+    """用户要求：判卷时不用手写/手选卷号，直接识别（答题卡右上角有卷号二维码）。"""
+
+    PID2 = "P20261031-932"
+
+    def _post(self, pid):
+        with open(self.photo, "rb") as fh:
+            data = fh.read()
+        return self.client.post("/submissions", data={"pid": pid},
+                                files={"file": ("photo.png", data, "image/png")},
+                                follow_redirects=False)
+
+    def _add_paper(self, pid, manifest=None):
+        """库里放一份卷（带 card 几何：先 build_card，再把 manifest 存进去）。"""
+        mf = manifest or make_manifest(pid=pid)
+        card.build_card(mf, os.path.join(self.tmp, "card_%s" % pid))
+        conn = dbmod.connect(self.db_path)
+        try:
+            conn.execute("INSERT OR REPLACE INTO papers"
+                         "(pid,created_at,title,params_json,manifest,n_items)"
+                         " VALUES (?,?,?,?,?,?)",
+                         (pid, mf["created_at"], mf["title"], "{}",
+                          json.dumps(mf, ensure_ascii=False), len(mf["items"])))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_upload_page_defaults_to_auto(self):
+        html = self.client.get("/submissions").text
+        self.assertIn("自动识别（推荐）", html)
+        self.assertIn("答题卡右上角", html, "要给一句「二维码会自动认」的说明")
+        self.assertIn('value="" selected', html, "默认选中「自动识别」")
+
+    def test_upload_without_pid_uses_qr_pid(self):
+        self.seed_questions()
+        res = self._post("")
+        self.assertEqual(302, res.status_code, res.text[:600])
+        location = res.headers["location"]
+        sid = location.split("?")[0].rstrip("/").split("/")[-1]
+        conn = dbmod.connect(self.db_path)
+        try:
+            row = conn.execute("SELECT pid FROM submissions WHERE sid=?", (sid,)).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(PID, row["pid"], "不选卷号 → 用答题卡二维码里的 pid")
+        page = self.client.get("/submissions/%s" % sid)
+        self.assertEqual(200, page.status_code)
+        self.assertIn("按每题标识识别", page.text)
+
+    def test_wrong_pid_shows_mismatch_with_both_pids(self):
+        self._add_paper(self.PID2)          # 库里另一份卷（有自己的 card 几何）
+        res = self._post(self.PID2)         # 但照片是 PID 的卡
+        self.assertEqual(422, res.status_code, res.text[:600])
+        html = res.text
+        self.assertIn("二维码里是", html, "要说清二维码里是哪个卷号")
+        self.assertIn(PID, html, "二维码里的卷号")
+        self.assertIn(self.PID2, html, "你选的卷号")
+
+    def test_qr_pid_not_in_library_falls_back_to_ids(self):
+        self.seed_questions()               # 只有题库、没有 papers 行
+        conn = dbmod.connect(self.db_path)
+        try:
+            conn.execute("DELETE FROM papers")
+            conn.commit()
+        finally:
+            conn.close()
+        res = self._post("")                # 二维码里的 PID 不在 papers 里
+        self.assertEqual(302, res.status_code, res.text[:600])
+        page = self.client.get(res.headers["location"])
+        self.assertEqual(200, page.status_code, "卷号不在库也不许 500")
+        self.assertIn("已改用每题标识识别", page.text)
+        self.assertIn("不在本机库中", page.text)
+
+
+# --------------------------------------------------------------------------- t49 CSV 学情导出
+class TestCsv(_Base):
+    """用户第 6 条：老师要学情数据 —— 判卷明细 / 知识点报告 / 全部记录 三个 CSV。"""
+
+    def _csv(self, url):
+        return self.client.get(url)
+
+    def _rows(self, res):
+        """BOM + 抬头行剥掉后的数据行（按表头列数判断）。"""
+        text = res.content.decode("utf-8-sig")
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        return lines
+
+    def test_export_csv_detail(self):
+        sid = self.sid_of()
+        res = self._csv("/submissions/%s/export.csv" % sid)
+        self.assertEqual(200, res.status_code)
+        self.assertIn("text/csv", res.headers["content-type"])
+        self.assertIn("charset=utf-8", res.headers["content-type"].lower())
+        self.assertIn("attachment", res.headers["content-disposition"])
+        self.assertIn(".csv", res.headers["content-disposition"])
+        self.assertTrue(res.content.startswith(b"\xef\xbb\xbf"), "Excel 双击要不乱码 → 必须带 BOM")
+        lines = self._rows(res)
+        header_at = [i for i, ln in enumerate(lines) if "题号" in ln and "判定" in ln]
+        self.assertTrue(header_at, "找不到表头行")
+        self.assertLessEqual(header_at[0], 2, "抬头最多两行，表头要在前三行内")
+        head = lines[header_at[0]]
+        for col in ("题号", "题型", "空号", "知识点ID", "知识点名", "标准答案", "识别值",
+                    "判定", "是否人工确认", "待确认原因"):
+            self.assertIn(col, head, "表头缺 %s" % col)
+        joined = "\n".join(lines[:header_at[0]])
+        self.assertIn(PID, joined, "抬头要有卷号")
+        self.assertIn("得分", joined)
+        data = lines[header_at[0] + 1:]
+        self.assertEqual(7, len(data), "7 个判分单元 → 7 行数据（实际 %d）" % len(data))
+
+    def test_export_csv_empty_units_header_only(self):
+        self.insert_fake("S20261031-200000-0000aa", PID, detail={"items": [], "backend": "manual"})
+        res = self._csv("/submissions/S20261031-200000-0000aa/export.csv")
+        self.assertEqual(200, res.status_code, "没有作答单元也要给表头，不许 500")
+        lines = self._rows(res)
+        self.assertTrue(any("题号" in ln for ln in lines), "空数据也要有表头")
+
+    def test_report_csv_aggregates_by_kp(self):
+        # 造一份 2 题的卷：第 1 题对、第 2 题错；两个知识点各 1 题
+        pid = "P20261031-941"
+        items = [
+            {"idx": 1, "no": "00001", "qtype": "选择", "options": ["A", "B", "C", "D"],
+             "answer_key": [{"blank": 1, "value": "A", "norm": "A"}]},
+            {"idx": 2, "no": "00002", "qtype": "选择", "options": ["A", "B", "C", "D"],
+             "answer_key": [{"blank": 1, "value": "B", "norm": "B"}]},
+        ]
+        mf = make_manifest(pid=pid)
+        mf["items"] = items
+        card.build_card(mf, os.path.join(self.tmp, "card_%s" % pid))
+        conn = dbmod.connect(self.db_path)
+        try:
+            conn.execute("INSERT OR REPLACE INTO papers"
+                         "(pid,created_at,title,params_json,manifest,n_items) VALUES (?,?,?,?,?,?)",
+                         (pid, mf["created_at"], "两题小卷", "{}",
+                          json.dumps(mf, ensure_ascii=False), len(items)))
+            for no, kp_id, kp in (("00001", "K1", "有理数"), ("00002", "K2", "整式")):
+                conn.execute("INSERT OR REPLACE INTO questions"
+                             "(no,qtype,option_count,sub_count,answer_raw,text_plain,is_empty,"
+                             "kp_id,kp) VALUES (?,?,?,?,?,'',0,?,?)",
+                             (no, "选择", 4, 1, "A" if no == "00001" else "B", kp_id, kp))
+            conn.commit()
+        finally:
+            conn.close()
+        photo = build_photo(self.tmp, mf, choices={1: "A", 2: "A"},
+                            texts={}, name="two.png")
+        with open(photo, "rb") as fh:
+            data = fh.read()
+        up = self.client.post("/submissions", data={"pid": pid},
+                              files={"file": ("two.png", data, "image/png")})
+        self.assertEqual(200, up.status_code, up.text[:400])
+
+        res = self._csv("/papers/%s/report.csv" % pid)
+        self.assertEqual(200, res.status_code)
+        self.assertTrue(res.content.startswith(b"\xef\xbb\xbf"))
+        lines = self._rows(res)
+        self.assertIn("知识点ID", lines[0])
+        self.assertIn("正确率", lines[0])
+        joined = "\n".join(lines)
+        self.assertIn("K1", joined)
+        self.assertIn("K2", joined)
+        k1 = [ln for ln in lines if ln.startswith("K1,")][0]
+        k2 = [ln for ln in lines if ln.startswith("K2,")][0]
+        self.assertEqual(["K1", "有理数", "1", "1", "0", "0", "100%"], k1.split(",")[:7])
+        self.assertEqual(["K2", "整式", "1", "0", "1", "0", "0%"], k2.split(",")[:7])
+
+    def test_report_csv_empty(self):
+        res = self._csv("/papers/P20261031-000/report.csv")
+        self.assertEqual(200, res.status_code, "没判过的卷也要给表头，不许 500")
+        self.assertIn("知识点ID", self._rows(res)[0])
+
+    def test_records_csv(self):
+        sid = self.sid_of()
+        res = self._csv("/records.csv")
+        self.assertEqual(200, res.status_code)
+        self.assertIn("text/csv", res.headers["content-type"])
+        self.assertTrue(res.content.startswith(b"\xef\xbb\xbf"))
+        lines = self._rows(res)
+        for col in ("时间", "卷号", "标题", "得分", "满分", "待确认", "提交号"):
+            self.assertIn(col, lines[0])
+        self.assertIn(sid, "\n".join(lines))
+
+    def test_records_csv_empty(self):
+        conn = dbmod.connect(self.db_path)
+        try:
+            conn.execute("DELETE FROM submissions")
+            conn.commit()
+        finally:
+            conn.close()
+        res = self._csv("/records.csv")
+        self.assertEqual(200, res.status_code)
+        lines = self._rows(res)
+        self.assertEqual(1, len(lines), "空数据只出表头（实际 %d 行）" % len(lines))
+
+    def test_buttons_present(self):
+        sid = self.sid_of()
+        self.assertIn("/submissions/%s/export.csv" % sid,
+                      self.client.get("/submissions/%s" % sid).text)
+        self.assertIn("/records.csv", self.client.get("/records").text)
+
+
+# --------------------------------------------------------------------------- t49 诊断图
+class TestDiag(_Base):
+    """上传失败时把 grade.diag_image 画出来的诊断图贴到错误页上（t50 余留）。"""
+
+    def test_failure_page_shows_diag_image(self):
+        img = Image.new("L", (900, 1200), 255)      # 全白：四个角标定块一个都没有
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([20, 20, 60, 60], fill=0)    # 只画一个假角，制造「缺 3 个角」
+        path = os.path.join(self.tmp, "bad.png")
+        img.save(path)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        res = self.client.post("/submissions", data={"pid": PID},
+                               files={"file": ("bad.png", data, "image/png")})
+        self.assertEqual(422, res.status_code, res.text[:500])
+        html = res.text
+        self.assertIn("<img", html, "错误页要贴诊断图")
+        self.assertIn("data:image/png;base64,", html)
+        self.assertIn("这张照片的问题在哪", html)
+        self.assertTrue(
+            any(word in html for word in ("四角", "角没拍到", "重拍", "拍到")),
+            "要给一句「怎么拍才对」的话")
 
 
 if __name__ == "__main__":

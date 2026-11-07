@@ -6,7 +6,9 @@ cd /d "%~dp0"
 title 数学题库工作台 · http://127.0.0.1:8710/
 rem 想换端口：改下面的 --port 与浏览器地址两处，并同步 app/config.json 的 server.port。
 set "PF86=%ProgramFiles(x86)%"
-rem 启动参数：默认只监听本机（安全）；传 lan 或设 MATHAPP_LAN=1 才开放到局域网
+rem 监听范围：本脚本和 config.example.json 的 server.host 一样，固定监听 0.0.0.0（所有网卡）。
+rem **监听 0.0.0.0 不等于允许访问**：默认只允许本机（127.0.0.1）访问，手机要用得去「设置 -> 局域网访问」打开开关。
+rem 兼容老习惯：传 lan 或设 MATHAPP_LAN=1，等价于在设置里把那个开关点开（launcher 的 --lan 走的也是它）。
 if /i "%~1"=="lan" set "MATHAPP_LAN=1"
 
 echo ============================================================
@@ -56,6 +58,10 @@ if errorlevel 1 (
     echo [OK] 运行依赖齐全
 )
 
+rem ---------- 题库目录（可移植：环境变量 / config.paths.qbank / qbank\ / 老路径回退） ----------
+%PY% -c "import paths;d=paths.describe();print('   题库目录: '+d['qbank']['path']+'  ['+d['qbank']['source']+']')"
+echo.
+
 rem ---------- 3) 查 Word（只探路径，不启动 Word） ----------
 set "WORD="
 for %%p in (
@@ -82,8 +88,8 @@ if defined WORD (
 echo.
 
 rem ---------- 4) 起服务 ----------
-set "HOST=127.0.0.1"
-if /i "%MATHAPP_LAN%"=="1" set "HOST=0.0.0.0"
+rem HOST 必须与 config.example.json 的 server.host 一致（tests/test_packaging.py 锁这一条）
+set "HOST=0.0.0.0"
 echo [*] 启动命令: python -m uvicorn server:app --host %HOST% --port 8710
 %PY% -c "import server;print(server.lan_startup_text())"
 echo.
@@ -103,7 +109,7 @@ start "" /b %PY% -c "import time,webbrowser; time.sleep(3); webbrowser.open('htt
 echo.
 echo [x] 服务已退出。常见原因:
 echo     - 端口 8710 被占用: 先关掉旧的黑色窗口，或改本文件里的 --port 与界面地址
-echo     - 手机连不上: 确认电脑手机同一个 WiFi、防火墙放行 8710（见上面的 netsh 命令）
+echo     - 手机连不上: 先看「设置 -^> 局域网访问」开关有没有打开（默认关）；再确认同一个 WiFi、防火墙放行 8710
 echo     - 依赖装了一半: 重新执行 %PY% -m pip install -r requirements.txt
 echo     - 想看详细报错: 往上翻本窗口的输出
 echo.
