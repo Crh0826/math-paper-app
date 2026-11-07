@@ -1,64 +1,0 @@
-Fetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]Fetching 9 files: 100%|██████████| 9/9 [00:00<00:00, 2042.24it/s]
-<unknown>:623: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:859: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\7501d90ce7b5f9b3\modeling_GOT.py:623: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-  left_num = outputs.count('\left')
-C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\7501d90ce7b5f9b3\modeling_GOT.py:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
-C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\7501d90ce7b5f9b3\modeling_GOT.py:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
-C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\7501d90ce7b5f9b3\modeling_GOT.py:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
-C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\7501d90ce7b5f9b3\modeling_GOT.py:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
-C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\7501d90ce7b5f9b3\modeling_GOT.py:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
-C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\7501d90ce7b5f9b3\modeling_GOT.py:859: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-  left_num = outputs.count('\left')
-C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\7501d90ce7b5f9b3\modeling_GOT.py:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
-C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\7501d90ce7b5f9b3\modeling_GOT.py:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
-C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\7501d90ce7b5f9b3\modeling_GOT.py:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
-C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\7501d90ce7b5f9b3\modeling_GOT.py:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
-C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\7501d90ce7b5f9b3\modeling_GOT.py:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-  outputs = outputs.replace('\left(', '(').replace('\\right)', ')').replace('\left[', '[').replace('\\right]', ']').replace('\left{', '{').replace('\\right}', '}').replace('\left|', '|').replace('\\right|', '|').replace('\left.', '.').replace('\\right.', '.')
-<unknown>:623: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:859: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:623: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:626: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:859: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-<unknown>:862: SyntaxWarning: "\l" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\l"? A raw string is also an option.
-Loading weights:   0%|          | 0/472 [00:00<?, ?it/s]Loading weights:   5%|▌         | 24/472 [00:00<00:01, 232.18it/s]Loading weights:  10%|█         | 48/472 [00:00<00:01, 235.09it/s]Loading weights:  17%|█▋        | 82/472 [00:00<00:01, 280.59it/s]Loading weights:  24%|██▎       | 111/472 [00:00<00:01, 283.44it/s]Loading weights:  60%|██████    | 284/472 [00:00<00:00, 800.44it/s]Loading weights: 100%|██████████| 472/472 [00:00<00:00, 923.42it/s]
-C:\Users\CRH\.cache\huggingface\modules\transformers_modules\_979938bf89ccdc949c0131ddd3841e24578a4742\7501d90ce7b5f9b3\modeling_GOT.py:581: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
-  with torch.autocast("cuda", dtype=torch.bfloat16):
