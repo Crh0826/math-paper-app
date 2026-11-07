@@ -1,0 +1,30 @@
+{% set _active = nav_active | default("") %}
+{% set _main = ["compose", "papers", "grade", "train", "settings"] %}
+{# 全站唯一导航：一级 5 项 + 更多 ▾。healthz 不进导航。 #}
+<nav class="nav" aria-label="主导航">
+  <a class="nav-item{% if _active == 'compose' %} is-active{% endif %}" href="/"
+     {% if _active == 'compose' %}aria-current="page"{% endif %}>组卷</a>
+  <a class="nav-item{% if _active == 'papers' %} is-active{% endif %}" href="/papers"
+     {% if _active == 'papers' %}aria-current="page"{% endif %}>我的卷子</a>
+  <a class="nav-item{% if _active == 'grade' %} is-active{% endif %}" href="/submissions"
+     {% if _active == 'grade' %}aria-current="page"{% endif %}>判卷</a>
+  <a class="nav-item{% if _active == 'train' %} is-active{% endif %}" href="/train"
+     {% if _active == 'train' %}aria-current="page"{% endif %}>训练</a>
+  <a class="nav-item{% if _active == 'settings' %} is-active{% endif %}" href="/settings"
+     {% if _active == 'settings' %}aria-current="page"{% endif %}>设置</a>
+  <details class="nav-more">
+    <summary class="{% if _active not in _main %}is-active{% endif %}">更多 ▾</summary>
+    <div class="nav-more-panel">
+      <a class="{% if _active == 'import' %}is-active{% endif %}" href="/import"
+         {% if _active == 'import' %}aria-current="page"{% endif %}>导入题库</a>
+      <a class="{% if _active == 'order' %}is-active{% endif %}" href="/manage/order"
+         {% if _active == 'order' %}aria-current="page"{% endif %}>顺序管理</a>
+      <a class="{% if _active == 'records' %}is-active{% endif %}" href="/records"
+         {% if _active == 'records' %}aria-current="page"{% endif %}>判卷记录</a>
+      <a class="{% if _active == 'guide' %}is-active{% endif %}" href="/guide"
+         {% if _active == 'guide' %}aria-current="page"{% endif %}>使用指南</a>
+      <a class="{% if _active == 'health' %}is-active{% endif %}" href="/health"
+         {% if _active == 'health' %}aria-current="page"{% endif %}>自检</a>
+    </div>
+  </details>
+</nav>

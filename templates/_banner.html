@@ -6,12 +6,17 @@
     <strong>{{ b.title }}</strong>
     {% if b.code %}<span class="banner-code mono">{{ b.code }}</span>{% endif %}
   </div>
-  {% if b.detail %}<p class="banner-detail">{{ b.detail }}</p>{% endif %}
-  {% if b.hints %}
-  <p class="banner-hint-title">怎么办</p>
-  <ol class="banner-hints">
-    {% for hint in b.hints %}<li>{{ hint }}</li>{% endfor %}
-  </ol>
+  {% if b.detail or b.hints %}
+  {# UI 落地：默认只留一行，详情与「怎么办」收进展开区，别占半屏 #}
+  <details class="banner-more">
+    <summary>{% if b.hints %}详情 · 怎么办{% else %}详情{% endif %}</summary>
+    {% if b.detail %}<p class="banner-detail">{{ b.detail }}</p>{% endif %}
+    {% if b.hints %}
+    <ol class="banner-hints">
+      {% for hint in b.hints %}<li>{{ hint }}</li>{% endfor %}
+    </ol>
+    {% endif %}
+  </details>
   {% endif %}
 </div>
 {%- endmacro %}
