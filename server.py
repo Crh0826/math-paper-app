@@ -2179,6 +2179,11 @@ def create_app(db_path: str | None = None, config_path: str | None = None,
         ctx["avail_rows"] = [(q, int(avail.get(q) or 0)) for q in qtypes
                              if int(avail.get(q) or 0) > 0]
         ctx["avail_total"] = sum(int(avail.get(q) or 0) for q in qtypes)
+        # 判断/其他题型没有配比输入框，但计入总数；单独说一行，免得「三类之和对不上总数」
+        _others = [(q, int(avail.get(q) or 0)) for q in ("判断", "其他")
+                   if int(avail.get(q) or 0) > 0]
+        ctx["others_total"] = sum(v for _, v in _others)
+        ctx["others_text"] = " / ".join("%s %s" % (q, format(v, ",d")) for q, v in _others)
         ctx.setdefault("excluded_detail", {"total": 0, "rows": []})
         ctx["check"] = str(check or "").strip() in ("1", "true", "on", "yes")
         ctx["lan"] = _lan_ctx()

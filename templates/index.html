@@ -130,8 +130,22 @@
           note.textContent = o ? ('当前：' + want + ' · ' + o.textContent.trim()) : '';
         }
       }
-      nameSel.addEventListener('change', filterGrades);
-      gradeSel.addEventListener('change', function () { hidden.value = gradeSel.value; syncNameFromGrade(); });
+      nameSel.addEventListener('change', function () {
+        filterGrades();
+        reloadWithSubject();          // 换学科：重载页面，下方「范围」列表才会换成新学科的
+      });
+      gradeSel.addEventListener('change', function () {
+        hidden.value = gradeSel.value;
+        syncNameFromGrade();
+        reloadWithSubject();          // 换年级/册次：同理
+      });
+      var initialPk = hidden.value;
+      function reloadWithSubject() {
+        var pk = gradeSel.value || hidden.value;
+        if (!pk || pk === initialPk) { return; }
+        initialPk = pk;
+        window.location.href = '/?subject_pk=' + encodeURIComponent(pk);
+      }
       // 换学科已经自动生效（t98 之后自动刷新），不再需要「应用学科」按钮
       filterGrades();
       syncNameFromGrade();
@@ -171,7 +185,7 @@
         <input type="number" name="{{ s.field }}" value="{{ values[s.field] }}" min="0" max="99" step="1" data-qtype="{{ s.qtype }}">
         <span class="field-hint">
           {% if available is not none and s.qtype in available %}
-          可出 <strong>{{ available[s.qtype] | num }}</strong> 题
+          可出 <strong data-avail="{{ s.qtype }}">{{ available[s.qtype] | num }}</strong> 题
           {% else %}
           暂时算不出来（见自检页）
           {% endif %}
@@ -180,6 +194,9 @@
       </label>
       {% endfor %}
     </div>
+    <p class="field-hint" id="other-qtypes"{% if not (others_total) %} hidden{% endif %}>
+      另有 <span id="other-text">{{ others_text }}</span> 题（判断/其他题型，不计入上面三类）
+    </p>
     <p class="field-hint">填 0 表示不放这类题；数字随勾选自动刷新。</p>
     {# t98：只有「没有 JS」时才需要手动查一次；有 JS 的浏览器完全看不到这两个元素 #}
     <noscript>
@@ -414,6 +431,29 @@ function fmt(n) { return Number(n || 0).toLocaleString('zh-CN'); }
     schedule();                            // 立刻重算题量
   }
 
+  /* 每题型「可出 N 题」：换学科/换范围后一起更新（否则会出现「总 2,219 但三类加 15,952」） */
+  function syncOthers(by) {
+    var box = document.getElementById('other-qtypes');
+    var txt = document.getElementById('other-text');
+    if (!box || !txt) { return; }
+    var parts = [];
+    ['判断', '其他'].forEach(function (qt) {
+      var v = parseInt((by && by[qt]) || 0, 10);
+      if (v > 0) { parts.push(qt + ' ' + fmt(v)); }
+    });
+    if (parts.length) { txt.textContent = parts.join(' / '); box.hidden = false; }
+    else { box.hidden = true; }
+  }
+
+  function syncPerType(by) {
+    var nodes = form.querySelectorAll('[data-avail]');
+    for (var i = 0; i < nodes.length; i++) {
+      var qt = nodes[i].getAttribute('data-avail');
+      var v = parseInt((by && by[qt]) || 0, 10);
+      nodes[i].textContent = fmt(isNaN(v) ? 0 : v);
+    }
+  }
+
   function shortfall(data) {
     var by = (data && data.by_qtype) || {};
     var inputs = form.querySelectorAll('input[data-qtype]');
@@ -455,6 +495,8 @@ function fmt(n) { return Number(n || 0).toLocaleString('zh-CN'); }
         ? '· 按已选的 ' + data.chapters.length + ' 个单元算'
         : '· 未勾单元按整册算，改选自动刷新';
     }
+    syncPerType(by);          // 每题型「可出 N 题」跟着刷新，别只刷顶部总数
+    syncOthers(by);           // 判断/其他题型也要露出来，否则总数对不上
     shortfall(data);
     renderExcluded(data.excluded);
   }

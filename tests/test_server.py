@@ -566,7 +566,7 @@ class TestSubjectPicker(unittest.TestCase):
         return m.group(0)
 
     def _available_choice(self, html: str) -> int:
-        counts = re.findall(r"可出\s*<strong>(\d+)</strong>\s*题", html)
+        counts = re.findall(r"可出\s*<strong[^>]*>(\d+)</strong>\s*题", html)
         self.assertTrue(counts, "页面没显示「可出 N 题」")
         return int(counts[0])          # stats 顺序：选择题在前
 

@@ -38,3 +38,6 @@ tools/compare_vlm.py
 tools/probe_glm_ocr.py
 tools/probe_glm_ocr_api.py
 tools/probe_glm_ocr_page.py
+
+# pytest 缓存
+.pytest_cache/
